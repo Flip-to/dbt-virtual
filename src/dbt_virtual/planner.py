@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from dbt_virtual.fingerprint import NodeFingerprint
+from dbt_virtual.fingerprint import NodeFingerprint, extract_sql_output_columns
 
 ROUTINE_TYPES = {"table_function", "function", "procedure"}
 
@@ -227,24 +227,30 @@ def diff_model_columns(
 def diff_manifests(
     old_manifest: dict[str, Any],
     new_manifest: dict[str, Any],
+    *,
+    dialect: str = "bigquery",
 ) -> list[ModelSchemaDiff]:
-    """Compare declared/catalog column schemas across two dbt `manifest.json` payloads."""
+    """Compare declared or SQL-AST-projected column schemas across two dbt `manifest.json` payloads."""
     old_nodes = old_manifest.get("nodes") or {}
     new_nodes = new_manifest.get("nodes") or {}
+
+    def _extract_cols(node: dict[str, Any]) -> dict[str, str]:
+        declared = {
+            col_name: (col_meta.get("data_type") or "")
+            for col_name, col_meta in (node.get("columns") or {}).items()
+        }
+        if declared:
+            return declared
+        compiled = node.get("compiled_code") or node.get("compiled_sql") or ""
+        return extract_sql_output_columns(compiled, dialect=dialect)
 
     diffs: list[ModelSchemaDiff] = []
     for uid, new_node in sorted(new_nodes.items()):
         if uid not in old_nodes:
             continue
         old_node = old_nodes[uid]
-        old_cols = {
-            col_name: (col_meta.get("data_type") or "")
-            for col_name, col_meta in (old_node.get("columns") or {}).items()
-        }
-        new_cols = {
-            col_name: (col_meta.get("data_type") or "")
-            for col_name, col_meta in (new_node.get("columns") or {}).items()
-        }
+        old_cols = _extract_cols(old_node)
+        new_cols = _extract_cols(new_node)
         if old_cols or new_cols:
             diff = diff_model_columns(new_node.get("name", uid), old_cols, new_cols)
             if diff.changes:

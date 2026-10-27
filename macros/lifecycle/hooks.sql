@@ -42,7 +42,7 @@
 
   {%- set lookup_query -%}
     SELECT physical_identifier
-    FROM `{{ this.database }}`.`{{ phys_schema }}`._environments
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment = '{{ base_env }}'
       AND model_name = '{{ model.name }}'
       AND resource_type = 'model'
@@ -97,7 +97,7 @@
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
   {%- set lookup_query -%}
     SELECT physical_identifier
-    FROM `{{ this.database }}`.`{{ phys_schema }}`._environments
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment = '{{ base_env }}'
       AND model_name = '{{ model.name }}'
       AND resource_type = 'model'
@@ -146,27 +146,18 @@
   {%- set sql_statements -%}
     {{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }};
 
-    MERGE `{{ this.database }}`.`{{ phys_schema }}`._environments AS T
-    USING (
-      SELECT
-        '{{ env_name }}' AS environment,
-        '{{ model.name }}' AS model_name,
-        'model' AS resource_type,
-        '{{ fp }}' AS fingerprint,
-        '{{ phys_schema }}.{{ this.identifier }}' AS physical_identifier,
-        '{{ release_id }}' AS release_id,
-        CURRENT_TIMESTAMP() AS updated_at
-    ) AS S
-    ON T.environment = S.environment AND T.model_name = S.model_name
-    WHEN MATCHED THEN UPDATE SET
-      fingerprint = S.fingerprint,
-      physical_identifier = S.physical_identifier,
-      release_id = S.release_id,
-      updated_at = S.updated_at
-    WHEN NOT MATCHED THEN INSERT ROW;
+    {{ dbt_virtual.upsert_environment_pointer_sql(
+      phys_schema,
+      env_name,
+      model.name,
+      'model',
+      fp,
+      phys_schema ~ '.' ~ this.identifier,
+      release_id
+    ) }};
 
     {%- if release_id != '' %}
-    INSERT INTO `{{ this.database }}`.`{{ phys_schema }}`._releases (
+    INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} (
       release_id,
       source_environment,
       target_environment,
@@ -247,27 +238,18 @@ CREATE OR REPLACE PROCEDURE `{{ target_relation.database }}`.`{{ env_schema }}`.
     {%- set ddl_template = full_ddl | replace(env_schema, '__DBT_VIRTUAL_ENV_SCHEMA__') -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}
-      MERGE `{{ target_relation.database }}`.`{{ phys_schema }}`._environments AS T
-      USING (
-        SELECT
-          '{{ env_name }}' AS environment,
-          '{{ node.name }}' AS model_name,
-          '{{ routine_type }}' AS resource_type,
-          '{{ fp }}' AS fingerprint,
-          '{{ target_relation.schema }}.{{ target_relation.identifier }}' AS physical_identifier,
-          '{{ release_id }}' AS release_id,
-          CURRENT_TIMESTAMP() AS updated_at
-      ) AS S
-      ON T.environment = S.environment AND T.model_name = S.model_name
-      WHEN MATCHED THEN UPDATE SET
-        fingerprint = S.fingerprint,
-        physical_identifier = S.physical_identifier,
-        release_id = S.release_id,
-        updated_at = S.updated_at
-      WHEN NOT MATCHED THEN INSERT ROW;
+      {{ dbt_virtual.upsert_environment_pointer_sql(
+        phys_schema,
+        env_name,
+        node.name,
+        routine_type,
+        fp,
+        target_relation.schema ~ '.' ~ target_relation.identifier,
+        release_id
+      ) }};
 
       {%- if release_id != '' %}
-      INSERT INTO `{{ target_relation.database }}`.`{{ phys_schema }}`._releases (
+      INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} (
         release_id,
         source_environment,
         target_environment,

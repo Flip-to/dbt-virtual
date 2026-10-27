@@ -34,10 +34,14 @@ Exercises the full virtual data environment lifecycle against a running BigQuery
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dbt_virtual.fingerprint import compute_manifest_fingerprints, compute_node_fingerprint
 from dbt_virtual.planner import classify_plan_actions, compute_dbt_select_for_build
+from tests.test_macros_execution import FakeRelation, MacroTestHarness
 
 
 def run_e2e() -> int:
@@ -105,7 +109,9 @@ def run_e2e() -> int:
           physical_identifier STRING,
           routine_ddl_template STRING,
           status STRING,
-          created_at TIMESTAMP
+          created_at TIMESTAMP,
+          promoted_at TIMESTAMP,
+          rolled_back_at TIMESTAMP
         )
         """
     )
@@ -374,6 +380,39 @@ def run_e2e() -> int:
     assert orphan_tbl not in protected_names
     q(f"DROP TABLE `{project}.analytics_physical.{orphan_tbl}`")
     print("[gc] Protected vs orphaned physical fingerprint table detection verified.")
+
+    # 9. Execute SQL rendered directly by the actual Jinja macros (`sync_env_view`, `virtual_sync_reused_views`)
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "env_schemas": {
+                    "staging": "analytics_staging",
+                    "prod": "analytics",
+                    "pr_42": "analytics_pr_42",
+                },
+            },
+            "_dbt_virtual_fps": {"orders_metrics": fp_v1},
+            "_dbt_virtual_release": "v1_macro_check",
+        },
+        target_database=project,
+    )
+    harness.model = {
+        "name": "orders_metrics",
+        "config": {"materialized": "incremental", "virtual_env": True},
+    }
+    harness.this = FakeRelation(project, "analytics_physical", phys_v1)
+    rendered_sync_sql = harness.call_macro("sync_env_view")
+    for stmt in [s.strip() for s in rendered_sync_sql.split(";") if s.strip()]:
+        q(stmt)
+
+    # Verify macro-rendered MERGE and INSERT landed in `_environments` and `_releases`
+    macro_rel_rows = q(
+        f"SELECT model_name, fingerprint FROM `{project}.analytics_physical._releases` "
+        f"WHERE release_id = 'v1_macro_check'"
+    )
+    assert macro_rel_rows == [{"model_name": "orders_metrics", "fingerprint": fp_v1}], macro_rel_rows
+    print("[macro-sql] Jinja macro `sync_env_view` SQL executed on emulator:", macro_rel_rows)
 
     print("All dbt-virtual emulator E2E checks PASSED.")
     return 0

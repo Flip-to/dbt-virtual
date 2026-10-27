@@ -1,0 +1,33 @@
+name: 'sample_virtual_project'
+version: '1.0.0'
+config-version: 2
+
+profile: 'sample_virtual_project'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target"]
+
+vars:
+  dbt_virtual:
+    enabled: true
+    use_ctas_for_clone: true
+    physical_schema: "analytics_physical"
+    environment: "{{ var('_dbt_virtual_env', target.name) }}"
+    base_environment: "prod"
+    ref_resolution: "env_view"
+    env_schemas:
+      staging: "analytics_staging"
+      prod: "analytics"
+      pr_42: "analytics_pr_42"
+    retention_releases: 5
+    retention_days: 7
+
+models:
+  sample_virtual_project:
+    +virtual_env: true
+    +pre-hook:
+      - "{{ dbt_virtual.clone_if_new_fp() }}"
+    +post-hook:
+      - "{{ dbt_virtual.sync_env_view() }}"

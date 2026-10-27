@@ -1,9 +1,10 @@
 ---
-status: open
+status: paid
 area: adapters
 impact: low
 effort: s
 bean: dbt-virtual-0003
+paid_by: 5390909
 ---
 
 # Lifecycle hooks and operations contain BigQuery-specific SQL syntax

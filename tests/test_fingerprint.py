@@ -3,8 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from dbt_virtual.fingerprint import (
+    canonicalize_sql_ast,
     compute_manifest_fingerprints,
     compute_node_fingerprint,
+    extract_sql_output_columns,
     is_virtual_node,
     normalize_sql,
     write_fingerprints_file,
@@ -140,3 +142,23 @@ def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
     assert "0123456789ab" not in cleaned
     assert "__DBT_VIRTUAL_THIS__" in cleaned
     assert "__DBT_VIRTUAL_SCHEMA__." in cleaned
+
+
+def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
+    """Cosmetic SQL differences (case, line comments, whitespace) must produce identical AST SQL."""
+    sql_a = """
+    -- leading line comment
+    select
+        customer_id,
+        cast(sum(orders) as int64) as total_orders
+    from `proj.analytics.events`
+    group by 1
+    """
+    sql_b = "SELECT customer_id, CAST(SUM(orders) AS INT64) AS total_orders FROM `proj.analytics.events` GROUP BY 1"
+
+    assert normalize_sql(sql_a) == normalize_sql(sql_b)
+    assert canonicalize_sql_ast(sql_a) == canonicalize_sql_ast(sql_b)
+
+    cols = extract_sql_output_columns(sql_b)
+    assert cols == {"customer_id": "", "total_orders": "INT64"}
+

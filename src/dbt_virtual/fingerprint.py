@@ -1,4 +1,4 @@
-"""Merkle-DAG fingerprinting and canonical SQL normalization for dbt-virtual."""
+"""Merkle-DAG fingerprinting and canonical SQL normalization (with sqlglot AST) for dbt-virtual."""
 
 from __future__ import annotations
 
@@ -10,10 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
 
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
 
@@ -56,18 +61,62 @@ def is_virtual_node(node: dict[str, Any]) -> bool:
     return meta.get("virtual_env") is True
 
 
+def canonicalize_sql_ast(sql: str, dialect: str = "bigquery") -> str:
+    """Canonicalize SQL via sqlglot AST (strips comments, normalizes keyword case, quoting, and whitespace).
+
+    Falls back to the input string if the snippet contains raw Jinja (`{{` or `{%`) or procedural
+    statements not parseable as a single expression.
+    """
+    if not sql or "{{" in sql or "{%" in sql:
+        return sql
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+        return parsed.sql(dialect=dialect, comments=False, normalize_functions="upper")
+    except (SqlglotError, ValueError, TypeError, KeyError, IndexError):
+        return sql
+
+
+def extract_sql_output_columns(sql: str, dialect: str = "bigquery") -> dict[str, str]:
+    """Extract top-level projected column names (and inferred/cast types when explicit) from compiled SQL."""
+    if not sql or "{{" in sql or "{%" in sql:
+        return {}
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+        select_expr = parsed.find(exp.Select)
+        if select_expr is None:
+            return {}
+        cols: dict[str, str] = {}
+        for proj in select_expr.expressions:
+            if isinstance(proj, exp.Star):
+                continue
+            col_name = proj.alias_or_name
+            if not col_name:
+                continue
+            col_type = ""
+            unwrapped = proj.this if isinstance(proj, exp.Alias) else proj
+            if isinstance(unwrapped, exp.Cast) and unwrapped.to:
+                col_type = unwrapped.to.sql(dialect=dialect)
+            cols[col_name] = col_type
+        return cols
+    except (SqlglotError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
 def normalize_sql(
     sql: str,
     *,
     self_identifier: str | None = None,
     known_schemas: list[str] | None = None,
+    use_ast: bool = True,
+    dialect: str = "bigquery",
 ) -> str:
-    """Normalize compiled SQL so target-specific schemas & self-references do not alter the hash."""
+    """Normalize compiled SQL so target-specific schemas, comments, and formatting do not alter the hash."""
     if not sql:
         return ""
 
     normalized = sql.replace("\r\n", "\n").replace("\r", "\n")
     normalized = _BLOCK_COMMENT_RE.sub("", normalized)
+    normalized = _LINE_COMMENT_RE.sub("", normalized)
 
     # Strip any existing __<fp> suffixes from physical table names
     normalized = _FINGERPRINT_SUFFIX_RE.sub("", normalized)
@@ -83,6 +132,9 @@ def normalize_sql(
         base_ident = _FINGERPRINT_SUFFIX_RE.sub("", self_identifier)
         ident_pattern = re.compile(rf"\b{re.escape(base_ident)}\b")
         normalized = ident_pattern.sub("__DBT_VIRTUAL_THIS__", normalized)
+
+    if use_ast:
+        normalized = canonicalize_sql_ast(normalized, dialect=dialect)
 
     lines = [_WHITESPACE_RUN_RE.sub(" ", line).strip() for line in normalized.split("\n")]
     return " ".join(line for line in lines if line)
@@ -138,13 +190,14 @@ def compute_node_fingerprint(
 
     norm_compiled = normalize_sql(
         compiled_sql,
-        self_identifier= node.get("alias") or name,
+        self_identifier=node.get("alias") or name,
         known_schemas=schemas_to_strip,
     )
     norm_raw = normalize_sql(
         raw_sql,
         self_identifier=name,
         known_schemas=schemas_to_strip,
+        use_ast=False,
     )
 
     sorted_upstreams = dict(sorted((upstream_fingerprints or {}).items()))

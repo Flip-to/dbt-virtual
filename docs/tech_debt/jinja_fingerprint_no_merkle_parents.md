@@ -1,9 +1,10 @@
 ---
-status: open
+status: paid
 area: fingerprinting
 impact: medium
 effort: s
 bean: dbt-virtual-0002
+paid_by: 5390909
 ---
 
 # Pure-Jinja fingerprint fallback does not include upstream Merkle parent hashes
