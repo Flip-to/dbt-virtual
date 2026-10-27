@@ -11,7 +11,7 @@ prs: []
 
 ## Context
 
-When extracting the SQLMesh-style virtual data environment design from `Flip-to/flipto-dbt#509` into a standalone open-source repository (`Flip-to/dbt-virtual`), we had to choose the packaging model (pure dbt macros vs. Python CLI wrapper vs. hybrid) and the initial warehouse target scope.
+When designing `dbt-virtual` (`Flip-to/dbt-virtual`) to bring SQLMesh-style virtual data environments into dbt, we had to choose the packaging model (pure dbt macros vs. Python CLI wrapper vs. hybrid) and the initial warehouse target scope.
 
 ## Decision
 
@@ -22,7 +22,7 @@ When extracting the SQLMesh-style virtual data environment design from `Flip-to/
 
 - **Deterministic Merkle-DAG fingerprinting needs `manifest.json`**: Computing topological parent-to-child fingerprints over normalized `compiled_code` is clean and fast in a 200-line Python pass over `target/manifest.json` (`src/dbt_virtual/fingerprint.py`), whereas doing full compiled-SQL normalization purely inside Jinja at parse time has limited access to compiled upstream bodies.
 - **Pure-dbt ergonomics still work**: Providing a pure-Jinja fallback in `macros/fingerprint/get_fingerprint.sql` and `dbt run-operation` macros means users can still run bare `dbt run` or orchestrate everything from dbt Cloud / Cloud Workflows without a custom container if desired.
-- **BigQuery is where the immediate production workload lives**: `Flip-to/flipto-dbt` runs on BigQuery and relies heavily on BigQuery TVFs (`table_function`), scalar UDFs (`function`), and zero-copy table clones (`CLONE`).
+- **BigQuery is where the immediate production workload lives**: Production workloads on BigQuery rely heavily on BigQuery TVFs (`table_function`), scalar UDFs (`function`), and zero-copy table clones (`CLONE`).
 
 ## Alternatives
 

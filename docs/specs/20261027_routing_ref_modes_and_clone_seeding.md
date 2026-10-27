@@ -30,15 +30,15 @@ prs: []
 
 ## Alternatives
 
-- **Always rebuild new fingerprints from scratch**: Rejected; full refreshes of multi-year Snowplow roots are prohibitively expensive and slow.
+- **Always rebuild new fingerprints from scratch**: Rejected; full refreshes of multi-year incremental tables are prohibitively expensive and slow.
 - **Hardcode only Mode A or only Mode B**: Rejected; making `ref_resolution` a config setting (`env_view` default, `physical` and `hybrid` supported) satisfies both instant TVF view-swapping and strict physical lineage use cases.
 
 ## Rollout
 
 1. Implement `virtual_schema_name`, `virtual_alias_name`, and `virtual_ref` in `macros/routing/virtual_routing.sql`.
 2. Implement `clone_if_new_fp` and `sync_env_view` in `macros/lifecycle/hooks.sql`.
-3. Verify partition pruning through virtual views (proven on BigQuery in `Flip-to/flipto-dbt#509`: 438,213,812 bytes scanned both directly and through a `SELECT *` view over a 194.4 GB table).
+3. Verify partition pruning through virtual views (dry-run benchmark on BigQuery confirmed 438,213,812 bytes scanned both directly and through a `SELECT *` view over a 194.4 GB partitioned table).
 
 ## Verification
 
-- Verify `virtual_schema_name`, `virtual_alias_name`, `clone_if_new_fp`, and `sync_env_view` in the `Flip-to/bigquery-emulator` E2E test (`scripts/run_emulator_e2e.py`).
+- Verify `virtual_schema_name`, `virtual_alias_name`, `clone_if_new_fp`, and `sync_env_view` in the BigQuery emulator E2E test (`scripts/run_emulator_e2e.py`).

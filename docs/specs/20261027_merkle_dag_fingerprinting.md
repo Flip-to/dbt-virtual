@@ -9,7 +9,7 @@ prs: []
 
 ## Problem
 
-A virtual data environment relies on content-addressed physical tables (`<model>__<fp>`). If the fingerprint `<fp>` is computed over raw uncompiled SQL (`node.raw_code`), it misses changes to shared Jinja macros and `dbt_project.yml` variables (`var()`), reusing a stale physical table (`Flip-to/flipto-dbt#509`, section "V1 risks and checks before building"). Conversely, if `<fp>` is computed over raw `node.compiled_code`, target-specific schema names (`spacetime_staging` vs. `spacetime`) and self-references (`{{ this }}`) change the hash between `staging` and `prod`, forcing a rebuild on promotion.
+A virtual data environment relies on content-addressed physical tables (`<model>__<fp>`). If the fingerprint `<fp>` is computed over raw uncompiled SQL (`node.raw_code`), it misses changes to shared Jinja macros and `dbt_project.yml` variables (`var()`), reusing a stale physical table. Conversely, if `<fp>` is computed over raw `node.compiled_code`, target-specific schema names (`analytics_staging` vs. `analytics`) and self-references (`{{ this }}`) change the hash between `staging` and `prod`, forcing a rebuild on promotion.
 
 ## Decision
 

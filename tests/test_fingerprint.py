@@ -12,11 +12,11 @@ from dbt_virtual.fingerprint import (
 
 
 def _make_node(
-    name: str = "traffic_metrics_root",
+    name: str = "orders_metrics",
     *,
-    compiled_code: str = "SELECT entity_uuid, COUNT(*) AS c FROM `proj.spacetime_staging.sessions` GROUP BY 1",
-    raw_code: str = "SELECT entity_uuid, COUNT(*) AS c FROM {{ ref('sessions') }} GROUP BY 1",
-    schema: str = "spacetime_staging",
+    compiled_code: str = "SELECT customer_id, COUNT(*) AS c FROM `proj.analytics_staging.events` GROUP BY 1",
+    raw_code: str = "SELECT customer_id, COUNT(*) AS c FROM {{ ref('events') }} GROUP BY 1",
+    schema: str = "analytics_staging",
     materialized: str = "incremental",
     virtual_env: bool = True,
     depends_on: list[str] | None = None,
@@ -33,8 +33,8 @@ def _make_node(
         "config": {
             "materialized": materialized,
             "incremental_strategy": "insert_overwrite",
-            "partition_by": {"field": "granular_date", "data_type": "date"},
-            "cluster_by": ["entity_uuid"],
+            "partition_by": {"field": "order_date", "data_type": "date"},
+            "cluster_by": ["customer_id"],
             "virtual_env": virtual_env,
             "virtual_env_epoch": epoch,
         },
@@ -53,30 +53,30 @@ def test_target_schema_invariance() -> None:
     node_staging = _make_node(
         compiled_code=(
             "/* dbt comment */\n"
-            "SELECT * FROM `my_proj`.`spacetime_staging`.sessions "
-            "WHERE dt > (SELECT MAX(dt) FROM `my_proj`.`spacetime_physical`.traffic_metrics_root__abcdef123456)"
+            "SELECT * FROM `my_proj`.`analytics_staging`.events "
+            "WHERE dt > (SELECT MAX(dt) FROM `my_proj`.`analytics_physical`.orders_metrics__abcdef123456)"
         ),
-        schema="spacetime_staging",
+        schema="analytics_staging",
     )
     node_prod = _make_node(
         compiled_code=(
-            "SELECT * FROM `my_proj`.`spacetime`.sessions\n"
-            "WHERE dt > (SELECT MAX(dt) FROM `my_proj`.`spacetime_physical`.traffic_metrics_root__999999999999)"
+            "SELECT * FROM `my_proj`.`analytics`.events\n"
+            "WHERE dt > (SELECT MAX(dt) FROM `my_proj`.`analytics_physical`.orders_metrics__999999999999)"
         ),
-        schema="spacetime",
+        schema="analytics",
     )
-    known = ["spacetime_staging", "spacetime", "spacetime_physical"]
+    known = ["analytics_staging", "analytics", "analytics_physical"]
     fp_stg = compute_node_fingerprint(node_staging, known_schemas=known)
     fp_prod = compute_node_fingerprint(node_prod, known_schemas=known)
 
     assert fp_stg.fingerprint == fp_prod.fingerprint
-    assert fp_stg.physical_identifier == f"traffic_metrics_root__{fp_stg.fingerprint}"
+    assert fp_stg.physical_identifier == f"orders_metrics__{fp_stg.fingerprint}"
 
 
 def test_sql_or_config_change_invalidates_fingerprint() -> None:
     base = compute_node_fingerprint(_make_node())
     changed_sql = compute_node_fingerprint(
-        _make_node(compiled_code="SELECT entity_uuid, SUM(x) FROM `proj.spacetime_staging.sessions` GROUP BY 1")
+        _make_node(compiled_code="SELECT customer_id, SUM(x) FROM `proj.analytics_staging.events` GROUP BY 1")
     )
     changed_epoch = compute_node_fingerprint(_make_node(epoch=2))
 
@@ -87,16 +87,16 @@ def test_sql_or_config_change_invalidates_fingerprint() -> None:
 def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
     """Changing an upstream virtualized model must propagate a new fingerprint to downstream nodes."""
     parent_v1 = _make_node(
-        name="traffic_metrics_root",
+        name="orders_metrics",
         compiled_code="SELECT 1 AS a",
         raw_code="SELECT 1 AS a",
     )
     child_tvf = _make_node(
-        name="ft_report_v9_traffic_metrics",
+        name="tvf_orders_report",
         materialized="table_function",
-        compiled_code="SELECT a FROM `proj.spacetime_staging.traffic_metrics_root`",
-        raw_code="SELECT a FROM {{ ref('traffic_metrics_root') }}",
-        depends_on=["model.test.traffic_metrics_root"],
+        compiled_code="SELECT a FROM `proj.analytics_staging.orders_metrics`",
+        raw_code="SELECT a FROM {{ ref('orders_metrics') }}",
+        depends_on=["model.test.orders_metrics"],
     )
 
     manifest_v1 = {
@@ -105,10 +105,10 @@ def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
             child_tvf["unique_id"]: child_tvf,
         }
     }
-    fps_v1 = compute_manifest_fingerprints(manifest_v1, known_schemas=["spacetime_staging"])
+    fps_v1 = compute_manifest_fingerprints(manifest_v1, known_schemas=["analytics_staging"])
 
     parent_v2 = _make_node(
-        name="traffic_metrics_root",
+        name="orders_metrics",
         compiled_code="SELECT 2 AS a",
         raw_code="SELECT 2 AS a",
     )
@@ -118,12 +118,12 @@ def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
             child_tvf["unique_id"]: child_tvf,
         }
     }
-    fps_v2 = compute_manifest_fingerprints(manifest_v2, known_schemas=["spacetime_staging"])
+    fps_v2 = compute_manifest_fingerprints(manifest_v2, known_schemas=["analytics_staging"])
 
-    assert fps_v1["model.test.traffic_metrics_root"].fingerprint != fps_v2["model.test.traffic_metrics_root"].fingerprint
-    assert fps_v1["model.test.ft_report_v9_traffic_metrics"].fingerprint != fps_v2["model.test.ft_report_v9_traffic_metrics"].fingerprint
+    assert fps_v1["model.test.orders_metrics"].fingerprint != fps_v2["model.test.orders_metrics"].fingerprint
+    assert fps_v1["model.test.tvf_orders_report"].fingerprint != fps_v2["model.test.tvf_orders_report"].fingerprint
     # TVF physical identifier stays logical name (deployed per env schema)
-    assert fps_v1["model.test.ft_report_v9_traffic_metrics"].physical_identifier == "ft_report_v9_traffic_metrics"
+    assert fps_v1["model.test.tvf_orders_report"].physical_identifier == "tvf_orders_report"
 
     out_path = tmp_path / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps_v2, out_path)
@@ -131,11 +131,11 @@ def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
 
 
 def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
-    raw = "/* query_tag: abc */ SELECT * FROM `p.spacetime_physical.my_table__0123456789ab` WHERE x = 1"
+    raw = "/* query_tag: abc */ SELECT * FROM `p.analytics_physical.my_table__0123456789ab` WHERE x = 1"
     cleaned = normalize_sql(
         raw,
         self_identifier="my_table__0123456789ab",
-        known_schemas=["spacetime_physical"],
+        known_schemas=["analytics_physical"],
     )
     assert "0123456789ab" not in cleaned
     assert "__DBT_VIRTUAL_THIS__" in cleaned

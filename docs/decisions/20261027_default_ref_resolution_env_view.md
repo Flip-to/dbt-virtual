@@ -19,8 +19,8 @@ Set `ref_resolution: "env_view"` (Option A) as the default in `dbt-virtual`, so 
 
 ## Why
 
-- **Instant view-swap promotion and rollback for TVFs and downstream views**: In BigQuery, table functions (`CREATE TABLE FUNCTION`) bind their referenced relation names at compile time and cannot be aliased by a view. When a TVF in `spacetime` reads the environment view `spacetime.traffic_metrics_root`, promoting or rolling back `traffic_metrics_root` by swapping that view immediately changes what the TVF serves without needing to recompile or redeploy unchanged TVFs.
-- **Zero partition pruning penalty**: Measured by dry-run on BigQuery on 2026-10-26 (`Flip-to/flipto-dbt#509`): querying a 194,437,234,666-byte partitioned root table directly vs. through a `SELECT *` view vs. through a compiled TVF reading that view estimated the exact same 438,213,812 bytes.
+- **Instant view-swap promotion and rollback for TVFs and downstream views**: In BigQuery, table functions (`CREATE TABLE FUNCTION`) bind their referenced relation names at compile time and cannot be aliased by a view. When a TVF in `analytics` reads the environment view `analytics.orders_metrics`, promoting or rolling back `orders_metrics` by swapping that view immediately changes what the TVF serves without needing to recompile or redeploy unchanged TVFs.
+- **Zero partition pruning penalty**: Measured by dry-run on BigQuery on 2026-10-26: querying a 194,437,234,666-byte partitioned root table directly vs. through a `SELECT *` view vs. through a compiled TVF reading that view estimated the exact same 438,213,812 bytes.
 - **Future flexibility preserved**: Supporting `ref_resolution: "physical"` and `"hybrid"` in the same macro (`DECISION(default_ref_resolution_env_view)`) lets teams switch modes via `dbt_project.yml` without rewriting model SQL.
 
 ## Alternatives

@@ -11,14 +11,14 @@
 In standard dbt deployments:
 1. Promoting `staging` → `prod` requires **rebuilding every table a second time** in production—doubling warehouse compute costs and risking data drift between the staging run and production run.
 2. Rolling back a bad production release requires slow table restores, while **BigQuery routines (`TABLE FUNCTION`, `FUNCTION`, `PROCEDURE`) have no time travel at all**.
-3. Migrating an existing mature dbt codebase to SQLMesh often breaks dbt-native ecosystems: custom Jinja materializations (`table_function`, `function`, `procedure`), `snowplow_unified` manifest hooks, `dbt-checkpoint`, the `sqlfluff` dbt templater, Elementary, and Slim CI.
+3. Migrating an existing mature dbt codebase to SQLMesh often breaks dbt-native ecosystems: custom Jinja materializations (`table_function`, `function`, `procedure`), package manifest hooks, `dbt-checkpoint`, the `sqlfluff` dbt templater, Elementary, and Slim CI.
 
 **`dbt-virtual`** brings Virtual Data Environments directly into dbt as a hybrid dbt macro package + lightweight CLI.
 
 | Capability | Standard dbt | `dbt-virtual` |
 |---|---|---|
-| **Physical Storage** | Mutable in-place table (`prod.orders`) | Content-addressed (`physical.orders__8f3a9c1b2d4e`) |
-| **Environment Isolation** | Separate physical rebuilds per target | Lightweight per-environment `VIEW` layers (`staging.orders`, `prod.orders`) |
+| **Physical Storage** | Mutable in-place table (`prod.orders`) | Content-addressed (`analytics_physical.orders__8f3a9c1b2d4e`) |
+| **Environment Isolation** | Separate physical rebuilds per target | Lightweight per-environment `VIEW` layers (`analytics_staging.orders`, `analytics.orders`) |
 | **Modified Incrementals** | Full refresh or manual clone | Automatic zero-copy `CREATE TABLE ... CLONE` from active `prod` table |
 | **Promote `staging` → `prod`** | Full second `dbt build` in prod | **Zero rebuild** — metadata-only view swap + routine deploy |
 | **Rollback `prod`** | Manual revert PR + snapshot restore | **Instant rollback** — repoint views & redeploy previous release's routines |
@@ -37,7 +37,7 @@ All written documentation follows [`docs/conventions/docs_and_specs.md`](docs/co
 - **[`20261027_routing_ref_modes_and_clone_seeding.md`](docs/specs/20261027_routing_ref_modes_and_clone_seeding.md)** — Default `env_view` (Option A) resolution, alternative `physical` / `hybrid` / `explicit` modes, and incremental cloning.
 - **[`20261027_routine_virtualization_and_tvf_testing.md`](docs/specs/20261027_routine_virtualization_and_tvf_testing.md)** — Atomic promotion/rollback of BigQuery TVFs, scalar UDFs, and stored procedures.
 - **[`20261027_lifecycle_promote_rollback_and_gc.md`](docs/specs/20261027_lifecycle_promote_rollback_and_gc.md)** — `_environments` and `_releases` schemas, `plan`, `build`, `promote`, `rollback`, `diff`, and `gc`.
-- **[`20261027_adapter_dispatch_and_emulator_ci.md`](docs/specs/20261027_adapter_dispatch_and_emulator_ci.md)** — Multi-warehouse adapter dispatch & `Flip-to/bigquery-emulator` CI integration.
+- **[`20261027_adapter_dispatch_and_emulator_ci.md`](docs/specs/20261027_adapter_dispatch_and_emulator_ci.md)** — Multi-warehouse adapter dispatch & BigQuery emulator CI integration.
 
 ### Decisions & Tech Debt
 - **[Decision Index (`docs/decisions/README.md`)](docs/decisions/README.md)** — Architectural decision records (`DECISION(<slug>)`).
@@ -68,13 +68,13 @@ uv pip install git+https://github.com/Flip-to/dbt-virtual.git
 vars:
   dbt_virtual:
     enabled: true
-    physical_schema: "spacetime_physical"
+    physical_schema: "analytics_physical"
     environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"
     base_environment: "prod"
     ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid'
     env_schemas:
-      staging: "spacetime_staging"
-      prod: "spacetime"
+      staging: "analytics_staging"
+      prod: "analytics"
     retention_releases: 5
     retention_days: 7
 

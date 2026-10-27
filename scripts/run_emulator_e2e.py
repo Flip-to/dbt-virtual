@@ -3,21 +3,21 @@
 Exercises the full virtual data environment lifecycle against a running BigQuery emulator
 (`BIGQUERY_EMULATOR_HOST`, default `http://127.0.0.1:9050`, project `test-project`):
 
-1. Registry initialization (`_environments`, `_releases` in `spacetime_physical`).
+1. Registry initialization (`_environments`, `_releases` in `analytics_physical`).
 2. Release v1 build in `staging`:
-   - Content-addressed physical table `spacetime_physical.traffic_metrics_root__<fp_v1>`
-   - Virtual environment view `spacetime_staging.traffic_metrics_root`
-   - Scalar SQL UDF `spacetime_staging.udf_double_sessions(n INT64)`
-   - Table Function (TVF) `spacetime_staging.ft_report_traffic(min_sessions INT64)` reading the view
+   - Content-addressed physical table `analytics_physical.orders_metrics__<fp_v1>`
+   - Virtual environment view `analytics_staging.orders_metrics`
+   - Scalar SQL UDF `analytics_staging.udf_double_orders(n INT64)`
+   - Table Function (TVF) `analytics_staging.tvf_orders_report(min_orders INT64)` reading the view
 3. Zero-rebuild promotion (`staging` -> `prod` for release `v1`):
-   - View `spacetime.traffic_metrics_root` points to `spacetime_physical.traffic_metrics_root__<fp_v1>`
-   - `spacetime.udf_double_sessions` and `spacetime.ft_report_traffic` deployed in `prod`
+   - View `analytics.orders_metrics` points to `analytics_physical.orders_metrics__<fp_v1>`
+   - `analytics.udf_double_orders` and `analytics.tvf_orders_report` deployed in `prod`
 4. Release v2 build in `staging` + promote to `prod`:
-   - New fingerprinted table `spacetime_physical.traffic_metrics_root__<fp_v2>` seeded from `prod`'s `<fp_v1>`
+   - New fingerprinted table `analytics_physical.orders_metrics__<fp_v2>` seeded from `prod`'s `<fp_v1>`
      and updated with new rows
    - Promoted to `prod` via view swap
 5. Instant rollback (`prod` -> release `v1`):
-   - Repoints `spacetime.traffic_metrics_root` back to `<fp_v1>` and verifies `spacetime.ft_report_traffic`
+   - Repoints `analytics.orders_metrics` back to `<fp_v1>` and verifies `analytics.tvf_orders_report`
      immediately serves `v1` data again.
 """
 
@@ -46,7 +46,7 @@ def run_e2e() -> int:
     project = os.environ.get("BIGQUERY_EMULATOR_PROJECT", "test-project")
 
     # 0. Ensure datasets exist in the emulator via REST API
-    for dataset_id in ("spacetime_physical", "spacetime_staging", "spacetime"):
+    for dataset_id in ("analytics_physical", "analytics_staging", "analytics"):
         resp = requests.post(
             f"{endpoint}/bigquery/v2/projects/{project}/datasets",
             json={"datasetReference": {"projectId": project, "datasetId": dataset_id}},
@@ -67,10 +67,10 @@ def run_e2e() -> int:
 
     print(f"Connected to Flip-to/bigquery-emulator at {endpoint} (project={project})")
 
-    # 1. Create registry tables in spacetime_physical
+    # 1. Create registry tables in analytics_physical
     q(
         f"""
-        CREATE TABLE IF NOT EXISTS `{project}.spacetime_physical._environments` (
+        CREATE TABLE IF NOT EXISTS `{project}.analytics_physical._environments` (
           environment STRING,
           model_name STRING,
           resource_type STRING,
@@ -83,7 +83,7 @@ def run_e2e() -> int:
     )
     q(
         f"""
-        CREATE TABLE IF NOT EXISTS `{project}.spacetime_physical._releases` (
+        CREATE TABLE IF NOT EXISTS `{project}.analytics_physical._releases` (
           release_id STRING,
           source_environment STRING,
           target_environment STRING,
@@ -101,134 +101,134 @@ def run_e2e() -> int:
 
     # 2. Compute v1 fingerprint & build in staging
     node_v1 = {
-        "unique_id": "model.test.traffic_metrics_root",
-        "name": "traffic_metrics_root",
+        "unique_id": "model.test.orders_metrics",
+        "name": "orders_metrics",
         "resource_type": "model",
-        "compiled_code": "SELECT 'prop_1' AS entity_uuid, 10 AS sessions UNION ALL SELECT 'prop_2', 25",
-        "raw_code": "SELECT 'prop_1' AS entity_uuid, 10 AS sessions UNION ALL SELECT 'prop_2', 25",
+        "compiled_code": "SELECT 'store_1' AS customer_id, 10 AS orders UNION ALL SELECT 'store_2', 25",
+        "raw_code": "SELECT 'store_1' AS customer_id, 10 AS orders UNION ALL SELECT 'store_2', 25",
         "config": {"materialized": "incremental", "virtual_env": True},
     }
     fp_v1 = compute_node_fingerprint(node_v1).fingerprint
-    phys_v1 = f"traffic_metrics_root__{fp_v1}"
-    print(f"[v1] Computed fingerprint: {fp_v1} -> spacetime_physical.{phys_v1}")
+    phys_v1 = f"orders_metrics__{fp_v1}"
+    print(f"[v1] Computed fingerprint: {fp_v1} -> analytics_physical.{phys_v1}")
 
     q(
         f"""
-        CREATE OR REPLACE TABLE `{project}.spacetime_physical.{phys_v1}` AS
-        SELECT 'prop_1' AS entity_uuid, 10 AS sessions
+        CREATE OR REPLACE TABLE `{project}.analytics_physical.{phys_v1}` AS
+        SELECT 'store_1' AS customer_id, 10 AS orders
         UNION ALL
-        SELECT 'prop_2' AS entity_uuid, 25 AS sessions
+        SELECT 'store_2' AS customer_id, 25 AS orders
         """
     )
     q(
         f"""
-        CREATE OR REPLACE VIEW `{project}.spacetime_staging.traffic_metrics_root` AS
-        SELECT * FROM `{project}.spacetime_physical.{phys_v1}`
+        CREATE OR REPLACE VIEW `{project}.analytics_staging.orders_metrics` AS
+        SELECT * FROM `{project}.analytics_physical.{phys_v1}`
         """
     )
     q(
         f"""
-        CREATE OR REPLACE FUNCTION `{project}.spacetime_staging.udf_double_sessions`(n INT64)
+        CREATE OR REPLACE FUNCTION `{project}.analytics_staging.udf_double_orders`(n INT64)
         RETURNS INT64
         AS (n * 2)
         """
     )
     q(
         f"""
-        CREATE OR REPLACE TABLE FUNCTION `{project}.spacetime_staging.ft_report_traffic`(min_s INT64)
+        CREATE OR REPLACE TABLE FUNCTION `{project}.analytics_staging.tvf_orders_report`(min_o INT64)
         AS (
           SELECT
-            entity_uuid,
-            sessions,
-            `{project}.spacetime_staging.udf_double_sessions`(sessions) AS doubled_sessions
-          FROM `{project}.spacetime_staging.traffic_metrics_root`
-          WHERE sessions >= min_s
+            customer_id,
+            orders,
+            `{project}.analytics_staging.udf_double_orders`(orders) AS doubled_orders
+          FROM `{project}.analytics_staging.orders_metrics`
+          WHERE orders >= min_o
         )
         """
     )
 
     stg_rows = q(
-        f"SELECT entity_uuid, sessions, doubled_sessions FROM `{project}.spacetime_staging.ft_report_traffic`(15)"
+        f"SELECT customer_id, orders, doubled_orders FROM `{project}.analytics_staging.tvf_orders_report`(15)"
     )
-    assert stg_rows == [{"entity_uuid": "prop_2", "sessions": 25, "doubled_sessions": 50}], stg_rows
+    assert stg_rows == [{"customer_id": "store_2", "orders": 25, "doubled_orders": 50}], stg_rows
     print("[v1] Staging TVF + UDF + virtual view verified:", stg_rows)
 
     # 3. Zero-rebuild Promote v1 to prod (view swap + routine deploy)
     q(
         f"""
-        CREATE OR REPLACE VIEW `{project}.spacetime.traffic_metrics_root` AS
-        SELECT * FROM `{project}.spacetime_physical.{phys_v1}`
+        CREATE OR REPLACE VIEW `{project}.analytics.orders_metrics` AS
+        SELECT * FROM `{project}.analytics_physical.{phys_v1}`
         """
     )
     q(
         f"""
-        CREATE OR REPLACE FUNCTION `{project}.spacetime.udf_double_sessions`(n INT64)
+        CREATE OR REPLACE FUNCTION `{project}.analytics.udf_double_orders`(n INT64)
         RETURNS INT64
         AS (n * 2)
         """
     )
     q(
         f"""
-        CREATE OR REPLACE TABLE FUNCTION `{project}.spacetime.ft_report_traffic`(min_s INT64)
+        CREATE OR REPLACE TABLE FUNCTION `{project}.analytics.tvf_orders_report`(min_o INT64)
         AS (
           SELECT
-            entity_uuid,
-            sessions,
-            `{project}.spacetime.udf_double_sessions`(sessions) AS doubled_sessions
-          FROM `{project}.spacetime.traffic_metrics_root`
-          WHERE sessions >= min_s
+            customer_id,
+            orders,
+            `{project}.analytics.udf_double_orders`(orders) AS doubled_orders
+          FROM `{project}.analytics.orders_metrics`
+          WHERE orders >= min_o
         )
         """
     )
     prod_v1_rows = q(
-        f"SELECT SUM(sessions) AS total_sessions FROM `{project}.spacetime.ft_report_traffic`(0)"
+        f"SELECT SUM(orders) AS total_orders FROM `{project}.analytics.tvf_orders_report`(0)"
     )
-    assert prod_v1_rows == [{"total_sessions": 35}], prod_v1_rows
+    assert prod_v1_rows == [{"total_orders": 35}], prod_v1_rows
     print("[v1] Promoted to prod with zero table rebuild:", prod_v1_rows)
 
     # 4. Build v2 in staging (seed from prod v1 table + incremental insert), then promote to prod
     node_v2 = {
         **node_v1,
-        "compiled_code": "SELECT 'prop_1' AS entity_uuid, 10 AS sessions UNION ALL SELECT 'prop_2', 25 UNION ALL SELECT 'prop_3', 40",
+        "compiled_code": "SELECT 'store_1' AS customer_id, 10 AS orders UNION ALL SELECT 'store_2', 25 UNION ALL SELECT 'store_3', 40",
     }
     fp_v2 = compute_node_fingerprint(node_v2).fingerprint
-    phys_v2 = f"traffic_metrics_root__{fp_v2}"
+    phys_v2 = f"orders_metrics__{fp_v2}"
     assert fp_v1 != fp_v2
-    print(f"[v2] Computed fingerprint: {fp_v2} -> spacetime_physical.{phys_v2}")
+    print(f"[v2] Computed fingerprint: {fp_v2} -> analytics_physical.{phys_v2}")
 
     # Seed v2 from prod's v1 table and append incremental row
     q(
         f"""
-        CREATE OR REPLACE TABLE `{project}.spacetime_physical.{phys_v2}` AS
-        SELECT * FROM `{project}.spacetime_physical.{phys_v1}`
+        CREATE OR REPLACE TABLE `{project}.analytics_physical.{phys_v2}` AS
+        SELECT * FROM `{project}.analytics_physical.{phys_v1}`
         UNION ALL
-        SELECT 'prop_3' AS entity_uuid, 40 AS sessions
+        SELECT 'store_3' AS customer_id, 40 AS orders
         """
     )
     # Promote v2 to prod by swapping the view only (TVF in prod automatically reads the swapped view!)
     q(
         f"""
-        CREATE OR REPLACE VIEW `{project}.spacetime.traffic_metrics_root` AS
-        SELECT * FROM `{project}.spacetime_physical.{phys_v2}`
+        CREATE OR REPLACE VIEW `{project}.analytics.orders_metrics` AS
+        SELECT * FROM `{project}.analytics_physical.{phys_v2}`
         """
     )
     prod_v2_rows = q(
-        f"SELECT SUM(sessions) AS total_sessions FROM `{project}.spacetime.ft_report_traffic`(0)"
+        f"SELECT SUM(orders) AS total_orders FROM `{project}.analytics.tvf_orders_report`(0)"
     )
-    assert prod_v2_rows == [{"total_sessions": 75}], prod_v2_rows
+    assert prod_v2_rows == [{"total_orders": 75}], prod_v2_rows
     print("[v2] Promoted to prod via view swap (TVF automatically sees v2 data):", prod_v2_rows)
 
     # 5. Instant Rollback of prod from v2 back to v1
     q(
         f"""
-        CREATE OR REPLACE VIEW `{project}.spacetime.traffic_metrics_root` AS
-        SELECT * FROM `{project}.spacetime_physical.{phys_v1}`
+        CREATE OR REPLACE VIEW `{project}.analytics.orders_metrics` AS
+        SELECT * FROM `{project}.analytics_physical.{phys_v1}`
         """
     )
     prod_rollback_rows = q(
-        f"SELECT SUM(sessions) AS total_sessions FROM `{project}.spacetime.ft_report_traffic`(0)"
+        f"SELECT SUM(orders) AS total_orders FROM `{project}.analytics.tvf_orders_report`(0)"
     )
-    assert prod_rollback_rows == [{"total_sessions": 35}], prod_rollback_rows
+    assert prod_rollback_rows == [{"total_orders": 35}], prod_rollback_rows
     print("[rollback] Instant view rollback to v1 verified:", prod_rollback_rows)
 
     print("All dbt-virtual emulator E2E checks PASSED.")

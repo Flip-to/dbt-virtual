@@ -25,9 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
         with:
+          enable-cache: true
+          cache-suffix: unit-${{ matrix.python-version }}
           python-version: ${{ matrix.python-version }}
       - name: Sync dependencies
         run: uv sync --extra dev --python ${{ matrix.python-version }}
@@ -44,26 +44,45 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v6
         with:
+          enable-cache: true
+          cache-suffix: emulator-3.11
           python-version: "3.11"
       - name: Sync dependencies (with emulator client)
         run: uv sync --extra dev --extra emulator --python 3.11
+      - name: Resolve Flip-to/bigquery-emulator revision
+        id: bqemu_rev
+        run: |
+          REV=$(git ls-remote https://github.com/Flip-to/bigquery-emulator.git refs/heads/flipto/main | cut -f1)
+          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
+      - name: Cache Flip-to/bigquery-emulator Docker image
+        id: bqemu_cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/bqemu-cache
+          key: bqemu-image-v1-${{ steps.bqemu_rev.outputs.rev }}
+          restore-keys: |
+            bqemu-image-v1-
       - name: Start Flip-to/bigquery-emulator
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Try pulling prebuilt ghcr.io/flip-to/bigquery-emulator:flipto first (when org package
-          # read access is granted to the repo); otherwise build from public Flip-to/bigquery-emulator#flipto/main.
-          if echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin && \
-             docker pull ghcr.io/flip-to/bigquery-emulator:flipto; then
+          mkdir -p /tmp/bqemu-cache
+          if [ -f /tmp/bqemu-cache/bqemu.tar.zst ]; then
+            echo "Loading cached Flip-to/bigquery-emulator image..."
+            zstd -dc /tmp/bqemu-cache/bqemu.tar.zst | docker load
+            IMAGE="bigquery-emulator:flipto"
+          elif echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin && \
+               docker pull ghcr.io/flip-to/bigquery-emulator:flipto; then
             IMAGE="ghcr.io/flip-to/bigquery-emulator:flipto"
+            docker tag "$IMAGE" bigquery-emulator:flipto
+            docker save bigquery-emulator:flipto | zstd -T0 -3 -o /tmp/bqemu-cache/bqemu.tar.zst
           else
             echo "Building Flip-to/bigquery-emulator from public repo flipto/main..."
             docker build -t bigquery-emulator:flipto https://github.com/Flip-to/bigquery-emulator.git#flipto/main
             IMAGE="bigquery-emulator:flipto"
+            docker save bigquery-emulator:flipto | zstd -T0 -3 -o /tmp/bqemu-cache/bqemu.tar.zst
           fi
           docker run -d --name bqemu -p 9050:9050 -p 9060:9060 "$IMAGE" \
             --project=test-project --host=0.0.0.0 --port=9050
