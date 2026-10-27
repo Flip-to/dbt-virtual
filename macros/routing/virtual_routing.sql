@@ -35,7 +35,8 @@
 
 {% macro virtual_ref() -%}
   {#-
-    Configurable ref() resolution for virtualized models (see SPEC 02):
+    DECISION(default_ref_resolution_env_view):
+    Configurable ref() resolution for virtualized models (see docs/specs/20261027_routing_ref_modes_and_clone_seeding.md):
     - Mode A ('env_view', default): resolves virtualized table models to <env_schema>.<model_name>
       so downstream views & TVFs read the virtual environment view and swap instantaneously on promote/rollback.
     - Mode B ('physical'): resolves directly to <physical_schema>.<model_name>__<fp>.

@@ -53,9 +53,7 @@ def is_virtual_node(node: dict[str, Any]) -> bool:
     if extra.get("virtual_env") is True:
         return True
     meta = config.get("meta") or {}
-    if meta.get("virtual_env") is True:
-        return True
-    return False
+    return meta.get("virtual_env") is True
 
 
 def normalize_sql(
@@ -76,7 +74,7 @@ def normalize_sql(
 
     # Replace known environment / physical schemas with a canonical schema token
     if known_schemas:
-        for schema in sorted(set(s for s in known_schemas if s), key=len, reverse=True):
+        for schema in sorted({s for s in known_schemas if s}, key=len, reverse=True):
             pattern = re.compile(rf"(`?)\b{re.escape(schema)}\b\1\.")
             normalized = pattern.sub("__DBT_VIRTUAL_SCHEMA__.", normalized)
 

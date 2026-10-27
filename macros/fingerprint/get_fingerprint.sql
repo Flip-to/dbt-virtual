@@ -63,7 +63,9 @@
     {{ return(precomputed[model_name]) }}
   {%- endif -%}
 
-  {#- Pure Jinja fallback when invoked via bare `dbt run` without `dbt-virtual build` -#}
+  {#- Pure Jinja fallback when invoked via bare `dbt run` without `dbt-virtual build`.
+      TECH_DEBT(jinja_fingerprint_no_merkle_parents): hashes own raw_code + config only;
+      use `dbt-virtual build` for full topological Merkle-DAG parent propagation. -#}
   {%- set node_cfg = node.get('config', {}) -%}
   {%- set payload = (
     (node.get('raw_code', '') or node.get('raw_sql', ''))

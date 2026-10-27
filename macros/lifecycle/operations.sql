@@ -1,5 +1,7 @@
 {% macro virtual_promote(from_env='staging', to_env='prod', release_id='') -%}
   {#-
+    TECH_DEBT(bigquery_sql_in_lifecycle_ops): Registry queries currently use BigQuery backtick
+    identifiers and MERGE syntax directly; move into macros/adapters/dispatch.sql.
     Zero-rebuild promotion:
     1. Verifies every physical table in `release_id` (or `from_env` active state) exists.
     2. Repoints `to_env` views (`<to_env_schema>.<model>`) to `<physical_schema>.<model>__<fp>`.

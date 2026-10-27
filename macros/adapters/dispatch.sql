@@ -3,8 +3,14 @@
 {%- endmacro %}
 
 {% macro bigquery__clone_table_sql(source_relation, target_relation) -%}
-  CREATE TABLE IF NOT EXISTS {{ target_relation }}
-  CLONE {{ source_relation }}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if cfg.get('use_ctas_for_clone', false) or target.name == 'emulator' -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
+    SELECT * FROM {{ source_relation }}
+  {%- else -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }}
+    CLONE {{ source_relation }}
+  {%- endif -%}
 {%- endmacro %}
 
 {% macro default__clone_table_sql(source_relation, target_relation) -%}

@@ -1,14 +1,25 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main, master]
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  unit-and-guards:
+    name: Unit tests & docs layout guard
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
@@ -18,7 +29,49 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv pip install --system -e ".[dev]"
+      - name: Guard docs layout (specs, decisions, tech_debt, beans, A2V)
+        run: python scripts/check_docs_layout.py
       - name: Lint with ruff
-        run: ruff check src tests
+        run: ruff check src tests scripts
       - name: Run unit tests
         run: pytest -v
+
+  emulator-e2e:
+    name: BigQuery Emulator E2E (Flip-to/bigquery-emulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+      - name: Install dependencies (with emulator client)
+        run: uv pip install --system -e ".[dev,emulator]"
+      - name: Start Flip-to/bigquery-emulator
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Try pulling prebuilt ghcr.io/flip-to/bigquery-emulator:flipto first (when org package
+          # read access is granted to the repo); otherwise build from public Flip-to/bigquery-emulator#flipto/main.
+          if echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin && \
+             docker pull ghcr.io/flip-to/bigquery-emulator:flipto; then
+            IMAGE="ghcr.io/flip-to/bigquery-emulator:flipto"
+          else
+            echo "Building Flip-to/bigquery-emulator from public repo flipto/main..."
+            docker build -t bigquery-emulator:flipto https://github.com/Flip-to/bigquery-emulator.git#flipto/main
+            IMAGE="bigquery-emulator:flipto"
+          fi
+          docker run -d --name bqemu -p 9050:9050 -p 9060:9060 "$IMAGE" \
+            --project=test-project --host=0.0.0.0 --port=9050
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9050/bigquery/v2/projects/test-project/datasets >/dev/null; then
+              echo "BigQuery emulator is ready."
+              break
+            fi
+            sleep 1
+          done
+      - name: Run E2E virtual environment lifecycle test
+        env:
+          BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
+          BIGQUERY_EMULATOR_PROJECT: "test-project"
+        run: python scripts/run_emulator_e2e.py

@@ -26,15 +26,23 @@ In standard dbt deployments:
 
 ---
 
-## Architecture & Specifications
+## Architecture, Specs, Decisions & Tech Debt
 
-Full engineering specifications live under [`docs/`](docs/SPEC.md):
-- **[Master Architecture Spec (`docs/SPEC.md`)](docs/SPEC.md)** — Problem, goals, architecture diagram, and roadmap.
-- **[SPEC 01: Merkle-DAG Fingerprinting & Canonical SQL Normalization](docs/specs/01_fingerprinting_and_merkle_dag.md)** — Target-invariant SQL normalization and topological Merkle hashing.
-- **[SPEC 02: Routing, `ref()` Resolution Modes, and Zero-Copy `CLONE` Seeding](docs/specs/02_routing_ref_modes_and_clone_seeding.md)** — Default `env_view` (Option A) resolution, alternative `physical` / `hybrid` / `explicit` modes, and incremental cloning.
-- **[SPEC 03: Routine Virtualization (`table_function`, `function`, `procedure`) & TVF Testing](docs/specs/03_routine_virtualization_and_tvf_testing.md)** — Atomic promotion/rollback of BigQuery TVFs, scalar UDFs, and stored procedures.
-- **[SPEC 04: Lifecycle Operations, State Registry, Rollback & Janitor GC](docs/specs/04_lifecycle_promote_rollback_and_gc.md)** — `_environments` and `_releases` schemas, `plan`, `build`, `promote`, `rollback`, `diff`, and `gc`.
-- **[SPEC 05: Multi-Warehouse Adapter Dispatch & Integration Guide](docs/specs/05_adapter_dispatch_and_flipto_integration.md)** — BigQuery, DuckDB, and Snowflake dispatch + Cloud Workflows integration.
+All written documentation follows [`docs/conventions/docs_and_specs.md`](docs/conventions/docs_and_specs.md) and is enforced in CI by [`scripts/check_docs_layout.py`](scripts/check_docs_layout.py):
+
+### Specifications (`docs/specs/`)
+- **[Spec Index (`docs/specs/README.md`)](docs/specs/README.md)**
+- **[`20261027_dbt_virtual_architecture.md`](docs/specs/20261027_dbt_virtual_architecture.md)** — Master architecture, problem statement, alternatives, rollout, and verification.
+- **[`20261027_merkle_dag_fingerprinting.md`](docs/specs/20261027_merkle_dag_fingerprinting.md)** — Target-invariant SQL normalization and topological Merkle hashing.
+- **[`20261027_routing_ref_modes_and_clone_seeding.md`](docs/specs/20261027_routing_ref_modes_and_clone_seeding.md)** — Default `env_view` (Option A) resolution, alternative `physical` / `hybrid` / `explicit` modes, and incremental cloning.
+- **[`20261027_routine_virtualization_and_tvf_testing.md`](docs/specs/20261027_routine_virtualization_and_tvf_testing.md)** — Atomic promotion/rollback of BigQuery TVFs, scalar UDFs, and stored procedures.
+- **[`20261027_lifecycle_promote_rollback_and_gc.md`](docs/specs/20261027_lifecycle_promote_rollback_and_gc.md)** — `_environments` and `_releases` schemas, `plan`, `build`, `promote`, `rollback`, `diff`, and `gc`.
+- **[`20261027_adapter_dispatch_and_emulator_ci.md`](docs/specs/20261027_adapter_dispatch_and_emulator_ci.md)** — Multi-warehouse adapter dispatch & `Flip-to/bigquery-emulator` CI integration.
+
+### Decisions & Tech Debt
+- **[Decision Index (`docs/decisions/README.md`)](docs/decisions/README.md)** — Architectural decision records (`DECISION(<slug>)`).
+- **[Tech Debt Index (`docs/tech_debt/README.md`)](docs/tech_debt/README.md)** — Tracked debt items (`TECH_DEBT(<slug>)`) linked to `.beans/`.
+- **[Developer & Agent Guide (`CLAUDE.md` / `AGENTS.md`)](CLAUDE.md)** — Rules, skills, A2V track, and local commands.
 
 ---
 

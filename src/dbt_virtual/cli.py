@@ -6,8 +6,8 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from dbt_virtual import __version__
 from dbt_virtual.fingerprint import (
