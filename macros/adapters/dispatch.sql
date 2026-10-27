@@ -168,7 +168,7 @@
     fingerprint VARCHAR NOT NULL,
     physical_identifier VARCHAR NOT NULL,
     release_id VARCHAR,
-    updated_at TIMESTAMP_NTZ NOT NULL
+    updated_at TIMESTAMP NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
@@ -182,9 +182,9 @@
     physical_identifier VARCHAR NOT NULL,
     routine_ddl_template VARCHAR,
     status VARCHAR NOT NULL,
-    created_at TIMESTAMP_NTZ NOT NULL,
-    promoted_at TIMESTAMP_NTZ,
-    rolled_back_at TIMESTAMP_NTZ
+    created_at TIMESTAMP NOT NULL,
+    promoted_at TIMESTAMP,
+    rolled_back_at TIMESTAMP
   );
 {%- endmacro %}
 

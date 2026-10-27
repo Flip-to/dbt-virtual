@@ -108,7 +108,7 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     phys_v1 = f"orders_metrics__{fp_v1}"
     harness.vars_dict["_dbt_virtual_fps"] = {"orders_metrics": fp_v1}
 
-    sf_exec(f"CREATE TABLE analytics_physical.{phys_v1} (customer_id VARCHAR, orders NUMBER)")
+    sf_exec(f"CREATE TABLE analytics_physical.{phys_v1} (customer_id VARCHAR, orders INTEGER)")
     sf_exec(
         f"INSERT INTO analytics_physical.{phys_v1} VALUES ('store_1', 10), ('store_2', 25)"
     )
