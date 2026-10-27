@@ -34,8 +34,8 @@ Exercises the full virtual data environment lifecycle against a running BigQuery
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
