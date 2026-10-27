@@ -66,11 +66,48 @@
     ) -%}
     {%- if source_exists is not none -%}
       {{ log("dbt-virtual: Seeding " ~ this ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
+      {#- Prime dbt's relation cache so subsequent is_incremental() checks during model execution return True -#}
+      {%- do adapter.cache_added(this) -%}
       {{ return(dbt_virtual.clone_table_sql(source_rel, this)) }}
     {%- endif -%}
   {%- endif -%}
 
   {{ return('') }}
+{%- endmacro %}
+
+
+{% macro is_incremental() -%}
+  {#-
+    Virtual-environment-aware `is_incremental()` helper:
+    Returns True if standard `builtins.is_incremental()` is True OR if `clone_if_new_fp` will seed
+    `<this>` from `base_environment` (`prod`) in its pre-hook.
+  -#}
+  {%- if builtins.is_incremental() -%}
+    {{ return(true) }}
+  {%- endif -%}
+  {%- if not execute or not dbt_virtual.is_virtual_node(model) -%}
+    {{ return(false) }}
+  {%- endif -%}
+  {%- set mat = model.get('config', {}).get('materialized', '') -%}
+  {%- if mat != 'incremental' or flags.FULL_REFRESH -%}
+    {{ return(false) }}
+  {%- endif -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set base_env = cfg.get('base_environment', 'prod') -%}
+  {%- set lookup_query -%}
+    SELECT physical_identifier
+    FROM `{{ this.database }}`.`{{ phys_schema }}`._environments
+    WHERE environment = '{{ base_env }}'
+      AND model_name = '{{ model.name }}'
+      AND resource_type = 'model'
+    LIMIT 1
+  {%- endset -%}
+  {%- set results = run_query(lookup_query) -%}
+  {%- if results and (results.rows | length) > 0 -%}
+    {{ return(true) }}
+  {%- endif -%}
+  {{ return(false) }}
 {%- endmacro %}
 
 
@@ -170,9 +207,44 @@
     {%- set cfg = dbt_virtual.get_config() -%}
     {%- set phys_schema = cfg.get('physical_schema') -%}
     {%- set env_name = dbt_virtual.get_current_env() -%}
+    {%- set env_schema = dbt_virtual.get_env_schema(env_name) -%}
     {%- set fp = dbt_virtual.get_fingerprint(node) -%}
     {%- set release_id = var('_dbt_virtual_release', '') -%}
     {%- do dbt_virtual.ensure_registry() -%}
+
+    {%- set node_cfg = node.get('config', {}) -%}
+    {%- set params_sig = node_cfg.get('parameters', '') -%}
+    {%- set returns_sig = node_cfg.get('returns', '') -%}
+
+    {%- if routine_type == 'function' -%}
+      {%- set dep_tier = 1 -%}
+      {%- set full_ddl -%}
+CREATE OR REPLACE FUNCTION `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
+RETURNS {{ returns_sig }}
+AS (
+{{ body_sql }}
+)
+      {%- endset -%}
+    {%- elif routine_type == 'table_function' -%}
+      {%- set dep_tier = 3 -%}
+      {%- set full_ddl -%}
+CREATE OR REPLACE TABLE FUNCTION `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
+{%- if returns_sig %}
+RETURNS {{ returns_sig }}
+{%- endif %}
+AS (
+{{ body_sql }}
+)
+      {%- endset -%}
+    {%- else -%}
+      {%- set dep_tier = 4 -%}
+      {%- set full_ddl -%}
+CREATE OR REPLACE PROCEDURE `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
+{{ body_sql }}
+      {%- endset -%}
+    {%- endif -%}
+
+    {%- set ddl_template = full_ddl | replace(env_schema, '__DBT_VIRTUAL_ENV_SCHEMA__') -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}
       MERGE `{{ target_relation.database }}`.`{{ phys_schema }}`._environments AS T
@@ -193,6 +265,38 @@
         release_id = S.release_id,
         updated_at = S.updated_at
       WHEN NOT MATCHED THEN INSERT ROW;
+
+      {%- if release_id != '' %}
+      INSERT INTO `{{ target_relation.database }}`.`{{ phys_schema }}`._releases (
+        release_id,
+        source_environment,
+        target_environment,
+        model_name,
+        resource_type,
+        dependency_tier,
+        fingerprint,
+        physical_identifier,
+        routine_ddl_template,
+        status,
+        created_at,
+        promoted_at,
+        rolled_back_at
+      ) VALUES (
+        '{{ release_id }}',
+        '{{ env_name }}',
+        NULL,
+        '{{ node.name }}',
+        '{{ routine_type }}',
+        {{ dep_tier }},
+        '{{ fp }}',
+        '{{ target_relation.schema }}.{{ target_relation.identifier }}',
+        {{ dbt.string_literal(ddl_template) }},
+        'candidate',
+        CURRENT_TIMESTAMP(),
+        NULL,
+        NULL
+      );
+      {%- endif %}
     {%- endcall -%}
   {%- endif -%}
 {%- endmacro %}

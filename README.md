@@ -110,19 +110,26 @@ In your project's `macros/generate_schema_name.sql` and `macros/generate_alias_n
 ### 4. Lifecycle Commands
 
 ```bash
-# 1. Plan & inspect Merkle-DAG fingerprints
+# 1. Plan & inspect Merkle-DAG fingerprints (classifies REUSE, SEED_INCREMENTAL, FULL_BUILD, ROUTINE_DEPLOY)
 dbt-virtual plan --env staging
 
-# 2. Build in staging (seeds new incremental fingerprints via CLONE from prod)
+# 2. Build in staging (skips REUSE models in 0 compute; seeds new incremental fingerprints via CLONE from prod)
 dbt-virtual build --env staging --release v2026.10.27
 
-# 3. Zero-rebuild promote from staging -> prod (swaps views + deploys routines)
+# 3. Check column-level schema compatibility (BREAKING vs NON_BREAKING) before promotion
+dbt-virtual diff --base-manifest prod_manifest.json --fail-on-breaking
+
+# 4. Zero-rebuild promote from staging -> prod (swaps views + deploys routines in tier order 1->2->3->4)
 dbt-virtual promote --from staging --to prod --release v2026.10.27
 
-# 4. Instant rollback to previous release on gate failure
+# 5. Instant rollback to previous release on gate failure
 dbt-virtual rollback --env prod
 
-# 5. Janitor garbage collection of unreferenced physical tables
+# 6. Ephemeral PR environments (0-compute bootstrap from prod & teardown on PR close)
+dbt-virtual init-env --env pr_123 --from prod
+dbt-virtual drop-env --env pr_123
+
+# 7. Janitor garbage collection of unreferenced physical tables
 dbt-virtual gc --dry-run
 ```
 
