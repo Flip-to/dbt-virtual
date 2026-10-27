@@ -458,8 +458,13 @@ def test_jinja_sql_macros_parse_cleanly() -> None:
             "{% endmaterialization %}", "{% endblock %}"
         )
         sanitized = re.sub(
-            r"\{%\s*block\s+mat_(\w+),\s*adapter='[^']+'\s*%\}",
-            r"{% block mat_\1 %}",
+            r"\{%\s*block\s+mat_(\w+),\s*adapter='([^']+)'\s*%\}",
+            r"{% block mat_\1_\2 %}",
+            sanitized,
+        )
+        sanitized = re.sub(
+            r"\{%\s*block\s+mat_(\w+),\s*default\s*%\}",
+            r"{% block mat_\1_default %}",
             sanitized,
         )
         env.parse(sanitized)

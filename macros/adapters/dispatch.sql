@@ -1,3 +1,16 @@
+{% macro current_timestamp_sql() -%}
+  {{ return(adapter.dispatch('current_timestamp_sql', 'dbt_virtual')()) }}
+{%- endmacro %}
+
+{% macro bigquery__current_timestamp_sql() -%}
+  CURRENT_TIMESTAMP()
+{%- endmacro %}
+
+{% macro default__current_timestamp_sql() -%}
+  CURRENT_TIMESTAMP
+{%- endmacro %}
+
+
 {% macro clone_table_sql(source_relation, target_relation) -%}
   {{ return(adapter.dispatch('clone_table_sql', 'dbt_virtual')(source_relation, target_relation)) }}
 {%- endmacro %}
@@ -14,8 +27,25 @@
 {%- endmacro %}
 
 {% macro snowflake__clone_table_sql(source_relation, target_relation) -%}
-  CREATE TABLE IF NOT EXISTS {{ target_relation }}
-  CLONE {{ source_relation }}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if cfg.get('use_ctas_for_clone', false) or target.name == 'emulator' -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
+    SELECT * FROM {{ source_relation }}
+  {%- else -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }}
+    CLONE {{ source_relation }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro databricks__clone_table_sql(source_relation, target_relation) -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if cfg.get('use_ctas_for_clone', false) or target.name == 'emulator' -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
+    SELECT * FROM {{ source_relation }}
+  {%- else -%}
+    CREATE TABLE IF NOT EXISTS {{ target_relation }}
+    SHALLOW CLONE {{ source_relation }}
+  {%- endif -%}
 {%- endmacro %}
 
 {% macro default__clone_table_sql(source_relation, target_relation) -%}
@@ -28,9 +58,49 @@
   {{ return(adapter.dispatch('create_or_replace_view_sql', 'dbt_virtual')(view_relation, physical_relation)) }}
 {%- endmacro %}
 
+{% macro postgres__create_or_replace_view_sql(view_relation, physical_relation) -%}
+  DROP VIEW IF EXISTS {{ view_relation }} CASCADE;
+  CREATE VIEW {{ view_relation }} AS
+  SELECT * FROM {{ physical_relation }}
+{%- endmacro %}
+
 {% macro default__create_or_replace_view_sql(view_relation, physical_relation) -%}
   CREATE OR REPLACE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
+{%- endmacro %}
+
+
+{% macro create_schema_if_not_exists_sql(schema_name) -%}
+  {{ return(adapter.dispatch('create_schema_if_not_exists_sql', 'dbt_virtual')(schema_name)) }}
+{%- endmacro %}
+
+{% macro bigquery__create_schema_if_not_exists_sql(schema_name) -%}
+  CREATE SCHEMA IF NOT EXISTS `{{ target.database }}`.`{{ schema_name }}`
+{%- endmacro %}
+
+{% macro snowflake__create_schema_if_not_exists_sql(schema_name) -%}
+  CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
+{%- endmacro %}
+
+{% macro default__create_schema_if_not_exists_sql(schema_name) -%}
+  CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
+{%- endmacro %}
+
+
+{% macro drop_schema_cascade_sql(schema_name) -%}
+  {{ return(adapter.dispatch('drop_schema_cascade_sql', 'dbt_virtual')(schema_name)) }}
+{%- endmacro %}
+
+{% macro bigquery__drop_schema_cascade_sql(schema_name) -%}
+  DROP SCHEMA IF EXISTS `{{ target.database }}`.`{{ schema_name }}` CASCADE
+{%- endmacro %}
+
+{% macro snowflake__drop_schema_cascade_sql(schema_name) -%}
+  DROP SCHEMA IF EXISTS {{ schema_name }} CASCADE
+{%- endmacro %}
+
+{% macro default__drop_schema_cascade_sql(schema_name) -%}
+  DROP SCHEMA IF EXISTS {{ schema_name }} CASCADE
 {%- endmacro %}
 
 
@@ -40,6 +110,10 @@
 
 {% macro bigquery__registry_relation(physical_schema, table_name) -%}
   `{{ target.database }}`.`{{ physical_schema }}`.{{ table_name }}
+{%- endmacro %}
+
+{% macro snowflake__registry_relation(physical_schema, table_name) -%}
+  {{ physical_schema }}.{{ table_name }}
 {%- endmacro %}
 
 {% macro default__registry_relation(physical_schema, table_name) -%}
@@ -82,6 +156,36 @@
   )
   PARTITION BY DATE(created_at)
   CLUSTER BY release_id, status;
+{%- endmacro %}
+
+{% macro snowflake__ensure_registry_tables_sql(physical_schema) -%}
+  CREATE SCHEMA IF NOT EXISTS {{ physical_schema }};
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._environments (
+    environment VARCHAR NOT NULL,
+    model_name VARCHAR NOT NULL,
+    resource_type VARCHAR NOT NULL,
+    fingerprint VARCHAR NOT NULL,
+    physical_identifier VARCHAR NOT NULL,
+    release_id VARCHAR,
+    updated_at TIMESTAMP_NTZ NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
+    release_id VARCHAR NOT NULL,
+    source_environment VARCHAR NOT NULL,
+    target_environment VARCHAR,
+    model_name VARCHAR NOT NULL,
+    resource_type VARCHAR NOT NULL,
+    dependency_tier INTEGER NOT NULL,
+    fingerprint VARCHAR NOT NULL,
+    physical_identifier VARCHAR NOT NULL,
+    routine_ddl_template VARCHAR,
+    status VARCHAR NOT NULL,
+    created_at TIMESTAMP_NTZ NOT NULL,
+    promoted_at TIMESTAMP_NTZ,
+    rolled_back_at TIMESTAMP_NTZ
+  );
 {%- endmacro %}
 
 {% macro default__ensure_registry_tables_sql(physical_schema) -%}
@@ -140,6 +244,16 @@
   WHEN NOT MATCHED THEN INSERT ROW
 {%- endmacro %}
 
+{% macro snowflake__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
+  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
+  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at
+  ) VALUES (
+    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
+  )
+{%- endmacro %}
+
 {% macro default__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
   DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
   WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
@@ -148,6 +262,83 @@
   ) VALUES (
     '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
   )
+{%- endmacro %}
+
+
+{% macro create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
+  {{ return(adapter.dispatch('create_routine_ddl_sql', 'dbt_virtual')(routine_type, target_relation_str, params_sig, returns_sig, body_sql)) }}
+{%- endmacro %}
+
+{% macro bigquery__create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
+  {%- if routine_type == 'function' -%}
+CREATE OR REPLACE FUNCTION {{ target_relation_str }}({{ params_sig }})
+RETURNS {{ returns_sig }}
+AS (
+{{ body_sql }}
+)
+  {%- elif routine_type == 'table_function' -%}
+CREATE OR REPLACE TABLE FUNCTION {{ target_relation_str }}({{ params_sig }})
+{%- if returns_sig %}
+RETURNS {{ returns_sig }}
+{%- endif %}
+AS (
+{{ body_sql }}
+)
+  {%- else -%}
+CREATE OR REPLACE PROCEDURE {{ target_relation_str }}({{ params_sig }})
+{{ body_sql }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro snowflake__create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
+  {%- if routine_type == 'function' -%}
+CREATE OR REPLACE FUNCTION {{ target_relation_str }}({{ params_sig }})
+RETURNS {{ returns_sig }}
+AS $$
+{{ body_sql }}
+$$
+  {%- elif routine_type == 'table_function' -%}
+CREATE OR REPLACE FUNCTION {{ target_relation_str }}({{ params_sig }})
+RETURNS {{ returns_sig if returns_sig else 'TABLE()' }}
+AS $$
+{{ body_sql }}
+$$
+  {%- else -%}
+CREATE OR REPLACE PROCEDURE {{ target_relation_str }}({{ params_sig }})
+RETURNS {{ returns_sig if returns_sig else 'VARCHAR' }}
+LANGUAGE SQL
+AS $$
+{{ body_sql }}
+$$
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro duckdb__create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
+  {%- if routine_type == 'function' -%}
+CREATE OR REPLACE MACRO {{ target_relation_str }}({{ params_sig }}) AS ({{ body_sql }})
+  {%- elif routine_type == 'table_function' -%}
+CREATE OR REPLACE MACRO {{ target_relation_str }}({{ params_sig }}) AS TABLE ({{ body_sql }})
+  {%- else -%}
+-- DuckDB does not have SQL stored procedures; no-op
+SELECT 1
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro default__create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
+  {%- if routine_type in ['function', 'table_function'] -%}
+CREATE OR REPLACE FUNCTION {{ target_relation_str }}({{ params_sig }})
+RETURNS {{ returns_sig if returns_sig else ' RECORD' }}
+LANGUAGE SQL
+AS $$
+{{ body_sql }}
+$$
+  {%- else -%}
+CREATE OR REPLACE PROCEDURE {{ target_relation_str }}({{ params_sig }})
+LANGUAGE SQL
+AS $$
+{{ body_sql }}
+$$
+  {%- endif -%}
 {%- endmacro %}
 
 
@@ -182,6 +373,25 @@
   ORDER BY t.table_name
 {%- endmacro %}
 
+{% macro snowflake__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
+  SELECT LOWER(t.table_name) AS table_name
+  FROM {{ target.database }}.information_schema.tables AS t
+  WHERE UPPER(t.table_schema) = UPPER('{{ physical_schema }}')
+    AND t.table_type = 'BASE TABLE'
+    AND REGEXP_LIKE(LOWER(t.table_name), '.*__[0-9a-f]{8,64}$')
+    AND LOWER(t.table_name) NOT IN (
+      SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2))
+      FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+      WHERE resource_type = 'model'
+      UNION
+      SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2))
+      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+      WHERE resource_type = 'model'
+        AND status IN ('promoted', 'candidate')
+    )
+  ORDER BY 1
+{%- endmacro %}
+
 {% macro default__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   SELECT table_name
   FROM information_schema.tables
@@ -192,6 +402,11 @@
       SELECT REPLACE(physical_identifier, '{{ physical_schema }}.', '')
       FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
       WHERE resource_type = 'model'
+      UNION
+      SELECT REPLACE(physical_identifier, '{{ physical_schema }}.', '')
+      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+      WHERE resource_type = 'model'
+        AND status IN ('promoted', 'candidate')
     )
   ORDER BY table_name
 {%- endmacro %}

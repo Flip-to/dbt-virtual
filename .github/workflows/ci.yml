@@ -98,3 +98,69 @@ jobs:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_e2e.py
+
+  snowflake-and-postgres-e2e:
+    name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dbt
+          POSTGRES_PASSWORD: dbt
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-suffix: sf-pg-emulator-3.11
+          python-version: "3.11"
+      - name: Sync dependencies (with emulator & postgres clients)
+        run: uv sync --extra dev --extra emulator --python 3.11
+      - name: Resolve nnnkkk7/snowflake-emulator revision
+        id: sfemu_rev
+        run: |
+          REV=$(git ls-remote https://github.com/nnnkkk7/snowflake-emulator.git HEAD | cut -f1)
+          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
+      - name: Cache nnnkkk7/snowflake-emulator Docker image
+        uses: actions/cache@v5
+        with:
+          path: /tmp/sfemu-cache
+          key: sfemu-image-v1-${{ steps.sfemu_rev.outputs.rev }}
+          restore-keys: |
+            sfemu-image-v1-
+      - name: Start nnnkkk7/snowflake-emulator
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sfemu-cache
+          if [ -f /tmp/sfemu-cache/sfemu.tar.zst ]; then
+            echo "Loading cached nnnkkk7/snowflake-emulator image..."
+            zstd -dc /tmp/sfemu-cache/sfemu.tar.zst | docker load
+            SF_IMAGE="snowflake-emulator:cached"
+          else
+            docker pull ghcr.io/nnnkkk7/snowflake-emulator:latest
+            docker tag ghcr.io/nnnkkk7/snowflake-emulator:latest snowflake-emulator:cached
+            docker save snowflake-emulator:cached | zstd -T0 -3 -o /tmp/sfemu-cache/sfemu.tar.zst
+            SF_IMAGE="snowflake-emulator:cached"
+          fi
+          docker run -d --name sfemu -p 8080:8080 "$SF_IMAGE"
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null; then
+              echo "Snowflake emulator is ready."
+              break
+            fi
+            sleep 1
+          done
+      - name: Run Snowflake Emulator & PostgreSQL E2E lifecycle tests
+        env:
+          SNOWFLAKE_EMULATOR_HOST: "http://127.0.0.1:8080"
+          POSTGRES_DSN: "postgresql://dbt:dbt@127.0.0.1:5432/test_db"
+        run: uv run --python 3.11 python scripts/run_snowflake_emulator_e2e.py

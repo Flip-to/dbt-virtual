@@ -182,7 +182,7 @@
       '{{ phys_schema }}.{{ this.identifier }}',
       NULL,
       'candidate',
-      CURRENT_TIMESTAMP(),
+      {{ dbt_virtual.current_timestamp_sql() }},
       NULL,
       NULL
     );
@@ -209,31 +209,19 @@
 
     {%- if routine_type == 'function' -%}
       {%- set dep_tier = 1 -%}
-      {%- set full_ddl -%}
-CREATE OR REPLACE FUNCTION `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
-RETURNS {{ returns_sig }}
-AS (
-{{ body_sql }}
-)
-      {%- endset -%}
     {%- elif routine_type == 'table_function' -%}
       {%- set dep_tier = 3 -%}
-      {%- set full_ddl -%}
-CREATE OR REPLACE TABLE FUNCTION `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
-{%- if returns_sig %}
-RETURNS {{ returns_sig }}
-{%- endif %}
-AS (
-{{ body_sql }}
-)
-      {%- endset -%}
     {%- else -%}
       {%- set dep_tier = 4 -%}
-      {%- set full_ddl -%}
-CREATE OR REPLACE PROCEDURE `{{ target_relation.database }}`.`{{ env_schema }}`.`{{ target_relation.identifier }}`({{ params_sig }})
-{{ body_sql }}
-      {%- endset -%}
     {%- endif -%}
+
+    {%- set full_ddl = dbt_virtual.create_routine_ddl_sql(
+      routine_type,
+      target_relation | string,
+      params_sig,
+      returns_sig,
+      body_sql
+    ) -%}
 
     {%- set ddl_template = full_ddl | replace(env_schema, '__DBT_VIRTUAL_ENV_SCHEMA__') -%}
 

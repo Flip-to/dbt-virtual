@@ -1,23 +1,25 @@
-{% materialization procedure, adapter='bigquery' %}
-
+{% materialization procedure, default %}
   {#-
-    Virtual-environment-aware materialization for BigQuery stored procedures.
-    See SPEC 03 (`docs/specs/03_routine_virtualization_and_tvf_testing.md`).
+    Cross-adapter (BigQuery, Snowflake, Postgres) materialization for stored procedures.
   -#}
-
   {%- set target_relation = api.Relation.create(
     database=this.database,
     schema=this.schema,
     identifier=this.identifier,
-    type='external'
+    type='view'
   ) -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
   {% call statement('main') -%}
-    CREATE OR REPLACE PROCEDURE {{ target_relation }}({{ config.get('parameters', '') }})
-    {{ sql }}
+    {{ dbt_virtual.create_routine_ddl_sql(
+      'procedure',
+      target_relation | string,
+      config.get('parameters', ''),
+      config.get('returns', ''),
+      sql
+    ) }}
   {%- endcall %}
 
   {%- if dbt_virtual.is_virtual_node(model) -%}
@@ -29,5 +31,4 @@
   {{ run_hooks(post_hooks, inside_transaction=False) }}
 
   {{ return({'relations': [target_relation]}) }}
-
 {% endmaterialization %}

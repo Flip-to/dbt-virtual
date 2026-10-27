@@ -5,22 +5,23 @@ bean: dbt-virtual-0001
 prs: []
 ---
 
-# Multi-warehouse adapter dispatch and BigQuery emulator CI
+# Multi-warehouse adapter dispatch and emulator CI (BigQuery, Snowflake, DuckDB, Postgres, Databricks)
 
 ## Problem
 
-`dbt-virtual` targets BigQuery first (where `CREATE TABLE ... CLONE` and `CREATE TABLE FUNCTION` are core primitives), but open-source contributors and CI pipelines need to test every PR without requiring paid BigQuery credentials or production data.
+`dbt-virtual` originated on BigQuery (where `CREATE TABLE ... CLONE` and `CREATE TABLE FUNCTION` are core primitives), but production data teams also run dbt on **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks**, and open-source contributors need fast, hermetic CI pipelines that verify every warehouse dialect without paid cloud credentials.
 
 ## Decision
 
-1. **Adapter Dispatch (`macros/adapters/dispatch.sql`)**:
-   - Isolate warehouse-specific DDL behind `adapter.dispatch(..., 'dbt_virtual')`: `clone_table_sql`, `create_or_replace_view_sql`, and `ensure_registry_tables_sql`.
-2. **Hermetic CI on `Flip-to/bigquery-emulator` (`.github/workflows/ci.yml` & `scripts/run_emulator_e2e.py`)**:
-   - The `Flip-to/bigquery-emulator` fork (`flipto/main`, backed by `Flip-to/googlesqlite`) supports `CREATE OR REPLACE TABLE`, `CREATE OR REPLACE VIEW`, `CREATE OR REPLACE TABLE FUNCTION` (including `ANY TABLE`), `CREATE OR REPLACE FUNCTION`, `MERGE` with subquery sources, and `ASSERT`.
-   - Note on `CLONE` in the emulator: where `CREATE TABLE ... CLONE` is not supported by the SQLite-backed emulator analyzer, `bigquery__clone_table_sql` supports a configurable `var('dbt_virtual').use_ctas_for_clone` fallback (`CREATE TABLE IF NOT EXISTS ... AS SELECT * FROM ...`) when `target.name == 'emulator'`.
-   - CI runs two jobs on every push and PR with full caching (`setup-uv` cache + `docker/build-push-action` GitHub Actions cache):
-     1. **Fast Unit & Docs Layout Guard**: `ruff check`, `pytest`, and `scripts/check_docs_layout.py`.
-     2. **BigQuery Emulator E2E Test**: Starts `Flip-to/bigquery-emulator`, runs `scripts/run_emulator_e2e.py` (which tests fingerprinting, staging build, `CREATE TABLE FUNCTION`, zero-rebuild `virtual_promote` to `prod`, and `virtual_rollback`), and asserts exact row parity.
+1. **Multi-Warehouse Adapter Dispatch (`macros/adapters/dispatch.sql`)**:
+   - Isolate all warehouse-specific DDL and DQL behind `adapter.dispatch(..., 'dbt_virtual')`:
+     - `clone_table_sql`: `CLONE` on BigQuery and Snowflake (`bigquery__`, `snowflake__`), `SHALLOW CLONE` on Databricks (`databricks__`), and `CREATE TABLE IF NOT EXISTS ... AS SELECT *` on DuckDB/Postgres (`default__`) or when `use_ctas_for_clone` / `target.name == 'emulator'` is active.
+     - `create_or_replace_view_sql`: `CREATE OR REPLACE VIEW` (`default__`) and `DROP VIEW IF EXISTS ... CASCADE; CREATE VIEW ...` (`postgres__`).
+     - `ensure_registry_tables_sql`, `registry_relation`, `upsert_environment_pointer_sql`, `current_timestamp_sql`, `create_schema_if_not_exists_sql`, `drop_schema_cascade_sql`, `create_routine_ddl_sql`, and `find_orphan_tables_sql` with dedicated `bigquery__`, `snowflake__`, `duckdb__`, `postgres__`, and `default__` implementations.
+2. **Hermetic Multi-Emulator CI (`.github/workflows/ci.yml`)**:
+   - **Unit + In-Process DuckDB E2E (`unit-and-guards`)**: Runs `ruff check`, `scripts/check_docs_layout.py`, and `pytest` (including [`tests/test_duckdb_e2e.py`](../../tests/test_duckdb_e2e.py), which executes the full virtual environment lifecycle + DuckDB scalar/table macros against an in-memory DuckDB instance across Python 3.10, 3.11, and 3.12).
+   - **BigQuery Emulator E2E (`emulator-e2e`)**: Starts `Flip-to/bigquery-emulator` (`flipto/main`, cached via `actions/cache@v5` + `zstd`) and runs [`scripts/run_emulator_e2e.py`](../../scripts/run_emulator_e2e.py).
+   - **Snowflake Emulator & PostgreSQL E2E (`snowflake-and-postgres-e2e`)**: Starts [`nnnkkk7/snowflake-emulator`](https://github.com/nnnkkk7/snowflake-emulator) (`ghcr.io/nnnkkk7/snowflake-emulator:latest`, cached via `actions/cache@v5`) alongside a `postgres:16-alpine` service container and runs [`scripts/run_snowflake_emulator_e2e.py`](../../scripts/run_snowflake_emulator_e2e.py) across both Snowflake REST API v2 (`/api/v2/statements`) and PostgreSQL.
 
 ## Alternatives
 

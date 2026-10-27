@@ -17,12 +17,13 @@ In standard dbt deployments:
 
 | Capability | Standard dbt | `dbt-virtual` |
 |---|---|---|
+| **Supported Warehouses** | Adapter-specific | **BigQuery**, **Snowflake**, **DuckDB**, **PostgreSQL**, **Databricks** (all verified in CI via emulators/engines) |
 | **Physical Storage** | Mutable in-place table (`prod.orders`) | Content-addressed (`analytics_physical.orders__8f3a9c1b2d4e`) |
 | **Environment Isolation** | Separate physical rebuilds per target | Lightweight per-environment `VIEW` layers (`analytics_staging.orders`, `analytics.orders`) |
-| **Modified Incrementals** | Full refresh or manual clone | Automatic zero-copy `CREATE TABLE ... CLONE` from active `prod` table |
+| **Modified Incrementals** | Full refresh or manual clone | Automatic zero-copy `CLONE` (BigQuery / Snowflake / Databricks) or CTAS seed (DuckDB / Postgres) from active `prod` table |
 | **Promote `staging` → `prod`** | Full second `dbt build` in prod | **Zero rebuild** — metadata-only view swap + routine deploy |
 | **Rollback `prod`** | Manual revert PR + snapshot restore | **Instant rollback** — repoint views & redeploy previous release's routines |
-| **BigQuery TVFs / UDFs / Procs** | Not supported natively | First-class `table_function`, `function`, `procedure` materializations + `tvf_test_ref` |
+| **TVFs / UDFs / Procedures** | Not supported natively | First-class `table_function`, `function`, `procedure` materializations + `tvf_test_ref` |
 
 ---
 

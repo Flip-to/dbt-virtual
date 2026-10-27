@@ -102,7 +102,7 @@
   {%- endfor -%}
 
   {%- if release_id != '' -%}
-    {%- do run_query("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = CURRENT_TIMESTAMP() WHERE release_id = '" ~ release_id ~ "'") -%}
+    {%- do run_query("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
   {%- endif -%}
 {%- endmacro %}
 
@@ -147,10 +147,9 @@
     Creates schema `<env_schema>` and points all virtual views at `from_env`'s active physical tables
     in zero compute time.
   -#}
-  {%- set cfg = dbt_virtual.get_config() -%}
   {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
 
-  {%- do run_query("CREATE SCHEMA IF NOT EXISTS `" ~ target.database ~ "`.`" ~ env_schema ~ "`") -%}
+  {%- do run_query(dbt_virtual.create_schema_if_not_exists_sql(env_schema)) -%}
   {%- do dbt_virtual.virtual_promote(from_env=from_env, to_env=env, release_id='') -%}
 {%- endmacro %}
 
@@ -169,7 +168,7 @@
   {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
 
   {{ log("dbt-virtual drop-env: Dropping schema " ~ env_schema ~ " and cleaning _environments for env=" ~ env, info=True) }}
-  {%- do run_query("DROP SCHEMA IF EXISTS `" ~ target.database ~ "`.`" ~ env_schema ~ "` CASCADE") -%}
+  {%- do run_query(dbt_virtual.drop_schema_cascade_sql(env_schema)) -%}
   {%- do run_query("DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments') ~ " WHERE environment = '" ~ env ~ "'") -%}
 {%- endmacro %}
 

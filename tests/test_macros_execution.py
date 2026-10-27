@@ -19,9 +19,17 @@ class FakeRelation:
     schema: str
     identifier: str
     type: str = "table"
+    quote_char: str = "`"
 
     def __str__(self) -> str:
-        return f"`{self.database}`.`{self.schema}`.`{self.identifier}`"
+        if not self.quote_char:
+            if self.database:
+                return f"{self.database}.{self.schema}.{self.identifier}"
+            return f"{self.schema}.{self.identifier}"
+        q = self.quote_char
+        if self.database:
+            return f"{q}{self.database}{q}.{q}{self.schema}{q}.{q}{self.identifier}{q}"
+        return f"{q}{self.schema}{q}.{q}{self.identifier}{q}"
 
 
 class FakeResult:
@@ -180,7 +188,11 @@ class MacroTestHarness:
                         {
                             "create": staticmethod(
                                 lambda database, schema, identifier, type="table": FakeRelation(
-                                    database, schema, identifier, type
+                                    database,
+                                    schema,
+                                    identifier,
+                                    type,
+                                    "`" if self.adapter_type == "bigquery" else "",
                                 )
                             )
                         },
@@ -397,6 +409,32 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     )
     assert "DELETE FROM analytics_physical._environments" in upsert_sql
     assert "INSERT INTO analytics_physical._environments" in upsert_sql
+
+    # Snowflake dispatch: CLONE, UDF/TVF/Procedure DDL, and orphan table query
+    sf_harness = MacroTestHarness(
+        adapter_type="snowflake",
+        target_name="prod",
+        target_database="ANALYTICS_DB",
+    )
+    sf_clone = sf_harness.call_macro("clone_table_sql", src, dst)
+    assert "CLONE" in sf_clone
+    sf_tvf = sf_harness.call_macro(
+        "create_routine_ddl_sql",
+        "table_function",
+        "analytics.tvf_orders",
+        "min_o NUMBER",
+        "TABLE(customer_id VARCHAR, orders NUMBER)",
+        "SELECT customer_id, orders FROM analytics.orders WHERE orders >= min_o",
+    )
+    assert "RETURNS TABLE(customer_id VARCHAR, orders NUMBER)" in sf_tvf
+    assert "AS $$" in sf_tvf
+    sf_orphan = sf_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
+    assert "REGEXP_LIKE" in sf_orphan
+
+    # Databricks dispatch: SHALLOW CLONE
+    dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
+    dbx_clone = dbx_harness.call_macro("clone_table_sql", src, dst)
+    assert "SHALLOW CLONE" in dbx_clone
 
 
 def test_sync_env_view_and_register_routine_deployment() -> None:
