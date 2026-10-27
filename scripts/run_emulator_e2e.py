@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """End-to-end verification of dbt-virtual against Flip-to/bigquery-emulator.
 
 Exercises the full virtual data environment lifecycle against a running BigQuery emulator

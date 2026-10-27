@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """CI guard for docs/conventions/docs_and_specs.md. Offline, reads files only.
 
 1. Every name under docs/ is lowercase snake_case: no '-', except README.md.
