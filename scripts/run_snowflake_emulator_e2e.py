@@ -55,6 +55,10 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
                     f"Snowflake emulator error ({resp.status_code}) on `{stmt}`: {resp.text}"
                 )
             payload = resp.json()
+            if payload.get("sqlState") and payload.get("sqlState") != "00000":
+                raise RuntimeError(
+                    f"Snowflake emulator SQL error ({payload.get('code')}/{payload.get('sqlState')}) on `{stmt}`: {payload.get('message')}"
+                )
             rows = payload.get("data") or []
         return rows
 
