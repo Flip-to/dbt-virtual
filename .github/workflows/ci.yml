@@ -27,14 +27,14 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: uv pip install --system -e ".[dev]"
+      - name: Sync dependencies
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
       - name: Guard docs layout (specs, decisions, tech_debt, beans, A2V)
-        run: python scripts/check_docs_layout.py
+        run: uv run --python ${{ matrix.python-version }} python scripts/check_docs_layout.py
       - name: Lint with ruff
-        run: ruff check src tests scripts
+        run: uv run --python ${{ matrix.python-version }} ruff check src tests scripts
       - name: Run unit tests
-        run: pytest -v
+        run: uv run --python ${{ matrix.python-version }} pytest -v
 
   emulator-e2e:
     name: BigQuery Emulator E2E (Flip-to/bigquery-emulator)
@@ -44,8 +44,8 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - name: Set up Python 3.11
         run: uv python install 3.11
-      - name: Install dependencies (with emulator client)
-        run: uv pip install --system -e ".[dev,emulator]"
+      - name: Sync dependencies (with emulator client)
+        run: uv sync --extra dev --extra emulator --python 3.11
       - name: Start Flip-to/bigquery-emulator
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,4 +74,4 @@ jobs:
         env:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
-        run: python scripts/run_emulator_e2e.py
+        run: uv run --python 3.11 python scripts/run_emulator_e2e.py
