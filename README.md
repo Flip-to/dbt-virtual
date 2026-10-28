@@ -1,6 +1,6 @@
 # `dbt-virtual`
 
-**SQLMesh-style Virtual Data Environments for dbt** — content-addressed physical tables (`<model>__<fp>`), zero-copy `CLONE` incremental seeding, per-environment routine virtualization (`table_function`, `function`, `procedure`), zero-rebuild view-swap promotion, and instant rollback.
+**SQLMesh-style Virtual Data Environments for dbt** (first-class **BigQuery** + **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks**) — `sqlglot` AST Merkle-DAG fingerprinting (`<model>__<fp>`), zero-copy `CLONE` incremental seeding with post-clone column migration, per-environment routine virtualization (`table_function`, `function`, `procedure`), pre-promotion quality gates (`audit`), concurrency lease locks (`_locks`), interval tracking (`_intervals`), zero-rebuild view-swap promotion (with partial promotion & automatic demotion), and instant rollback.
 
 [![CI](https://github.com/Flip-to/dbt-virtual/actions/workflows/ci.yml/badge.svg)](https://github.com/Flip-to/dbt-virtual/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-GitHub_Pages-indigo?logo=materialformkdocs)](https://flip-to.github.io/dbt-virtual/)

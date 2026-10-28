@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: implemented
 ticket: None
 bean: dbt-virtual-0001
 prs: []
@@ -19,14 +19,14 @@ prs: []
    - Virtualized routines (`table_function`, `function`, `procedure`) and views deploy to `<env_schema>.<model>`.
 2. **`ref()` Resolution Modes (Default Option A + Configurable Strategy)**:
    - See decision [20261027_default_ref_resolution_env_view.md](../decisions/20261027_default_ref_resolution_env_view.md).
-   - **Mode A (`ref_resolution: "env_view"`, default)**: Resolves `{{ ref('A') }}` to `<env_schema>.A`. Downstream views and BigQuery TVFs read the virtual view, so promoting or rolling back `A` via view swap requires zero recompilation of unchanged downstream readers.
+   - **Mode A (`ref_resolution: "env_view"`, default)**: Resolves `{{ ref('A') }}` to `<env_schema>.A`. Downstream views and TVFs read the virtual view, so promoting or rolling back `A` via view swap requires zero recompilation of unchanged downstream readers.
    - **Mode B (`ref_resolution: "physical"`)**: Resolves `{{ ref('A') }}` directly to `<physical_schema>.A__<fp_A>`.
    - **Mode C (`ref_resolution: "hybrid"`)**: Physical tables bind `<physical_schema>.A__<fp_A>`, while routines and views bind `<env_schema>.A`.
    - **Mode D (`ref_resolution: "explicit"`)**: Standard `ref()` is untouched; users call `{{ dbt_virtual.virtual_ref('A') }}` explicitly.
-3. **Zero-Copy `CLONE` Seeding (`macros/lifecycle/hooks.sql` `clone_if_new_fp`)**:
-   - Before an `incremental` model runs (when `--full-refresh` is not set and `<model>__<fp_new>` does not exist), query `<physical_schema>._environments` for `base_environment` (`prod`) and execute `CREATE TABLE IF NOT EXISTS <physical>.<model>__<fp_new> CLONE <physical>.<model>__<fp_base>`.
+3. **Zero-Copy `CLONE` Seeding & Post-Clone Column Migration (`macros/lifecycle/hooks.sql` `clone_if_new_fp`)**:
+   - Before an `incremental` model runs (when `--full-refresh` is not set and `<model>__<fp_new>` does not exist), query `<physical_schema>._environments` for `base_environment` (`prod`), execute `clone_table_sql` (`CLONE` on BigQuery/Snowflake, `SHALLOW CLONE` on Databricks, `CTAS` on DuckDB/Postgres), call `adapter.cache_added(this)`, and optionally emit `ALTER TABLE {{ this }} ADD COLUMN IF NOT EXISTS ...` for any columns listed in `config(virtual_add_columns=[...])`.
 4. **Post-Hook View Sync (`sync_env_view`)**:
-   - Point `<env_schema>.<model>` at `<physical_schema>.<model>__<fp_new>` and upsert `_environments`.
+   - Point `<env_schema>.<model>` at `<physical_schema>.<model>__<fp_new>`, upsert `_environments`, insert candidate release rows into `_releases`, and record `[start_ts, end_ts]` in `_intervals` when `--start` / `--end` are provided.
 
 ## Alternatives
 
@@ -35,10 +35,10 @@ prs: []
 
 ## Rollout
 
-1. Implement `virtual_schema_name`, `virtual_alias_name`, and `virtual_ref` in `macros/routing/virtual_routing.sql`.
+1. Implement `virtual_schema_name`, `virtual_alias_name`, `virtual_ref`, and `virtual_is_incremental` in `macros/routing/virtual_routing.sql`.
 2. Implement `clone_if_new_fp` and `sync_env_view` in `macros/lifecycle/hooks.sql`.
 3. Verify partition pruning through virtual views (dry-run benchmark on BigQuery confirmed 438,213,812 bytes scanned both directly and through a `SELECT *` view over a 194.4 GB partitioned table).
 
 ## Verification
 
-- Verify `virtual_schema_name`, `virtual_alias_name`, `clone_if_new_fp`, and `sync_env_view` in the BigQuery emulator E2E test (`scripts/run_emulator_e2e.py`).
+- Verify `virtual_schema_name`, `virtual_alias_name`, `clone_if_new_fp` (including `virtual_add_columns`), and `sync_env_view` in `tests/test_macros_execution.py` and the BigQuery emulator E2E test (`scripts/run_emulator_e2e.py`).

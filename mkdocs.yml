@@ -1,5 +1,5 @@
 site_name: dbt-virtual
-site_description: "SQLMesh-style Virtual Data Environments for dbt — content-addressed physical tables, zero-copy CLONE incremental seeding, per-environment routine virtualization, and instant view-swap promotion & rollback."
+site_description: "SQLMesh-style Virtual Data Environments for dbt (BigQuery, Snowflake, DuckDB, PostgreSQL, Databricks) — sqlglot AST Merkle-DAG fingerprinting, zero-copy CLONE incremental seeding, per-environment routine virtualization, pre-promotion audit gates, concurrency locks, and zero-rebuild promotion & rollback."
 site_url: https://flip-to.github.io/dbt-virtual/
 repo_url: https://github.com/Flip-to/dbt-virtual
 repo_name: Flip-to/dbt-virtual
