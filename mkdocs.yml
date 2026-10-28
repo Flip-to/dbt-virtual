@@ -69,6 +69,7 @@ nav:
       - How It Works & Architecture: guides/how_it_works.md
       - Routines & TVF Unit Testing: guides/routines_and_tvf_testing.md
       - CLI & Lifecycle Operations: guides/cli_and_operations.md
+      - AI Agent Skills (Claude / Antigravity / Cursor): guides/agent_skills.md
       - CI/CD & Production Workflows: guides/ci_cd_workflows.md
       - Warehouse Support Matrix: guides/warehouse_support.md
   - Architecture Specs:

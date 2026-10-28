@@ -68,8 +68,10 @@ uv run --with mkdocs-material mkdocs build --strict           # Build GitHub Pag
 - **Hybrid Packaging**: Every lifecycle operation works both via the `dbt-virtual` Python CLI (`plan`, `build`, `diff`, `audit`, `promote`, `rollback`, `status`, `init-env`, `drop-env`, `gc`) and via `dbt run-operation` macros (`docs/decisions/20261027_hybrid_package_and_bigquery_first.md`).
 - **Multi-Emulator CI**: We test end-to-end SQL execution against `Flip-to/bigquery-emulator`, `nnnkkk7/snowflake-emulator`, `postgres:16-alpine`, and real `dbt-core` + `dbt-duckdb` in `.github/workflows/ci.yml`.
 
-## Governance Workflows
+## Agent Skills (`.claude/skills/`)
 
-- **Record a decision**: Use `/record-decision` (`.claude/skills/record-decision/SKILL.md`), copy `docs/templates/decision.md` to `docs/decisions/YYYYMMDD_<slug>.md`, optionally add `DECISION(<slug>)` in code, and run `uv run python scripts/check_docs_layout.py --write-index`.
-- **Record or pay off tech debt**: Use `/record-tech-debt` (`.claude/skills/record-tech-debt/SKILL.md`), copy `docs/templates/tech_debt.md` to `docs/tech_debt/<slug>.md`, link an open bean in `.beans/`, add `TECH_DEBT(<slug>)` at the code site, and run `uv run python scripts/check_docs_layout.py --write-index`.
-- **Track beans & A2V**: Every PR has a bean in `.beans/` with an `## A2V track` table (`.claude/rules/beans-tracking.md`, `.claude/rules/a2v-track.md`).
+- **Setup & Zero-Compute Project Migration (`/dbt-virtual-setup`)**: `.claude/skills/dbt-virtual-setup/SKILL.md` — interactive workflow to wire `packages.yml`, `dbt_project.yml`, `generate_schema_name` / `generate_alias_name`, and run `dbt-virtual adopt` in zero compute (see `docs/guides/agent_skills.md`).
+- **Day-to-Day Lifecycle Operations (`/dbt-virtual-ops`)**: `.claude/skills/dbt-virtual-ops/SKILL.md` — workflow for `status`, `plan`, `build`, `diff`, `audit`, `promote`, `rollback`, `init-env`, `drop-env`, and `gc`.
+- **Record a decision (`/record-decision`)**: `.claude/skills/record-decision/SKILL.md`, copy `docs/templates/decision.md` to `docs/decisions/YYYYMMDD_<slug>.md`, optionally add `DECISION(<slug>)` in code, and run `uv run python scripts/check_docs_layout.py --write-index`.
+- **Record or pay off tech debt (`/record-tech-debt`)**: `.claude/skills/record-tech-debt/SKILL.md`, copy `docs/templates/tech_debt.md` to `docs/tech_debt/<slug>.md`, link an open bean in `.beans/`, add `TECH_DEBT(<slug>)` at the code site, and run `uv run python scripts/check_docs_layout.py --write-index`.
+- **Track beans & A2V (`/a2v-track`)**: Every PR has a bean in `.beans/` with an `## A2V track` table (`.claude/rules/beans-tracking.md`, `.claude/rules/a2v-track.md`, `.claude/skills/a2v-track/SKILL.md`).

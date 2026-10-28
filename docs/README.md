@@ -60,6 +60,14 @@
 
     [:octicons-arrow-right-24: Warehouse Support Matrix](guides/warehouse_support.md)
 
+-   :material-robot:{ .lg .middle } **AI Agent Skills (DRY Setup & Ops)**
+
+    ---
+
+    Drop-in skills (`/dbt-virtual-setup`, `/dbt-virtual-ops`) for Claude Code, Antigravity, Cursor, and Codex to automate project setup, zero-compute migration, and promotions.
+
+    [:octicons-arrow-right-24: AI Agent Skills](guides/agent_skills.md)
+
 </div>
 
 ---

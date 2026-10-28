@@ -13,6 +13,7 @@
 > - [How It Works & Ref Resolution Modes (`env_view` vs `physical` vs `hybrid`)](docs/guides/how_it_works.md)
 > - [Routines (`table_function`, `function`, `procedure`) & `tvf_test_ref`](docs/guides/routines_and_tvf_testing.md)
 > - [CLI & Lifecycle Operations Reference](docs/guides/cli_and_operations.md)
+> - [AI Agent Skills (`/dbt-virtual-setup` & `/dbt-virtual-ops`)](docs/guides/agent_skills.md)
 > - [CI/CD & Production Workflows](docs/guides/ci_cd_workflows.md)
 > - [Multi-Warehouse Support Matrix (BigQuery, Snowflake, DuckDB, Postgres, Databricks)](docs/guides/warehouse_support.md)
 
@@ -207,6 +208,7 @@ All written documentation follows [`docs/conventions/docs_and_specs.md`](docs/co
 - **[How It Works & Ref Resolution Modes (`docs/guides/how_it_works.md`)](docs/guides/how_it_works.md)**
 - **[Routines & TVF Unit Testing (`docs/guides/routines_and_tvf_testing.md`)](docs/guides/routines_and_tvf_testing.md)**
 - **[CLI & Lifecycle Operations Reference (`docs/guides/cli_and_operations.md`)](docs/guides/cli_and_operations.md)**
+- **[AI Agent Skills (`docs/guides/agent_skills.md`)](docs/guides/agent_skills.md)**
 - **[CI/CD & Production Workflows (`docs/guides/ci_cd_workflows.md`)](docs/guides/ci_cd_workflows.md)**
 - **[Warehouse Support Matrix (`docs/guides/warehouse_support.md`)](docs/guides/warehouse_support.md)**
 

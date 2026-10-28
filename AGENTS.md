@@ -8,6 +8,7 @@ All coding agents (Claude Code, Antigravity, Cursor, Copilot, Codex) working in 
 4. **[`.claude/rules/a2v-track.md`](.claude/rules/a2v-track.md)** — Every bean in `.beans/` carries an `## A2V track` (`Asked → Built → Proven → Reviewed → Shipped → Verified`).
 5. **[`.claude/rules/beans-tracking.md`](.claude/rules/beans-tracking.md)** — Bean lifecycle and PR state alignment.
 6. **[`.claude/rules/docs-and-specs.md`](.claude/rules/docs-and-specs.md)** — Quick summary of spec, decision (`DECISION(<slug>)`), and tech debt (`TECH_DEBT(<slug>)`) markers.
+7. **[`docs/guides/agent_skills.md`](docs/guides/agent_skills.md)** — Available DRY skills in `.claude/skills/` (`/dbt-virtual-setup`, `/dbt-virtual-ops`, `/record-decision`, `/record-tech-debt`, `/a2v-track`).
 
 ## Required Checks Before Committing or Opening a PR
 
