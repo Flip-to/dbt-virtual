@@ -66,8 +66,27 @@
       {%- endif -%}
     {%- endfor -%}
   {%- endif -%}
-  {%- if raw_rel.schema == phys_schema and suffix_check.valid -%}
-    {%- set logical_name = raw_rel.identifier.rsplit('__', 1)[0] -%}
+  {%- set virtual_relation = namespace(
+    valid=suffix_check.valid,
+    logical_name=(identifier_parts[0] if suffix_check.valid else '')
+  ) -%}
+  {#- physical_version may be an explicit non-hex suffix; only trust it when a manifest node declares it. -#}
+  {%- if raw_rel.schema == phys_schema and not virtual_relation.valid and graph is defined and graph.nodes is defined -%}
+    {%- for candidate in graph.nodes.values() -%}
+      {%- if dbt_virtual.is_virtual_node(candidate) -%}
+        {%- set candidate_cfg = dbt_virtual.node_attr(candidate, 'config', {}) -%}
+        {%- set candidate_mat = dbt_virtual.node_attr(candidate_cfg, 'materialized', 'view') -%}
+        {%- set pinned_version = dbt_virtual.node_attr(candidate_cfg, 'physical_version', none) -%}
+        {%- set candidate_name = dbt_virtual.node_attr(candidate, 'name', '') -%}
+        {%- if candidate_mat in ['table', 'incremental'] and pinned_version is not none and raw_rel.identifier == candidate_name ~ '__' ~ pinned_version -%}
+          {%- set virtual_relation.valid = true -%}
+          {%- set virtual_relation.logical_name = candidate_name -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if raw_rel.schema == phys_schema and virtual_relation.valid -%}
+    {%- set logical_name = virtual_relation.logical_name -%}
     {%- if mode == 'env_view' -%}
       {{ return(api.Relation.create(
         database=raw_rel.database,

@@ -309,6 +309,26 @@ def test_virtual_ref_modes_env_view_physical_and_hybrid() -> None:
     assert rel_unrelated.schema == "analytics_physical"
     assert rel_unrelated.identifier == "daily__archive"
 
+    harness_a.graph = {
+        "nodes": {
+            "model.pkg.pinned": {
+                "name": "pinned_orders",
+                "resource_type": "model",
+                "config": {
+                    "materialized": "incremental",
+                    "virtual_env": True,
+                    "physical_version": "pinned_fp_v1",
+                },
+            }
+        }
+    }
+    harness_a.ref_relations["pinned_orders"] = FakeRelation(
+        "test_proj", "analytics_physical", "pinned_orders__pinned_fp_v1", "table"
+    )
+    rel_pinned = harness_a.call_macro("virtual_ref", "pinned_orders")
+    assert rel_pinned.schema == "analytics_staging"
+    assert rel_pinned.identifier == "pinned_orders"
+
     # 2. Option B (`physical`) keeps direct `<physical_schema>.<model>__<fp>` table relation
     harness_b = MacroTestHarness(
         vars_dict={
