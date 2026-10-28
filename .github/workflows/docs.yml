@@ -27,13 +27,12 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install MkDocs Material
-        run: uv pip install --system mkdocs-material
-
-      - name: Build documentation site
+      - name: Install dependencies and build documentation site
         env:
           NO_MKDOCS_2_WARNING: "1"
-        run: mkdocs build --strict
+        run: |
+          uv sync --extra docs
+          uv run mkdocs build --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
