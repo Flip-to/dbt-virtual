@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -162,6 +163,57 @@ def test_cli_plan_json_and_text(tmp_path: Path, capsys) -> None:
     assert "FULL_BUILD" in txt_out
 
 
+def test_cli_status_writes_exported_state_json(tmp_path: Path, capsys) -> None:
+    state = {
+        "env": "staging",
+        "base_env": "prod",
+        "env_state": {"orders_metrics": "fp123"},
+        "base_env_state": {"orders_metrics": "fp000"},
+        "existing_physical_tables": ["orders_metrics__fp123"],
+    }
+    marker_output = f"DBT_VIRTUAL_STATE_JSON:{json.dumps(state)}\n"
+    completed = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout=marker_output, stderr="")
+    output_path = tmp_path / "target" / "state.json"
+
+    with patch("dbt_virtual.cli.subprocess.run", return_value=completed) as run:
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "status",
+                "--env",
+                "staging",
+                "--base-env",
+                "prod",
+                "--output",
+                "target/state.json",
+            ]
+        )
+
+    assert rc == 0
+    assert run.call_args.kwargs["cwd"] == tmp_path
+    assert run.call_args.kwargs["capture_output"] is True
+    assert json.loads(output_path.read_text(encoding="utf-8")) == state
+    assert "DBT_VIRTUAL_STATE_JSON:" in capsys.readouterr().out
+
+    missing_output_path = tmp_path / "missing.json"
+    no_marker = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout="dbt completed\n", stderr="")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=no_marker):
+        rc_missing = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_missing == 1
+    assert not missing_output_path.exists()
+
+    failed = subprocess.CompletedProcess(args=["dbt"], returncode=17, stdout="", stderr="dbt failed")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=failed):
+        rc_failed = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_failed == 17
+    assert not missing_output_path.exists()
+
+
 def test_planner_reuse_and_seed_incremental_classification(tmp_path: Path) -> None:
     manifest = _sample_manifest()
     fps = compute_manifest_fingerprints(manifest, known_schemas=["analytics_staging"])
@@ -238,6 +290,38 @@ def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> N
     assert len(recorded_cmds) == 1
     assert recorded_cmds[0][:2] == ["run-operation", "virtual_sync_reused_views"]
     assert "zero compute" in capsys.readouterr().out
+
+
+def test_cli_build_selects_planned_virtual_nodes_without_reuse(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(
+        json.dumps(_sample_manifest()), encoding="utf-8"
+    )
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "build",
+                "--env",
+                "staging",
+                "--skip-compile",
+            ]
+        )
+
+    assert rc == 0
+    assert len(recorded_cmds) == 1
+    build_args = recorded_cmds[0]
+    selected = build_args[build_args.index("--select") + 1].split()
+    assert set(selected) == {"orders_metrics", "udf_dimension_key", "tvf_orders_report"}
+    assert "events_base" not in selected
 
 
 def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> None:
