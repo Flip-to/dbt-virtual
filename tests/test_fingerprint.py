@@ -133,6 +133,37 @@ def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
     assert out_path.exists()
 
 
+def test_nonvirtual_model_dependency_change_invalidates_virtual_fingerprint() -> None:
+    upstream_v1 = _make_node(
+        name="shared_orders",
+        compiled_code="SELECT 1 AS a",
+        raw_code="SELECT 1 AS a",
+        virtual_env=False,
+        materialized="table",
+    )
+    downstream = _make_node(
+        name="virtual_report",
+        compiled_code="SELECT a FROM `proj.analytics_staging.shared_orders`",
+        raw_code="SELECT a FROM {{ ref('shared_orders') }}",
+        depends_on=[upstream_v1["unique_id"]],
+    )
+    manifest_v1 = {"nodes": {upstream_v1["unique_id"]: upstream_v1, downstream["unique_id"]: downstream}}
+
+    upstream_v2 = _make_node(
+        name="shared_orders",
+        compiled_code="SELECT 2 AS a",
+        raw_code="SELECT 2 AS a",
+        virtual_env=False,
+        materialized="table",
+    )
+    manifest_v2 = {"nodes": {upstream_v2["unique_id"]: upstream_v2, downstream["unique_id"]: downstream}}
+
+    fp_v1 = compute_manifest_fingerprints(manifest_v1)[downstream["unique_id"]]
+    fp_v2 = compute_manifest_fingerprints(manifest_v2)[downstream["unique_id"]]
+
+    assert fp_v1.fingerprint != fp_v2.fingerprint
+
+
 def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
     raw = "/* query_tag: abc */ SELECT * FROM `p.analytics_physical.my_table__0123456789ab` WHERE x = 1"
     cleaned = normalize_sql(
