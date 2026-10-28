@@ -536,6 +536,14 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
                     "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf_report`() AS (SELECT * FROM `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`orders_metrics`)",
                     3,
                 ),
+                (
+                    "sp_update",
+                    "procedure",
+                    "fpsp",
+                    "analytics_staging.sp_update",
+                    "CREATE OR REPLACE PROCEDURE `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`sp_update`() BEGIN INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (1); UPDATE `test_proj`.`analytics`.`audit_log` SET id = id + 1; END;",
+                    4,
+                ),
             ]
         )
     )
@@ -555,6 +563,11 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
     assert "CREATE OR REPLACE FUNCTION `test_proj`.`analytics`.`udf_double`" not in joined_queries
     assert "CREATE OR REPLACE VIEW `test_proj`.`analytics`.`orders_metrics`" in joined_queries
     assert "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`analytics`.`tvf_report`" in joined_queries
+    assert (
+        "CREATE OR REPLACE PROCEDURE `test_proj`.`analytics`.`sp_update`() BEGIN "
+        "INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (1); UPDATE "
+        "`test_proj`.`analytics`.`audit_log` SET id = id + 1; END;"
+    ) in harness.executed_queries
     assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`legacy_view`" in joined_queries
     assert "SET status = 'promoted'" in joined_queries
 
@@ -579,13 +592,25 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
                     "fp000",
                     "analytics_physical.orders_metrics__fp000",
                     None,
-                )
+                ),
+                (
+                    "sp_rollback",
+                    "procedure",
+                    "fpsp0",
+                    "analytics.sp_rollback",
+                    "CREATE OR REPLACE PROCEDURE `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`sp_rollback`() BEGIN INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (2); UPDATE `test_proj`.`analytics`.`audit_log` SET id = id + 1; END;",
+                ),
             ]
         )
     )
     harness.call_macro("virtual_rollback", env="prod", to_release="")
     rollback_queries = "\n".join(harness.executed_queries)
     assert "SELECT * FROM `test_proj`.`analytics_physical`.`orders_metrics__fp000`" in rollback_queries
+    assert (
+        "CREATE OR REPLACE PROCEDURE `test_proj`.`analytics`.`sp_rollback`() BEGIN "
+        "INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (2); UPDATE "
+        "`test_proj`.`analytics`.`audit_log` SET id = id + 1; END;"
+    ) in harness.executed_queries
     assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`new_model`" in rollback_queries
     assert "DROP FUNCTION IF EXISTS `test_proj`.`analytics`.`new_fn`" in rollback_queries
     assert "WHERE environment = 'prod' AND model_name = 'new_model'" in rollback_queries
