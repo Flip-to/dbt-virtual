@@ -14,8 +14,8 @@ The generic orphan query matched any table containing two underscores. Since `vi
 | Step | Who | Why | Evidence | When |
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | Continue reviewing warehouse cleanup behavior across adapters | Chat request, 2026-10-28 | 2026-10-28 |
-| Built | Agent: Codex (session 01a18479-0b39-7373-93c3-6b159946c051), approved by Yuri Olive | Require a valid hex fingerprint suffix and fail closed for unmatched adapters | `macros/adapters/dispatch.sql` | 2026-10-28 |
-| Proven | Agent: Codex (session 01a18479-0b39-7373-93c3-6b159946c051), approved by Yuri Olive | L2: Macro tests assert strict matching for DuckDB, Postgres, Databricks and fail-closed fallback; DuckDB catalog E2E excludes an unrelated double-underscore table | `test_multi_adapter_dispatch_postgres_duckdb_fallback`; `test_duckdb_gc_only_selects_fingerprint_suffix_tables` | 2026-10-28 |
+| Built | Agent: Codex (session 01a18479-0b39-7373-93c3-6b159946c051), approved by Yuri Olive | Require a valid hex fingerprint suffix, fail closed for unmatched adapters, and apply release-count and age retention before collection | `macros/adapters/dispatch.sql` | 2026-10-28 |
+| Proven | Agent: Codex (session 01a18479-0b39-7373-93c3-6b159946c051), approved by Yuri Olive | L3: Release rows are ranked per release; DuckDB and PostgreSQL use the latest registered reference for the age cutoff, retaining a table with a recent reference even when older rows exist; DuckDB E2E confirms old orphans are candidates while recent and unrelated tables are retained | `test_virtual_promote_rollback_init_drop_and_gc_operations`; `test_duckdb_gc_only_selects_fingerprint_suffix_tables`; ruff and docs layout passed | 2026-10-28 |
 | Reviewed | Reviewer: Yuri Olive | pending | pending | pending |
 | Shipped | Developer: Yuri Olive | pending | pending | pending |
 | Verified | Developer: Yuri Olive | pending | pending | pending |
