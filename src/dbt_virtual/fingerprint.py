@@ -23,6 +23,41 @@ _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
 
 
+def _strip_fingerprint_suffixes(sql: str) -> str:
+    """Normalize fingerprint suffixes outside SQL string literals only."""
+    out: list[str] = []
+    i = 0
+    in_string = False
+    while i < len(sql):
+        char = sql[i]
+        if in_string:
+            out.append(char)
+            if char == "\\" and i + 1 < len(sql):
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if char == "'":
+                if i + 1 < len(sql) and sql[i + 1] == "'":
+                    out.append(sql[i + 1])
+                    i += 2
+                    continue
+                in_string = False
+            i += 1
+            continue
+        if char == "'":
+            in_string = True
+            out.append(char)
+            i += 1
+            continue
+        match = _FINGERPRINT_SUFFIX_RE.match(sql, i)
+        if match:
+            i = match.end()
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
 @dataclass(frozen=True)
 class NodeFingerprint:
     """Computed fingerprint metadata for a single virtualized dbt node."""
@@ -119,7 +154,7 @@ def normalize_sql(
     normalized = _LINE_COMMENT_RE.sub("", normalized)
 
     # Strip any existing __<fp> suffixes from physical table names
-    normalized = _FINGERPRINT_SUFFIX_RE.sub("", normalized)
+    normalized = _strip_fingerprint_suffixes(normalized)
 
     # Replace known environment / physical schemas with a canonical schema token
     if known_schemas:

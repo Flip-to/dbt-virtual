@@ -145,6 +145,18 @@ def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
     assert "__DBT_VIRTUAL_SCHEMA__." in cleaned
 
 
+def test_normalize_sql_preserves_fingerprint_shaped_string_literals() -> None:
+    first_sql = "SELECT 'customer__deadbeef123456' AS label"
+    second_sql = "SELECT 'customer__cafebabe123456' AS label"
+
+    assert normalize_sql(first_sql) != normalize_sql(second_sql)
+    assert normalize_sql(first_sql, use_ast=False) == first_sql
+
+    base = _make_node(compiled_code=first_sql, raw_code=first_sql)
+    changed = _make_node(compiled_code=second_sql, raw_code=second_sql)
+    assert compute_node_fingerprint(base).fingerprint != compute_node_fingerprint(changed).fingerprint
+
+
 def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
     """Cosmetic SQL differences (case, line comments, whitespace) must produce identical AST SQL."""
     sql_a = """
