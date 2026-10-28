@@ -55,9 +55,38 @@
   {%- set mode = cfg.get('ref_resolution', 'env_view') -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
 
-  {#- If the referenced relation is in physical_schema and carries a __<fp> suffix, it is a virtualized table -#}
-  {%- if raw_rel.schema == phys_schema and '__' in raw_rel.identifier -%}
-    {%- set logical_name = raw_rel.identifier.rsplit('__', 1)[0] -%}
+  {#- Only fingerprint-shaped suffixes identify virtual tables; arbitrary names may contain `__`. -#}
+  {%- set identifier_parts = raw_rel.identifier.rsplit('__', 1) -%}
+  {%- set fingerprint = identifier_parts[-1] -%}
+  {%- set suffix_check = namespace(valid=identifier_parts | length == 2 and fingerprint | length >= 8 and fingerprint | length <= 64) -%}
+  {%- if suffix_check.valid -%}
+    {%- for char in fingerprint -%}
+      {%- if char not in '0123456789abcdef' -%}
+        {%- set suffix_check.valid = false -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set virtual_relation = namespace(
+    valid=suffix_check.valid,
+    logical_name=(identifier_parts[0] if suffix_check.valid else '')
+  ) -%}
+  {#- physical_version may be an explicit non-hex suffix; only trust it when a manifest node declares it. -#}
+  {%- if raw_rel.schema == phys_schema and not virtual_relation.valid and graph is defined and graph.nodes is defined -%}
+    {%- for candidate in graph.nodes.values() -%}
+      {%- if dbt_virtual.is_virtual_node(candidate) -%}
+        {%- set candidate_cfg = dbt_virtual.node_attr(candidate, 'config', {}) -%}
+        {%- set candidate_mat = dbt_virtual.node_attr(candidate_cfg, 'materialized', 'view') -%}
+        {%- set pinned_version = dbt_virtual.node_attr(candidate_cfg, 'physical_version', none) -%}
+        {%- set candidate_name = dbt_virtual.node_attr(candidate, 'name', '') -%}
+        {%- if candidate_mat in ['table', 'incremental'] and pinned_version is not none and raw_rel.identifier == candidate_name ~ '__' ~ pinned_version -%}
+          {%- set virtual_relation.valid = true -%}
+          {%- set virtual_relation.logical_name = candidate_name -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if raw_rel.schema == phys_schema and virtual_relation.valid -%}
+    {%- set logical_name = virtual_relation.logical_name -%}
     {%- if mode == 'env_view' -%}
       {{ return(api.Relation.create(
         database=raw_rel.database,

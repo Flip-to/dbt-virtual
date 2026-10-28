@@ -169,7 +169,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
     ]
     if ns.select:
         build_args.extend(["--select", ns.select])
-    elif reused_models and models_to_build:
+    elif models_to_build:
         build_args.extend(["--select", " ".join(models_to_build)])
     if ns.full_refresh:
         build_args.append("--full-refresh")
@@ -212,10 +212,53 @@ def cmd_status(ns: argparse.Namespace) -> int:
         "env": ns.env,
         "base_env": ns.base_env,
     }
-    return _run_dbt(
-        ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)],
-        project_dir,
+    dbt_args = ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)]
+    if not ns.output:
+        return _run_dbt(dbt_args, project_dir)
+
+    result = subprocess.run(
+        ["dbt", *dbt_args],
+        cwd=project_dir,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    if result.stdout:
+        print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+    if result.returncode != 0:
+        return result.returncode
+
+    state_marker = "DBT_VIRTUAL_STATE_JSON:"
+    state_json = None
+    for output in (result.stdout, result.stderr):
+        for line in output.splitlines():
+            if state_marker in line:
+                state_json = line.split(state_marker, 1)[1].strip()
+                break
+        if state_json is not None:
+            break
+    if state_json is None:
+        print(
+            "dbt-virtual status: dbt completed but did not emit DBT_VIRTUAL_STATE_JSON.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        state = json.loads(state_json)
+    except json.JSONDecodeError as exc:
+        print(f"dbt-virtual status: invalid state JSON: {exc}", file=sys.stderr)
+        return 1
+
+    output_path = Path(ns.output)
+    if not output_path.is_absolute():
+        output_path = project_dir / output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    print(f"dbt-virtual status: wrote warehouse state to {output_path}")
+    return 0
 
 
 def cmd_rollback(ns: argparse.Namespace) -> int:
@@ -405,6 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Export live warehouse virtual environment state JSON.")
     p_status.add_argument("--env", default="staging", help="Target environment to inspect.")
     p_status.add_argument("--base-env", default="prod", help="Base environment to compare.")
+    p_status.add_argument("--output", default=None, help="Optional path to write the exported warehouse state JSON.")
     p_status.set_defaults(func=cmd_status)
 
     # rollback
