@@ -166,7 +166,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
     ]
     if ns.select:
         build_args.extend(["--select", ns.select])
-    elif reused_models and models_to_build:
+    elif models_to_build:
         build_args.extend(["--select", " ".join(models_to_build)])
     if ns.full_refresh:
         build_args.append("--full-refresh")

@@ -292,6 +292,38 @@ def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> N
     assert "zero compute" in capsys.readouterr().out
 
 
+def test_cli_build_selects_planned_virtual_nodes_without_reuse(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(
+        json.dumps(_sample_manifest()), encoding="utf-8"
+    )
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "build",
+                "--env",
+                "staging",
+                "--skip-compile",
+            ]
+        )
+
+    assert rc == 0
+    assert len(recorded_cmds) == 1
+    build_args = recorded_cmds[0]
+    selected = build_args[build_args.index("--select") + 1].split()
+    assert set(selected) == {"orders_metrics", "udf_dimension_key", "tvf_orders_report"}
+    assert "events_base" not in selected
+
+
 def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> None:
     target_dir = tmp_path / "target"
     target_dir.mkdir(parents=True)
