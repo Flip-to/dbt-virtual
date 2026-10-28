@@ -426,6 +426,34 @@ def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
     assert harness.cache_added_relations == [harness.this]
 
 
+def test_is_incremental_requires_existing_base_physical_table() -> None:
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+            }
+        }
+    )
+    harness.model = {
+        "name": "orders_metrics",
+        "config": {"materialized": "incremental", "virtual_env": True},
+    }
+    harness.query_responses.append(
+        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
+    )
+
+    assert harness.call_macro("is_incremental") is False
+
+    harness.existing_relations.add(
+        ("test_proj", "analytics_physical", "orders_metrics__prodfp000000")
+    )
+    harness.query_responses.append(
+        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
+    )
+    assert harness.call_macro("is_incremental") is True
+
+
 def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     harness = MacroTestHarness(adapter_type="postgres")
     src = FakeRelation("db", "analytics_physical", "orders__v1")
