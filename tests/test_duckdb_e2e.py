@@ -208,6 +208,7 @@ def test_duckdb_gc_only_selects_fingerprint_suffix_tables() -> None:
     con.execute("CREATE SCHEMA analytics_physical")
     con.execute("CREATE TABLE analytics_physical.orders__deadbeef AS SELECT 1 AS id")
     con.execute("CREATE TABLE analytics_physical.recent__cafebabe AS SELECT 1 AS id")
+    con.execute("CREATE TABLE analytics_physical.oldorphan__badcafe00 AS SELECT 1 AS id")
     con.execute("CREATE TABLE analytics_physical.daily__archive AS SELECT 1 AS id")
     harness = MacroTestHarness(adapter_type="duckdb", target_name="prod")
     registry_sql = harness.call_macro("ensure_registry_tables_sql", "analytics_physical")
@@ -221,8 +222,12 @@ def test_duckdb_gc_only_selects_fingerprint_suffix_tables() -> None:
         ) VALUES
           ('old_release', 'staging', 'orders', 'model', 2, 'deadbeef',
            'analytics_physical.orders__deadbeef', 'candidate', CURRENT_TIMESTAMP - INTERVAL '30 days'),
+          ('recent_reference', 'staging', 'orders', 'model', 2, 'deadbeef',
+           'analytics_physical.orders__deadbeef', 'candidate', CURRENT_TIMESTAMP),
           ('recent_release', 'staging', 'recent', 'model', 2, 'cafebabe',
-           'analytics_physical.recent__cafebabe', 'candidate', CURRENT_TIMESTAMP)
+           'analytics_physical.recent__cafebabe', 'candidate', CURRENT_TIMESTAMP),
+          ('old_orphan_release', 'staging', 'oldorphan', 'model', 2, 'badcafe00',
+           'analytics_physical.oldorphan__badcafe00', 'candidate', CURRENT_TIMESTAMP - INTERVAL '30 days')
         """
     )
 
@@ -231,6 +236,7 @@ def test_duckdb_gc_only_selects_fingerprint_suffix_tables() -> None:
     )
     orphan_names = {row[0] for row in con.execute(orphan_query).fetchall()}
 
-    assert "orders__deadbeef" in orphan_names
+    assert "orders__deadbeef" not in orphan_names
     assert "recent__cafebabe" not in orphan_names
+    assert "oldorphan__badcafe00" in orphan_names
     assert "daily__archive" not in orphan_names

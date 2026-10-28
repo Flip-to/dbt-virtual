@@ -520,7 +520,7 @@ $$
     WHERE age_r.resource_type = 'model'
       AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
     GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
-    HAVING MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+      HAVING MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
   )
 {%- endmacro %}
 
@@ -532,7 +532,7 @@ $$
     WHERE age_r.resource_type = 'model'
       AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
     GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
-    HAVING MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+      HAVING MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
   )
 {%- endmacro %}
 

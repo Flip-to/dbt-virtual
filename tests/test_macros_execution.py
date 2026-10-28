@@ -463,7 +463,7 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     assert "MAX(created_at) AS release_created_at" in duckdb_orphan
     assert "GROUP BY release_id" in duckdb_orphan
     assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC)" in duckdb_orphan
-    assert "MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
+    assert "MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
 
     # Databricks dispatch: SHALLOW CLONE
     dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
