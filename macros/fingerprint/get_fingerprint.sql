@@ -108,7 +108,7 @@
     {%- set parent_uids = (dbt_virtual.node_attr(dep_obj, 'nodes', []) or []) | sort -%}
     {%- for p_uid in parent_uids -%}
       {%- set p_node = graph.nodes.get(p_uid) -%}
-      {%- if p_node is not none and dbt_virtual.is_virtual_node(p_node) -%}
+      {%- if p_node is not none and (dbt_virtual.is_virtual_node(p_node) or dbt_virtual.node_attr(p_node, 'resource_type', '') == 'model') -%}
         {%- set p_fp = dbt_virtual.get_fingerprint(p_node, depth=depth + 1) -%}
         {%- do parent_parts.append(p_uid ~ '=' ~ p_fp) -%}
       {%- endif -%}
