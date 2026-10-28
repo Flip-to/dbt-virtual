@@ -21,10 +21,11 @@ ENV/
 .coverage
 htmlcov/
 
-# dbt & MkDocs artifacts
+# dbt & Zensical artifacts
 target/
 dbt_packages/
 logs/
 .dbt_virtual/
 profiles.yml
 site/
+.cache/

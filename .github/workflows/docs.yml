@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build MkDocs Material Site
+    name: Build Zensical Documentation Site
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -27,12 +27,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install dependencies and build documentation site
-        env:
-          NO_MKDOCS_2_WARNING: "1"
+      - name: Install dependencies and build documentation site with Zensical
         run: |
           uv sync --extra docs
-          uv run mkdocs build --strict
+          uv run zensical build --clean --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4

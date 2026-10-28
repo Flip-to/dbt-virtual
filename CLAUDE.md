@@ -7,7 +7,7 @@ SQLMesh-style Virtual Data Environments for **dbt** (first-class **BigQuery** + 
 ```
 dbt_project.yml               # dbt package metadata & default vars('dbt_virtual')
 pyproject.toml                # Python package & CLI entry point (`dbt-virtual`)
-mkdocs.yml                    # Material for MkDocs configuration (GitHub Pages)
+mkdocs.yml                    # Zensical configuration (GitHub Pages)
 macros/
   adapters/dispatch.sql       # Multi-warehouse adapter.dispatch (bigquery__, snowflake__, databricks__, duckdb__, postgres__, default__)
   fingerprint/
@@ -59,7 +59,7 @@ uv run python scripts/check_docs_layout.py                    # Check docs, tech
 uv run python scripts/check_docs_layout.py --write-index      # Regenerate README.md indexes in docs/
 uv run python scripts/run_emulator_e2e.py                     # Run E2E lifecycle test on Flip-to/bigquery-emulator
 uv run python scripts/run_snowflake_emulator_e2e.py           # Run E2E lifecycle test on nnnkkk7/snowflake-emulator & Postgres
-uv run --with mkdocs-material mkdocs build --strict           # Build GitHub Pages documentation site locally
+uv run --with zensical zensical build --clean --strict        # Build GitHub Pages documentation site locally with Zensical
 ```
 
 ## Key Architectural Decisions & Conventions
