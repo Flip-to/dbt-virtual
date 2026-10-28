@@ -182,6 +182,18 @@ def compute_node_fingerprint(
     resource_type = node.get("resource_type", "model")
     config_subset = extract_relevant_config(node)
     materialized = str(config_subset["materialized"])
+    alias = node.get("alias") or name
+    generated_alias = re.fullmatch(rf"{re.escape(name)}__[0-9a-f]{{8,64}}", alias)
+    if (
+        is_virtual_node(node)
+        and materialized in {"table", "incremental"}
+        and alias != name
+        and generated_alias is None
+    ):
+        raise ValueError(
+            f"Virtual table model '{name}' uses alias '{alias}'. "
+            "dbt-virtual currently requires alias to match the model name."
+        )
 
     compiled_sql = node.get("compiled_code") or node.get("compiled_sql") or ""
     raw_sql = node.get("raw_code") or node.get("raw_sql") or ""

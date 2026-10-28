@@ -139,6 +139,8 @@ You can configure these parameters either in `dbt_project.yml` under `models:` (
 - **What it does**:
   Enables `dbt-virtual` for the model or routine. Models without `virtual_env: true` are completely ignored by `dbt-virtual` and behave like standard dbt models.
 
+Virtual table and incremental models must keep dbt's alias equal to the model name. A custom `alias` (or a custom alias-generation macro) makes dbt `ref()` resolve to a different environment-view name than dbt-virtual creates; the planner and routing macro fail early with an error when they detect this configuration.
+
 ---
 
 ### `virtual_env_epoch`

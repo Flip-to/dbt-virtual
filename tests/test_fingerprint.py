@@ -87,6 +87,23 @@ def test_sql_or_config_change_invalidates_fingerprint() -> None:
     assert base.fingerprint != changed_epoch.fingerprint
 
 
+def test_virtual_table_alias_override_fails_clearly() -> None:
+    node = _make_node()
+    node["alias"] = "legacy_orders"
+
+    try:
+        compute_node_fingerprint(node)
+        raise AssertionError("Expected virtual alias override to be rejected")
+    except ValueError as exc:
+        assert "currently requires alias to match the model name" in str(exc)
+
+    generated_alias_node = _make_node()
+    generated_alias_node["alias"] = "orders_metrics__abcdef123456"
+    assert compute_node_fingerprint(generated_alias_node).physical_identifier.startswith(
+        "orders_metrics__"
+    )
+
+
 def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
     """Changing an upstream virtualized model must propagate a new fingerprint to downstream nodes."""
     parent_v1 = _make_node(
