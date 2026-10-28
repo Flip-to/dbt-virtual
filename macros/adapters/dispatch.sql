@@ -397,10 +397,14 @@ $$
 
 {% macro bigquery__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
-    SELECT DISTINCT release_id
-    FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
-    WHERE status IN ('promoted', 'candidate')
-    QUALIFY DENSE_RANK() OVER (ORDER BY created_at DESC) <= {{ retention_releases }}
+    SELECT release_id
+    FROM (
+      SELECT release_id, MAX(created_at) AS release_created_at
+      FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
+      WHERE status IN ('promoted', 'candidate')
+      GROUP BY release_id
+    )
+    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT SPLIT(physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
@@ -445,6 +449,7 @@ $$
   {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
     physical_schema,
     retention_releases,
+    retention_days,
     "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"
   )) }}
 {%- endmacro %}
@@ -453,6 +458,7 @@ $$
   {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
     physical_schema,
     retention_releases,
+    retention_days,
     "LOWER(t.table_name) ~ '__[0-9a-f]{8,64}$'"
   )) }}
 {%- endmacro %}
@@ -461,17 +467,23 @@ $$
   {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
     physical_schema,
     retention_releases,
+    retention_days,
     "LOWER(t.table_name) RLIKE '__[0-9a-f]{8,64}$'"
   )) }}
 {%- endmacro %}
 
-{% macro find_orphan_tables_with_suffix_sql(physical_schema, retention_releases, suffix_predicate) -%}
+{% macro find_orphan_tables_with_suffix_sql(physical_schema, retention_releases, retention_days, suffix_predicate) -%}
   WITH protected_releases AS (
     SELECT release_id
     FROM (
-      SELECT release_id, DENSE_RANK() OVER (ORDER BY created_at DESC) AS release_rank
-      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-      WHERE status IN ('promoted', 'candidate')
+      SELECT release_id,
+        DENSE_RANK() OVER (ORDER BY release_created_at DESC) AS release_rank
+      FROM (
+        SELECT release_id, MAX(created_at) AS release_created_at
+        FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+        WHERE status IN ('promoted', 'candidate')
+        GROUP BY release_id
+      ) AS release_times
     ) AS ranked_releases
     WHERE release_rank <= {{ retention_releases }}
   ),
@@ -491,8 +503,41 @@ $$
   WHERE LOWER(t.table_schema) = LOWER('{{ physical_schema }}')
     AND t.table_type = 'BASE TABLE'
     AND {{ suffix_predicate }}
+    AND {{ dbt_virtual.orphan_table_age_predicate_sql(physical_schema, retention_days) }}
     AND p.table_name IS NULL
   ORDER BY 1
+{%- endmacro %}
+
+{% macro orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {{ return(adapter.dispatch('orphan_table_age_predicate_sql', 'dbt_virtual')(physical_schema, retention_days)) }}
+{%- endmacro %}
+
+{% macro duckdb__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- DuckDB has no portable creation timestamp for tables; require recorded release age, failing safe for untracked tables. -#}
+  EXISTS (
+    SELECT 1
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS age_r
+    WHERE age_r.resource_type = 'model'
+      AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
+    GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
+    HAVING MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+  )
+{%- endmacro %}
+
+{% macro postgres__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- PostgreSQL's portable catalogs omit table creation time; use release timestamps and retain untracked tables. -#}
+  EXISTS (
+    SELECT 1
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS age_r
+    WHERE age_r.resource_type = 'model'
+      AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
+    GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
+    HAVING MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+  )
+{%- endmacro %}
+
+{% macro databricks__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  t.created < DATEADD(DAY, -{{ retention_days }}, CURRENT_TIMESTAMP())
 {%- endmacro %}
 
 {% macro default__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}

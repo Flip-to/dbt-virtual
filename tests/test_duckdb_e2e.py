@@ -207,16 +207,30 @@ def test_duckdb_gc_only_selects_fingerprint_suffix_tables() -> None:
     con = duckdb.connect(":memory:")
     con.execute("CREATE SCHEMA analytics_physical")
     con.execute("CREATE TABLE analytics_physical.orders__deadbeef AS SELECT 1 AS id")
+    con.execute("CREATE TABLE analytics_physical.recent__cafebabe AS SELECT 1 AS id")
     con.execute("CREATE TABLE analytics_physical.daily__archive AS SELECT 1 AS id")
     harness = MacroTestHarness(adapter_type="duckdb", target_name="prod")
     registry_sql = harness.call_macro("ensure_registry_tables_sql", "analytics_physical")
     for stmt in [s.strip() for s in registry_sql.split(";") if s.strip()]:
         con.execute(stmt)
+    con.execute(
+        """
+        INSERT INTO analytics_physical._releases (
+            release_id, source_environment, model_name, resource_type, dependency_tier,
+            fingerprint, physical_identifier, status, created_at
+        ) VALUES
+          ('old_release', 'staging', 'orders', 'model', 2, 'deadbeef',
+           'analytics_physical.orders__deadbeef', 'candidate', CURRENT_TIMESTAMP - INTERVAL '30 days'),
+          ('recent_release', 'staging', 'recent', 'model', 2, 'cafebabe',
+           'analytics_physical.recent__cafebabe', 'candidate', CURRENT_TIMESTAMP)
+        """
+    )
 
     orphan_query = harness.call_macro(
-        "find_orphan_tables_sql", "analytics_physical", 5, 7
+        "find_orphan_tables_sql", "analytics_physical", 0, 7
     )
     orphan_names = {row[0] for row in con.execute(orphan_query).fetchall()}
 
     assert "orders__deadbeef" in orphan_names
+    assert "recent__cafebabe" not in orphan_names
     assert "daily__archive" not in orphan_names

@@ -14,7 +14,7 @@
 | **Scalar UDF (`function`)** | `CREATE OR REPLACE FUNCTION ... RETURNS <type> AS (...)` | `CREATE OR REPLACE FUNCTION ... RETURNS <type> AS $$ ... $$` | `CREATE OR REPLACE FUNCTION ... RETURNS <type> RETURN ...` | `CREATE OR REPLACE FUNCTION ...` |
 | **Table Function (`table_function`)** | `CREATE OR REPLACE TABLE FUNCTION ... AS (SELECT ...)` | `CREATE OR REPLACE FUNCTION ... RETURNS TABLE(...) AS $$ ... $$` | `CREATE OR REPLACE FUNCTION ... RETURNS TABLE(...) RETURN ...` | View / Function fallback |
 | **Stored Procedure (`procedure`)** | `CREATE OR REPLACE PROCEDURE ... BEGIN ... END` | `CREATE OR REPLACE PROCEDURE ... LANGUAGE SQL AS $$ BEGIN ... END; $$` | SQL Scripting | `CREATE OR REPLACE PROCEDURE ...` |
-| **Orphan Table Discovery (`find_orphan_tables_sql`)** | `INFORMATION_SCHEMA.TABLES` (`table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')` + `REGEXP_CONTAINS`) | `INFORMATION_SCHEMA.TABLES` (`REGEXP_LIKE`) | `information_schema.tables` (`RLIKE`) | DuckDB `regexp_matches`; PostgreSQL `~`; unsupported adapters fail closed |
+| **Orphan Table Discovery (`find_orphan_tables_sql`)** | `INFORMATION_SCHEMA.TABLES` (`table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')` + `REGEXP_CONTAINS`) | `INFORMATION_SCHEMA.TABLES` (`REGEXP_LIKE` + `DATEADD`) | `information_schema.tables` (`RLIKE` + `CREATED` age cutoff) | DuckDB `regexp_matches` + recorded release age; PostgreSQL `~` + recorded release age; unsupported adapters fail closed |
 | **CI Verification** | [`Flip-to/bigquery-emulator`](https://github.com/Flip-to/bigquery-emulator) E2E in CI | [`nnnkkk7/snowflake-emulator`](https://github.com/nnnkkk7/snowflake-emulator) E2E in CI | Macro Execution Harness | Real `dbt-core` + `dbt-duckdb` E2E in CI |
 
 ---

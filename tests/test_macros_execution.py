@@ -459,10 +459,18 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     except RuntimeError as exc:
         assert "no safe fingerprint table matcher is configured" in str(exc)
 
+    duckdb_orphan = harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
+    assert "MAX(created_at) AS release_created_at" in duckdb_orphan
+    assert "GROUP BY release_id" in duckdb_orphan
+    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC)" in duckdb_orphan
+    assert "MIN(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
+
     # Databricks dispatch: SHALLOW CLONE
     dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
     dbx_clone = dbx_harness.call_macro("clone_table_sql", src, dst)
     assert "SHALLOW CLONE" in dbx_clone
+    dbx_orphan = dbx_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
+    assert "t.created < DATEADD(DAY, -7, CURRENT_TIMESTAMP())" in dbx_orphan
 
 
 def test_sync_env_view_and_register_routine_deployment() -> None:
