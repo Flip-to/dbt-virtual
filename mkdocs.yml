@@ -1,0 +1,96 @@
+site_name: dbt-virtual
+site_description: "SQLMesh-style Virtual Data Environments for dbt — content-addressed physical tables, zero-copy CLONE incremental seeding, per-environment routine virtualization, and instant view-swap promotion & rollback."
+site_url: https://flip-to.github.io/dbt-virtual/
+repo_url: https://github.com/Flip-to/dbt-virtual
+repo_name: Flip-to/dbt-virtual
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+nav:
+  - Home: README.md
+  - User Guides:
+      - Step-by-Step Getting Started: guides/getting_started.md
+      - Configuration & Parameters Reference: guides/configuration_reference.md
+      - How It Works & Architecture: guides/how_it_works.md
+      - Routines & TVF Unit Testing: guides/routines_and_tvf_testing.md
+      - CLI & Lifecycle Operations: guides/cli_and_operations.md
+      - CI/CD & Production Workflows: guides/ci_cd_workflows.md
+      - Warehouse Support Matrix: guides/warehouse_support.md
+  - Architecture Specs:
+      - Overview: specs/README.md
+      - Master Architecture: specs/20261027_dbt_virtual_architecture.md
+      - Merkle-DAG Fingerprinting: specs/20261027_merkle_dag_fingerprinting.md
+      - Routing, Ref Modes & Clone Seeding: specs/20261027_routing_ref_modes_and_clone_seeding.md
+      - Routine Virtualization & TVF Testing: specs/20261027_routine_virtualization_and_tvf_testing.md
+      - Lifecycle, Promote, Rollback & GC: specs/20261027_lifecycle_promote_rollback_and_gc.md
+      - Adapter Dispatch & Emulator CI: specs/20261027_adapter_dispatch_and_emulator_ci.md
+  - Decisions & Tech Debt:
+      - Architectural Decisions: decisions/README.md
+      - Default env_view Ref Resolution: decisions/20261027_default_ref_resolution_env_view.md
+      - Hybrid Package & BigQuery First: decisions/20261027_hybrid_package_and_bigquery_first.md
+      - Tech Debt Index: tech_debt/README.md
+      - BigQuery SQL in Lifecycle Ops (Paid): tech_debt/bigquery_sql_in_lifecycle_ops.md
+      - Jinja Fingerprint Merkle Parents (Paid): tech_debt/jinja_fingerprint_no_merkle_parents.md
+      - Documentation Conventions: conventions/docs_and_specs.md
+
+exclude_docs: |
+  templates/
+
+validation:
+  links:
+    not_found: ignore
+    unrecognized_links: ignore
