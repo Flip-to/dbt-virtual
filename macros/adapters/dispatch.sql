@@ -397,10 +397,14 @@ $$
 
 {% macro bigquery__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
-    SELECT DISTINCT release_id
-    FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
-    WHERE status IN ('promoted', 'candidate')
-    QUALIFY DENSE_RANK() OVER (ORDER BY created_at DESC) <= {{ retention_releases }}
+    SELECT release_id
+    FROM (
+      SELECT release_id, MAX(created_at) AS release_created_at
+      FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
+      WHERE status IN ('promoted', 'candidate')
+      GROUP BY release_id
+    )
+    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT SPLIT(physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
@@ -424,10 +428,14 @@ $$
 
 {% macro snowflake__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
-    SELECT DISTINCT release_id
-    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-    WHERE status IN ('promoted', 'candidate')
-    QUALIFY DENSE_RANK() OVER (ORDER BY created_at DESC) <= {{ retention_releases }}
+    SELECT release_id
+    FROM (
+      SELECT release_id, MAX(created_at) AS release_created_at
+      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+      WHERE status IN ('promoted', 'candidate')
+      GROUP BY release_id
+    )
+    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2)) AS table_name
