@@ -193,6 +193,14 @@ def test_duckdb_full_virtual_lifecycle_e2e() -> None:
         WHERE release_id = 'v1'
         """
     ).fetchall()
+    current_prod_rows = con.execute(
+        """
+        SELECT model_name, resource_type
+        FROM analytics_physical._environments
+        WHERE environment = 'prod'
+        """
+    ).fetchall()
+    harness.query_responses.append(FakeResult(current_prod_rows))
     harness.query_responses.append(FakeResult(rel_v1_rb))
     harness.executed_queries.clear()
     harness.call_macro("virtual_rollback", env="prod", to_release="v1")
