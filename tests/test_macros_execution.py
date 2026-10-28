@@ -577,6 +577,15 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
     harness.query_responses.append(
         FakeResult(
             [
+                ("orders_metrics", "model"),
+                ("new_model", "model"),
+                ("new_fn", "function"),
+            ]
+        )
+    )
+    harness.query_responses.append(
+        FakeResult(
+            [
                 (
                     "orders_metrics",
                     "model",
@@ -602,6 +611,13 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
         "INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (2); UPDATE "
         "`test_proj`.`analytics`.`audit_log` SET id = id + 1; END;"
     ) in harness.executed_queries
+    assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`new_model`" in rollback_queries
+    assert "DROP FUNCTION IF EXISTS `test_proj`.`analytics`.`new_fn`" in rollback_queries
+    assert "WHERE environment = 'prod' AND model_name = 'new_model'" in rollback_queries
+    assert "WHERE environment = 'prod' AND model_name = 'new_fn'" in rollback_queries
+    assert rollback_queries.index("DROP VIEW IF EXISTS `test_proj`.`analytics`.`new_model`") < rollback_queries.index(
+        "DROP FUNCTION IF EXISTS `test_proj`.`analytics`.`new_fn`"
+    )
 
     # 3. virtual_drop_env protects base_environment ('prod') and allows dropping 'pr_42'
     try:

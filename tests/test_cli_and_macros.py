@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -160,6 +161,57 @@ def test_cli_plan_json_and_text(tmp_path: Path, capsys) -> None:
     assert "orders_metrics" in txt_out
     assert "tvf_orders_report" in txt_out
     assert "FULL_BUILD" in txt_out
+
+
+def test_cli_status_writes_exported_state_json(tmp_path: Path, capsys) -> None:
+    state = {
+        "env": "staging",
+        "base_env": "prod",
+        "env_state": {"orders_metrics": "fp123"},
+        "base_env_state": {"orders_metrics": "fp000"},
+        "existing_physical_tables": ["orders_metrics__fp123"],
+    }
+    marker_output = f"DBT_VIRTUAL_STATE_JSON:{json.dumps(state)}\n"
+    completed = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout=marker_output, stderr="")
+    output_path = tmp_path / "target" / "state.json"
+
+    with patch("dbt_virtual.cli.subprocess.run", return_value=completed) as run:
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "status",
+                "--env",
+                "staging",
+                "--base-env",
+                "prod",
+                "--output",
+                "target/state.json",
+            ]
+        )
+
+    assert rc == 0
+    assert run.call_args.kwargs["cwd"] == tmp_path
+    assert run.call_args.kwargs["capture_output"] is True
+    assert json.loads(output_path.read_text(encoding="utf-8")) == state
+    assert "DBT_VIRTUAL_STATE_JSON:" in capsys.readouterr().out
+
+    missing_output_path = tmp_path / "missing.json"
+    no_marker = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout="dbt completed\n", stderr="")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=no_marker):
+        rc_missing = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_missing == 1
+    assert not missing_output_path.exists()
+
+    failed = subprocess.CompletedProcess(args=["dbt"], returncode=17, stdout="", stderr="dbt failed")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=failed):
+        rc_failed = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_failed == 17
+    assert not missing_output_path.exists()
 
 
 def test_planner_reuse_and_seed_incremental_classification(tmp_path: Path) -> None:
