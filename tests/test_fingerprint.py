@@ -51,6 +51,19 @@ def test_is_virtual_node() -> None:
     assert is_virtual_node({"resource_type": "test", "config": {"virtual_env": True}}) is False
 
 
+def test_duplicate_virtual_model_names_fail_before_fingerprinting() -> None:
+    first = _make_node(name="shared_model")
+    second = {**_make_node(name="shared_model"), "unique_id": "model.other.shared_model"}
+
+    try:
+        compute_manifest_fingerprints(
+            {"nodes": {first["unique_id"]: first, second["unique_id"]: second}}
+        )
+        raise AssertionError("Expected duplicate virtual model names to be rejected")
+    except ValueError as exc:
+        assert "Duplicate virtual model name 'shared_model'" in str(exc)
+
+
 def test_target_schema_invariance() -> None:
     """Compiling the same model under staging vs prod must yield the exact same fingerprint."""
     node_staging = _make_node(
