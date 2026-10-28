@@ -1,16 +1,21 @@
+{% macro exec_sql_statement(sql_text) -%}
+  {%- if statement is defined -%}
+    {%- call statement('dbt_virtual_ddl_dml', fetch_result=False, auto_begin=True) -%}
+      {{ sql_text }}
+    {%- endcall -%}
+    {%- if adapter.commit is defined -%}
+      {%- do adapter.commit() -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do run_query(sql_text) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
 {% macro exec_ddl_dml(sql_text) -%}
   {%- for stmt in sql_text.split(';') -%}
     {%- if (stmt | trim) != '' -%}
-      {%- if statement is defined -%}
-        {%- call statement('dbt_virtual_ddl_dml', fetch_result=False, auto_begin=True) -%}
-          {{ stmt }}
-        {%- endcall -%}
-        {%- if adapter.commit is defined -%}
-          {%- do adapter.commit() -%}
-        {%- endif -%}
-      {%- else -%}
-        {%- do run_query(stmt) -%}
-      {%- endif -%}
+      {%- do dbt_virtual.exec_sql_statement(stmt) -%}
     {%- endif -%}
   {%- endfor -%}
 {%- endmacro %}
@@ -337,7 +342,7 @@
       {%- elif routine_ddl is not none and routine_ddl != '' -%}
         {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', to_schema) -%}
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
-        {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
+        {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
         {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
       {%- endif -%}
     {%- endif -%}
@@ -491,7 +496,7 @@
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', env_schema) -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying routine " ~ env_schema ~ "." ~ model_name, info=True) }}
-      {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
+      {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
     {%- endif -%}
 
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
