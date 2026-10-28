@@ -431,6 +431,9 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     target_manifest["nodes"]["model.pkg.orders_metrics"]["columns"] = {
         "customer_id": {"name": "customer_id", "data_type": "STRING"}
     }
+    target_manifest["nodes"]["model.pkg.orders_metrics"]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
 
     diffs = diff_manifests(base_manifest, target_manifest)
     assert len(diffs) == 1
@@ -459,6 +462,39 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["has_breaking_changes"] is True
     assert payload["diffs"][0]["classification"] == "BREAKING"
+
+
+def test_schema_diff_uses_sql_projections_when_manifest_columns_are_partial() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    model_uid = "model.pkg.orders_metrics"
+    # Only customer_id is documented; orders is present in the compiled query but undocumented.
+    partial_columns = {"customer_id": {"name": "customer_id", "data_type": "STRING"}}
+    base_manifest["nodes"][model_uid]["columns"] = partial_columns
+    target_manifest["nodes"][model_uid]["columns"] = partial_columns
+    target_manifest["nodes"][model_uid]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    orders_diff = next(diff for diff in diffs if diff.model_name == "orders_metrics")
+    assert orders_diff.classification == "BREAKING"
+    assert any(
+        change.column == "orders" and change.change_type == "DROPPED"
+        for change in orders_diff.changes
+    )
+
+    stale_base = _sample_manifest()
+    stale_target = _sample_manifest()
+    # Even if docs still mention `orders`, the compiled projection is the current query shape.
+    stale_target["nodes"][model_uid]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
+    stale_diffs = diff_manifests(stale_base, stale_target)
+    stale_orders_diff = next(diff for diff in stale_diffs if diff.model_name == "orders_metrics")
+    assert stale_orders_diff.classification == "BREAKING"
+    assert any(change.column == "orders" and change.change_type == "DROPPED" for change in stale_orders_diff.changes)
 
 
 def test_cycle_detection_in_manifest() -> None:
