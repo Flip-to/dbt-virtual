@@ -55,8 +55,18 @@
   {%- set mode = cfg.get('ref_resolution', 'env_view') -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
 
-  {#- If the referenced relation is in physical_schema and carries a __<fp> suffix, it is a virtualized table -#}
-  {%- if raw_rel.schema == phys_schema and '__' in raw_rel.identifier -%}
+  {#- Only fingerprint-shaped suffixes identify virtual tables; arbitrary names may contain `__`. -#}
+  {%- set identifier_parts = raw_rel.identifier.rsplit('__', 1) -%}
+  {%- set fingerprint = identifier_parts[-1] -%}
+  {%- set suffix_check = namespace(valid=identifier_parts | length == 2 and fingerprint | length >= 8 and fingerprint | length <= 64) -%}
+  {%- if suffix_check.valid -%}
+    {%- for char in fingerprint -%}
+      {%- if char not in '0123456789abcdef' -%}
+        {%- set suffix_check.valid = false -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if raw_rel.schema == phys_schema and suffix_check.valid -%}
     {%- set logical_name = raw_rel.identifier.rsplit('__', 1)[0] -%}
     {%- if mode == 'env_view' -%}
       {{ return(api.Relation.create(

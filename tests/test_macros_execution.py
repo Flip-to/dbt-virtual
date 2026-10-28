@@ -68,6 +68,7 @@ class MacroTestHarness:
         self.flags = type("Flags", (), {"FULL_REFRESH": False})()
         self.model: dict[str, Any] = {}
         self.this: FakeRelation | None = None
+        self.ref_relations: dict[str, FakeRelation] = {}
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -214,11 +215,14 @@ class MacroTestHarness:
                 (),
                 {
                     "ref": staticmethod(
-                        lambda name: FakeRelation(
-                            self.target["database"],
-                            "analytics_physical",
-                            f"{name}__abcdef123456",
-                            "table",
+                        lambda name: self.ref_relations.get(
+                            name,
+                            FakeRelation(
+                                self.target["database"],
+                                "analytics_physical",
+                                f"{name}__abcdef123456",
+                                "table",
+                            ),
                         )
                     ),
                     "is_incremental": staticmethod(lambda: False),
@@ -296,6 +300,14 @@ def test_virtual_ref_modes_env_view_physical_and_hybrid() -> None:
     assert rel_a.schema == "analytics_staging"
     assert rel_a.identifier == "orders_metrics"
     assert rel_a.type == "view"
+
+    # A non-fingerprinted physical table whose name contains `__` must keep its relation.
+    harness_a.ref_relations["daily__archive"] = FakeRelation(
+        "test_proj", "analytics_physical", "daily__archive", "table"
+    )
+    rel_unrelated = harness_a.call_macro("virtual_ref", "daily__archive")
+    assert rel_unrelated.schema == "analytics_physical"
+    assert rel_unrelated.identifier == "daily__archive"
 
     # 2. Option B (`physical`) keeps direct `<physical_schema>.<model>__<fp>` table relation
     harness_b = MacroTestHarness(
