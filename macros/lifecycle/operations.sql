@@ -324,6 +324,11 @@
     {%- else -%}
       {%- if resource_type == 'model' -%}
         {%- set phys_table = phys_ident.split('.')[-1] -%}
+        {%- set existing_target_rel = adapter.get_relation(database=target.database, schema=to_schema, identifier=model_name) -%}
+        {%- if existing_target_rel is not none and existing_target_rel.type is defined and existing_target_rel.type == 'table' -%}
+          {{ log("dbt-virtual promote [" ~ to_env ~ "]: Dropping legacy physical table " ~ existing_target_rel ~ " before creating virtual view", info=True) }}
+          {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(existing_target_rel, 'table')) -%}
+        {%- endif -%}
         {%- set view_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=model_name, type='view') -%}
         {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
 
@@ -527,6 +532,108 @@
     {%- else -%}
       {{ log("dbt-virtual gc: Dropping " ~ drop_rel, info=True) }}
       {%- do dbt_virtual.exec_ddl_dml("DROP TABLE IF EXISTS " ~ drop_rel) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro virtual_adopt(env='prod', release_id='v_adopt_initial', drop_existing_table=true) -%}
+  {#-
+    Zero-Compute Migration / Adoption of an Existing dbt Project:
+    For every virtualized model (`virtual_env: true`) in `graph.nodes`:
+      1. Computes its current fingerprint `<fp>` and target physical table `<physical_schema>.<model>__<fp>`.
+      2. If `<env_schema>.<model>` currently exists as a physical BASE TABLE in the warehouse:
+         - Zero-copy CLONEs `<env_schema>.<model>` -> `<physical_schema>.<model>__<fp>` (0 compute!).
+         - When `drop_existing_table=true`, drops the old physical table `<env_schema>.<model>` and
+           immediately creates the virtual view `<env_schema>.<model>` -> `<physical_schema>.<model>__<fp>`
+           so consumers experience zero downtime and zero table rebuilds.
+      3. Records the adopted model or routine in `<physical_schema>._environments` and `<physical_schema>._releases`.
+  -#}
+  {%- if not execute -%}
+    {{ return('') }}
+  {%- endif -%}
+
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
+
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_schema_if_not_exists_sql(phys_schema)) -%}
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_schema_if_not_exists_sql(env_schema)) -%}
+  {%- for stmt in dbt_virtual.ensure_registry_tables_sql(phys_schema) -%}
+    {%- do dbt_virtual.exec_ddl_dml(stmt) -%}
+  {%- endfor -%}
+
+  {%- set nodes_dict = graph.get('nodes', {}) if graph is mapping else {} -%}
+  {%- for unique_id, node in nodes_dict.items() -%}
+    {%- if dbt_virtual.is_virtual_node(node) -%}
+      {%- set model_name = dbt_virtual.node_attr(node, 'name', '') -%}
+      {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+      {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', 'view') -%}
+      {%- set fp = dbt_virtual.get_fingerprint(node) -%}
+
+      {%- if mat in ['table', 'incremental'] -%}
+        {%- set phys_table = model_name ~ '__' ~ fp -%}
+        {%- set phys_ident = phys_schema ~ '.' ~ phys_table -%}
+        {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
+        {%- set existing_rel = adapter.get_relation(database=target.database, schema=env_schema, identifier=model_name) -%}
+
+        {%- if existing_rel is not none -%}
+          {{ log("dbt-virtual adopt [" ~ env ~ "]: Cloning existing table " ~ existing_rel ~ " -> " ~ phys_rel ~ " (0 compute)", info=True) }}
+          {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.clone_table_sql(existing_rel, phys_rel)) -%}
+          {%- if drop_existing_table -%}
+            {#- In BigQuery/Snowflake/Postgres, replacing a BASE TABLE with a VIEW of the same name requires dropping the table first -#}
+            {%- if existing_rel.type is not defined or existing_rel.type != 'view' -%}
+              {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(existing_rel, 'table')) -%}
+            {%- endif -%}
+            {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
+            {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+          {%- endif -%}
+        {%- else -%}
+          {{ log("dbt-virtual adopt [" ~ env ~ "]: Existing relation " ~ env_schema ~ "." ~ model_name ~ " not found; skipping clone.", info=True) }}
+        {%- endif -%}
+
+        {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
+          phys_schema,
+          env,
+          model_name,
+          'model',
+          fp,
+          phys_ident,
+          release_id
+        )) -%}
+        {%- set ins_rel_sql -%}
+          INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} (
+            release_id,
+            source_environment,
+            target_environment,
+            model_name,
+            resource_type,
+            dependency_tier,
+            fingerprint,
+            physical_identifier,
+            routine_ddl_template,
+            status,
+            created_at,
+            promoted_at,
+            rolled_back_at
+          ) VALUES (
+            '{{ release_id }}',
+            '{{ env }}',
+            '{{ env }}',
+            '{{ model_name }}',
+            'model',
+            2,
+            '{{ fp }}',
+            '{{ phys_ident }}',
+            NULL,
+            'promoted',
+            {{ dbt_virtual.current_timestamp_sql() }},
+            {{ dbt_virtual.current_timestamp_sql() }},
+            NULL
+          )
+        {%- endset -%}
+        {%- do dbt_virtual.exec_ddl_dml(ins_rel_sql) -%}
+      {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
 {%- endmacro %}

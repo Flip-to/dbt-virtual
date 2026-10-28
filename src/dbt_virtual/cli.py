@@ -290,6 +290,37 @@ def cmd_gc(ns: argparse.Namespace) -> int:
     )
 
 
+def cmd_adopt(ns: argparse.Namespace) -> int:
+    project_dir = Path(ns.project_dir).resolve()
+    manifest_path = project_dir / "target" / "manifest.json"
+    if not ns.skip_compile or not manifest_path.exists():
+        rc = _run_dbt(["compile"], project_dir)
+        if rc != 0:
+            return rc
+
+    manifest = _load_manifest(project_dir)
+    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas or [])
+    fp_map = {v.name: v.fingerprint for v in fps.values()}
+
+    op_args = {
+        "env": ns.env,
+        "release_id": ns.release,
+        "drop_existing_table": not ns.keep_existing_table,
+    }
+    dbt_vars = {"_dbt_virtual_fps": fp_map}
+    return _run_dbt(
+        [
+            "run-operation",
+            "virtual_adopt",
+            "--args",
+            json.dumps(op_args),
+            "--vars",
+            json.dumps(dbt_vars),
+        ],
+        project_dir,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dbt-virtual",
@@ -404,6 +435,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--retention-releases", type=int, default=5)
     p_gc.add_argument("--retention-days", type=int, default=7)
     p_gc.set_defaults(func=cmd_gc)
+
+    # adopt
+    p_adopt = sub.add_parser(
+        "adopt",
+        help="Zero-compute migration: clone existing production tables into physical_schema and convert them to virtual views.",
+    )
+    p_adopt.add_argument("--env", default="prod", help="Existing environment to adopt (default: prod).")
+    p_adopt.add_argument("--release", default="v_adopt_initial", help="Initial baseline release ID.")
+    p_adopt.add_argument(
+        "--keep-existing-table",
+        action="store_true",
+        help="Clone into physical_schema and register in _environments without replacing the existing table with a view yet.",
+    )
+    p_adopt.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_adopt.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
+    p_adopt.set_defaults(func=cmd_adopt)
 
     return parser
 

@@ -8,6 +8,7 @@
 
 > **📖 Read the Full Documentation**: **[https://flip-to.github.io/dbt-virtual/](https://flip-to.github.io/dbt-virtual/)**
 > - [Step-by-Step Getting Started Guide](docs/guides/getting_started.md)
+> - [Migrating an Existing Project in Zero Compute (`dbt-virtual adopt`)](docs/guides/migrating_existing_project.md)
 > - [Complete Configuration & Parameters Reference](docs/guides/configuration_reference.md)
 > - [How It Works & Ref Resolution Modes (`env_view` vs `physical` vs `hybrid`)](docs/guides/how_it_works.md)
 > - [Routines (`table_function`, `function`, `procedure`) & `tvf_test_ref`](docs/guides/routines_and_tvf_testing.md)

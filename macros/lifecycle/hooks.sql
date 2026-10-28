@@ -145,6 +145,12 @@
 
   {%- do dbt_virtual.ensure_registry() -%}
 
+  {%- set existing_env_rel = adapter.get_relation(database=this.database, schema=env_schema, identifier=model.name) -%}
+  {%- set drop_legacy_tbl_stmt = '' -%}
+  {%- if existing_env_rel is not none and existing_env_rel.type is defined and existing_env_rel.type == 'table' -%}
+    {%- set drop_legacy_tbl_stmt = dbt_virtual.drop_object_if_exists_sql(existing_env_rel, 'table') ~ ';\n' -%}
+  {%- endif -%}
+
   {%- set view_rel = api.Relation.create(
     database=this.database,
     schema=env_schema,
@@ -153,7 +159,7 @@
   ) -%}
 
   {%- set sql_statements -%}
-    {{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }};
+    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }};
 
     {{ dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,

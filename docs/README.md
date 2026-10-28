@@ -12,6 +12,14 @@
 
     [:octicons-arrow-right-24: Getting Started Guide](guides/getting_started.md)
 
+-   :material-database-import:{ .lg .middle } **Migrating an Existing Project ($0 Compute)**
+
+    ---
+
+    Already have huge multi-TB production tables? Use `dbt-virtual adopt` to zero-copy `CLONE` existing tables into `analytics_physical` with zero rebuild cost.
+
+    [:octicons-arrow-right-24: Migration Guide](guides/migrating_existing_project.md)
+
 -   :material-tune:{ .lg .middle } **Configuration & Parameters Reference**
 
     ---

@@ -64,6 +64,7 @@ nav:
   - Home: README.md
   - User Guides:
       - Step-by-Step Getting Started: guides/getting_started.md
+      - Migrating an Existing Project (Zero Compute): guides/migrating_existing_project.md
       - Configuration & Parameters Reference: guides/configuration_reference.md
       - How It Works & Architecture: guides/how_it_works.md
       - Routines & TVF Unit Testing: guides/routines_and_tvf_testing.md

@@ -716,3 +716,55 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
     assert exported["existing_physical_tables"] == ["orders_metrics__fp111", "orders_metrics__fp222"]
 
 
+def test_virtual_adopt_zero_compute_existing_project_migration() -> None:
+    """Verify zero-compute migration of existing huge production tables via virtual_adopt."""
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+                "env_schemas": {
+                    "staging": "analytics_staging",
+                    "prod": "analytics",
+                },
+            },
+            "_dbt_virtual_fps": {"huge_events": "fp_adopted_1"},
+        }
+    )
+    harness.graph = {
+        "nodes": {
+            "model.pkg.huge_events": {
+                "unique_id": "model.pkg.huge_events",
+                "name": "huge_events",
+                "resource_type": "model",
+                "config": {"materialized": "incremental", "virtual_env": True},
+            }
+        }
+    }
+    # Existing physical table in `analytics.huge_events`
+    harness.existing_relations.add(("test_proj", "analytics", "huge_events"))
+
+    harness.call_macro(
+        "virtual_adopt",
+        env="prod",
+        release_id="v_adopt_initial",
+        drop_existing_table=True,
+    )
+    adopt_queries = "\n".join(harness.executed_queries)
+    # 1. Zero-copy CLONE from `analytics.huge_events` -> `analytics_physical.huge_events__fp_adopted_1`
+    assert (
+        "CREATE TABLE IF NOT EXISTS `test_proj`.`analytics_physical`.`huge_events__fp_adopted_1`\n"
+        "    CLONE `test_proj`.`analytics`.`huge_events`" in adopt_queries
+    )
+    # 2. Drops the legacy physical table `analytics.huge_events` and replaces it with a virtual VIEW
+    assert "DROP TABLE IF EXISTS `test_proj`.`analytics`.`huge_events`" in adopt_queries
+    assert (
+        "CREATE OR REPLACE VIEW `test_proj`.`analytics`.`huge_events` AS\n"
+        "  SELECT * FROM `test_proj`.`analytics_physical`.`huge_events__fp_adopted_1`" in adopt_queries
+    )
+    # 3. Registers the adopted table in `_environments` and `_releases`
+    assert "MERGE `test_proj`.`analytics_physical`._environments" in adopt_queries
+    assert "INSERT INTO `test_proj`.`analytics_physical`._releases" in adopt_queries
+
+
+

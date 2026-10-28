@@ -59,6 +59,7 @@
 {%- endmacro %}
 
 {% macro postgres__create_or_replace_view_sql(view_relation, physical_relation) -%}
+  DROP TABLE IF EXISTS {{ view_relation }} CASCADE;
   DROP VIEW IF EXISTS {{ view_relation }} CASCADE;
   CREATE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
@@ -466,7 +467,9 @@ $$
 {%- endmacro %}
 
 {% macro bigquery__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
-  {%- if resource_type == 'model' -%}
+  {%- if resource_type == 'table' -%}
+    DROP TABLE IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'model' -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP TABLE FUNCTION IF EXISTS {{ object_relation }}
@@ -480,7 +483,9 @@ $$
 {%- endmacro %}
 
 {% macro duckdb__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
-  {%- if resource_type == 'model' -%}
+  {%- if resource_type == 'table' -%}
+    DROP TABLE IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'model' -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP MACRO TABLE IF EXISTS {{ object_relation }}
@@ -492,7 +497,9 @@ $$
 {%- endmacro %}
 
 {% macro default__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
-  {%- if resource_type == 'model' -%}
+  {%- if resource_type == 'table' -%}
+    DROP TABLE IF EXISTS {{ object_relation }} CASCADE
+  {%- elif resource_type == 'model' -%}
     DROP VIEW IF EXISTS {{ object_relation }} CASCADE
   {%- else -%}
     SELECT 1
