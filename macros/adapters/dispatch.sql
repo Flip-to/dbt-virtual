@@ -415,7 +415,7 @@ $$
   SELECT t.table_name
   FROM `{{ target.database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES AS t
   LEFT JOIN protected_tables AS p ON t.table_name = p.table_name
-  WHERE t.table_type = 'BASE TABLE'
+  WHERE t.table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')
     AND REGEXP_CONTAINS(t.table_name, r'__[0-9a-f]{8,64}$')
     AND t.creation_time < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {{ retention_days }} DAY)
     AND p.table_name IS NULL
@@ -461,6 +461,45 @@ $$
 {%- endmacro %}
 
 
+{% macro drop_object_if_exists_sql(object_relation, resource_type='model') -%}
+  {{ return(adapter.dispatch('drop_object_if_exists_sql', 'dbt_virtual')(object_relation, resource_type)) }}
+{%- endmacro %}
+
+{% macro bigquery__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
+  {%- if resource_type == 'model' -%}
+    DROP VIEW IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'table_function' -%}
+    DROP TABLE FUNCTION IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'function' -%}
+    DROP FUNCTION IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'procedure' -%}
+    DROP PROCEDURE IF EXISTS {{ object_relation }}
+  {%- else -%}
+    DROP VIEW IF EXISTS {{ object_relation }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro duckdb__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
+  {%- if resource_type == 'model' -%}
+    DROP VIEW IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'table_function' -%}
+    DROP MACRO TABLE IF EXISTS {{ object_relation }}
+  {%- elif resource_type == 'function' -%}
+    DROP MACRO IF EXISTS {{ object_relation }}
+  {%- else -%}
+    SELECT 1
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro default__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
+  {%- if resource_type == 'model' -%}
+    DROP VIEW IF EXISTS {{ object_relation }} CASCADE
+  {%- else -%}
+    SELECT 1
+  {%- endif -%}
+{%- endmacro %}
+
+
 {% macro timestamp_add_minutes_sql(minutes) -%}
   {{ return(adapter.dispatch('timestamp_add_minutes_sql', 'dbt_virtual')(minutes)) }}
 {%- endmacro %}
@@ -485,7 +524,7 @@ $$
 {% macro bigquery__list_physical_tables_sql(physical_schema) -%}
   SELECT table_name
   FROM `{{ target.database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES
-  WHERE table_type = 'BASE TABLE'
+  WHERE table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')
     AND REGEXP_CONTAINS(table_name, r'__[0-9a-f]{8,64}$')
   ORDER BY table_name
 {%- endmacro %}

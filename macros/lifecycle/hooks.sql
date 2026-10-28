@@ -69,7 +69,14 @@
       {{ log("dbt-virtual: Seeding " ~ this ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
       {#- Prime dbt's relation cache so subsequent is_incremental() checks during model execution return True -#}
       {%- do adapter.cache_added(this) -%}
-      {{ return(dbt_virtual.clone_table_sql(source_rel, this)) }}
+      {%- set clone_sql = dbt_virtual.clone_table_sql(source_rel, this) -%}
+      {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
+      {%- set add_cols = dbt_virtual.node_attr(node_cfg, 'virtual_add_columns', []) or [] -%}
+      {%- set alter_stmts = [clone_sql] -%}
+      {%- for col_spec in add_cols -%}
+        {%- do alter_stmts.append("ALTER TABLE " ~ this ~ " ADD COLUMN IF NOT EXISTS " ~ col_spec) -%}
+      {%- endfor -%}
+      {{ return(alter_stmts | join(';\n')) }}
     {%- endif -%}
   {%- endif -%}
 

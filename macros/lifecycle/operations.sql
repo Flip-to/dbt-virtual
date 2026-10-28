@@ -282,6 +282,26 @@
     {%- endif -%}
   {%- endfor -%}
 
+  {#- Phase 1.5: Query existing pointers in `to_env` for partial promotion & demotion detection -#}
+  {%- set existing_env_query -%}
+    SELECT model_name, resource_type, fingerprint, physical_identifier
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment = '{{ to_env }}'
+  {%- endset -%}
+  {%- set existing_env_res = run_query(existing_env_query) -%}
+  {%- set existing_fp_map = {} -%}
+  {%- set existing_ident_map = {} -%}
+  {%- set existing_type_map = {} -%}
+  {%- if existing_env_res -%}
+    {%- for erow in existing_env_res.rows -%}
+      {%- do existing_fp_map.update({erow[0]: erow[2]}) -%}
+      {%- do existing_ident_map.update({erow[0]: erow[3]}) -%}
+      {%- do existing_type_map.update({erow[0]: erow[1]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set promoted_names = [] -%}
+
   {#- Phase 2: Tiered promotion (Tier 1 UDFs -> Tier 2 Views -> Tier 3 TVFs -> Tier 4 Procedures) -#}
   {%- for row in rows.rows -%}
     {%- set model_name = row[0] -%}
@@ -289,23 +309,32 @@
     {%- set fp = row[2] -%}
     {%- set phys_ident = row[3] -%}
     {%- set routine_ddl = row[4] -%}
+    {%- do promoted_names.append(model_name) -%}
 
     {%- if resource_type == 'model' -%}
-      {%- set phys_table = phys_ident.split('.')[-1] -%}
-      {%- set view_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=model_name, type='view') -%}
-      {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
-
-      {{ log("dbt-virtual promote [" ~ to_env ~ "]: " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
-      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
       {%- set target_phys_ident = phys_ident -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
-      {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', to_schema) -%}
-      {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
-      {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
-      {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
       {%- set target_phys_ident = to_schema ~ '.' ~ model_name -%}
     {%- else -%}
       {%- set target_phys_ident = phys_ident -%}
+    {%- endif -%}
+
+    {%- if existing_fp_map.get(model_name, '') == fp and existing_ident_map.get(model_name, '') == target_phys_ident -%}
+      {{ log("dbt-virtual promote [" ~ to_env ~ "]: Skipping unchanged " ~ model_name ~ " (fp=" ~ fp ~ " already promoted)", info=True) }}
+    {%- else -%}
+      {%- if resource_type == 'model' -%}
+        {%- set phys_table = phys_ident.split('.')[-1] -%}
+        {%- set view_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=model_name, type='view') -%}
+        {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
+
+        {{ log("dbt-virtual promote [" ~ to_env ~ "]: " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
+        {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+      {%- elif routine_ddl is not none and routine_ddl != '' -%}
+        {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', to_schema) -%}
+        {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
+        {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
+        {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
+      {%- endif -%}
     {%- endif -%}
 
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
@@ -317,6 +346,19 @@
       target_phys_ident,
       release_id
     )) -%}
+  {%- endfor -%}
+
+  {#- Phase 3: Demote removed objects that were previously in `to_env` but are no longer in the promoted set -#}
+  {%- for old_name, old_type in existing_type_map.items() -%}
+    {%- if old_name not in promoted_names -%}
+      {%- set demote_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=old_name, type='view') -%}
+      {{ log("dbt-virtual demote [" ~ to_env ~ "]: Removing demoted " ~ old_type ~ " " ~ demote_rel, info=True) }}
+      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(demote_rel, old_type)) -%}
+      {%- do dbt_virtual.exec_ddl_dml(
+        "DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments')
+        ~ " WHERE environment = '" ~ to_env ~ "' AND model_name = '" ~ old_name ~ "'"
+      ) -%}
+    {%- endif -%}
   {%- endfor -%}
 
   {%- if release_id != '' -%}

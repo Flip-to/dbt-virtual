@@ -6,6 +6,7 @@ from dbt_virtual.fingerprint import (
     canonicalize_sql_ast,
     compute_manifest_fingerprints,
     compute_node_fingerprint,
+    extract_relevant_config,
     extract_sql_output_columns,
     is_virtual_node,
     normalize_sql,
@@ -161,6 +162,26 @@ def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
 
     cols = extract_sql_output_columns(sql_b)
     assert cols == {"customer_id": "", "total_orders": "INT64"}
+
+
+def test_physical_version_pinning_and_forward_only_config() -> None:
+    """Verify SQLMesh-style physical_version pinning and forward_only config extraction."""
+    node_default = _make_node(
+        compiled_code="SELECT 1 AS id",
+    )
+    node_pinned = _make_node(
+        compiled_code="SELECT 2 AS id_changed",
+    )
+    node_pinned["config"]["physical_version"] = "pinned_fp_v1"
+    node_pinned["config"]["forward_only"] = True
+    fp_default = compute_node_fingerprint(node_default)
+    fp_pinned = compute_node_fingerprint(node_pinned)
+    assert fp_default.fingerprint != "pinned_fp_v1"
+    assert fp_pinned.fingerprint == "pinned_fp_v1"
+    assert fp_pinned.physical_identifier == "orders_metrics__pinned_fp_v1"
+    cfg_payload = extract_relevant_config(node_pinned)
+    assert cfg_payload.get("forward_only") is True
+    assert cfg_payload.get("physical_version") == "pinned_fp_v1"
 
 
 def test_property_based_sql_normalization_and_dag_determinism() -> None:

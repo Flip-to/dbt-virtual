@@ -164,6 +164,8 @@ def extract_relevant_config(node: dict[str, Any]) -> dict[str, Any]:
         "parameters": _get("parameters"),
         "returns": _get("returns"),
         "virtual_env_epoch": _get("virtual_env_epoch", 1),
+        "forward_only": bool(_get("forward_only", False)),
+        "physical_version": _get("physical_version"),
     }
 
 
@@ -214,6 +216,8 @@ def compute_node_fingerprint(
 
     canonical_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(canonical_bytes).hexdigest()[:fp_length]
+    if config_subset.get("physical_version"):
+        digest = str(config_subset["physical_version"])
 
     is_routine = materialized in {"table_function", "function", "procedure"}
     physical_identifier = name if is_routine else f"{name}__{digest}"

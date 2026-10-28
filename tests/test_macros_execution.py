@@ -375,7 +375,11 @@ def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
     )
     harness.model = {
         "name": "orders_metrics",
-        "config": {"materialized": "incremental", "virtual_env": True},
+        "config": {
+            "materialized": "incremental",
+            "virtual_env": True,
+            "virtual_add_columns": ["discount_amount NUMERIC", "coupon_code STRING"],
+        },
     }
     harness.this = FakeRelation("test_proj", "analytics_physical", "orders_metrics__newfp123456")
     # Base table exists in analytics_physical
@@ -384,6 +388,8 @@ def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
 
     sql = harness.call_macro("clone_if_new_fp")
     assert "CLONE `test_proj`.`analytics_physical`.`orders_metrics__prodfp000000`" in sql
+    assert "ADD COLUMN IF NOT EXISTS discount_amount NUMERIC" in sql
+    assert "ADD COLUMN IF NOT EXISTS coupon_code STRING" in sql
     # Verify adapter.cache_added(this) was called so dbt knows the table now exists
     assert harness.cache_added_relations == [harness.this]
 
@@ -533,11 +539,23 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
             ]
         )
     )
+    # Existing pointers in `prod` (includes an obsolete `legacy_view` that should be demoted,
+    # and `udf_double` already at `fpudf` pointing to `analytics.udf_double` which should skip redundant DDL re-execution!)
+    harness.query_responses.append(
+        FakeResult(
+            [
+                ("udf_double", "function", "fpudf", "analytics.udf_double"),
+                ("legacy_view", "model", "fp_old", "analytics_physical.legacy_view__fp_old"),
+            ]
+        )
+    )
     harness.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="v1")
     joined_queries = "\n".join(harness.executed_queries)
-    assert "CREATE OR REPLACE FUNCTION `test_proj`.`analytics`.`udf_double`" in joined_queries
+    # udf_double was already promoted at fpudf, so its CREATE OR REPLACE FUNCTION is skipped (partial promotion)
+    assert "CREATE OR REPLACE FUNCTION `test_proj`.`analytics`.`udf_double`" not in joined_queries
     assert "CREATE OR REPLACE VIEW `test_proj`.`analytics`.`orders_metrics`" in joined_queries
     assert "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`analytics`.`tvf_report`" in joined_queries
+    assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`legacy_view`" in joined_queries
     assert "SET status = 'promoted'" in joined_queries
 
     # 2. virtual_rollback to previous release

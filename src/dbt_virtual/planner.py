@@ -48,12 +48,55 @@ class NodePlanAction:
         }
 
 
+COMPATIBLE_TYPE_WIDENINGS: dict[str, set[str]] = {
+    "INT64": {"NUMERIC", "BIGNUMERIC", "FLOAT64", "DECIMAL", "BIGDECIMAL"},
+    "INTEGER": {"BIGINT", "NUMERIC", "DOUBLE", "FLOAT", "DECIMAL", "NUMBER"},
+    "INT": {"BIGINT", "INT64", "NUMERIC", "FLOAT64", "DOUBLE"},
+    "NUMERIC": {"BIGNUMERIC", "FLOAT64"},
+    "DECIMAL": {"BIGDECIMAL", "FLOAT64", "DOUBLE"},
+    "DATE": {"DATETIME", "TIMESTAMP"},
+}
+
+TYPE_SYNONYMS: dict[str, str] = {
+    "INT": "INT64",
+    "SMALLINT": "INT64",
+    "BYTEINT": "INT64",
+    "DECIMAL": "NUMERIC",
+    "BIGDECIMAL": "BIGNUMERIC",
+    "FLOAT": "FLOAT64",
+    "DOUBLE": "FLOAT64",
+    "BOOL": "BOOLEAN",
+    "TEXT": "VARCHAR",
+}
+
+
+def is_compatible_type_widening(old_type: str, new_type: str) -> bool:
+    """Return True if `old_type -> new_type` is an equivalent synonym or lossless widening (like SQLMesh BigQuery SCHEMA_DIFFER_KWARGS)."""
+    o = (old_type or "").upper().strip()
+    n = (new_type or "").upper().strip()
+    if not o or not n or o == n:
+        return True
+    o_canon = TYPE_SYNONYMS.get(o, o)
+    n_canon = TYPE_SYNONYMS.get(n, n)
+    if o_canon == n_canon:
+        return True
+    # Parameterized STRING(n) -> STRING or VARCHAR(n) -> VARCHAR
+    if o.startswith("STRING(") and n == "STRING":
+        return True
+    if o.startswith("BYTES(") and n == "BYTES":
+        return True
+    if o.startswith("VARCHAR(") and n in {"VARCHAR", "TEXT", "STRING"}:
+        return True
+    allowed = COMPATIBLE_TYPE_WIDENINGS.get(o, set()) | COMPATIBLE_TYPE_WIDENINGS.get(o_canon, set())
+    return n in allowed or n_canon in allowed
+
+
 @dataclass(frozen=True)
 class ColumnChange:
     """A single column addition, removal, or type change on a model."""
 
     column: str
-    change_type: str  # ADDED | DROPPED | TYPE_CHANGED
+    change_type: str  # ADDED | DROPPED | TYPE_WIDENED | TYPE_CHANGED
     old_type: str | None = None
     new_type: str | None = None
 
@@ -208,14 +251,25 @@ def diff_model_columns(
         else:
             _, new_type = norm_new[col_key]
             if old_type and new_type and old_type != new_type:
-                changes.append(
-                    ColumnChange(
-                        column=orig_name,
-                        change_type="TYPE_CHANGED",
-                        old_type=old_type,
-                        new_type=new_type,
+                if is_compatible_type_widening(old_type, new_type):
+                    if TYPE_SYNONYMS.get(old_type, old_type) != TYPE_SYNONYMS.get(new_type, new_type):
+                        changes.append(
+                            ColumnChange(
+                                column=orig_name,
+                                change_type="TYPE_WIDENED",
+                                old_type=old_type,
+                                new_type=new_type,
+                            )
+                        )
+                else:
+                    changes.append(
+                        ColumnChange(
+                            column=orig_name,
+                            change_type="TYPE_CHANGED",
+                            old_type=old_type,
+                            new_type=new_type,
+                        )
                     )
-                )
 
     for col_key, (orig_name, new_type) in sorted(norm_new.items()):
         if col_key not in norm_old:

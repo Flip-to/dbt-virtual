@@ -408,10 +408,20 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     )
     assert d_non_breaking.classification == "NON_BREAKING"
 
-    d_breaking = diff_model_columns(
+    # Compatible type widening (INT64 -> FLOAT64, matching SQLMesh BigQuery SCHEMA_DIFFER_KWARGS) is NON_BREAKING
+    d_widened = diff_model_columns(
         "orders_metrics",
         {"customer_id": "STRING", "orders": "INT64"},
         {"customer_id": "STRING", "orders": "FLOAT64"},
+    )
+    assert d_widened.classification == "NON_BREAKING"
+    assert d_widened.changes[0].change_type == "TYPE_WIDENED"
+
+    # Incompatible narrowing / type change (FLOAT64 -> INT64 or STRING -> INT64) is BREAKING
+    d_breaking = diff_model_columns(
+        "orders_metrics",
+        {"customer_id": "STRING", "orders": "FLOAT64"},
+        {"customer_id": "STRING", "orders": "INT64"},
     )
     assert d_breaking.classification == "BREAKING"
 
