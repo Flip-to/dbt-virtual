@@ -87,8 +87,12 @@ def extract_sql_output_columns(sql: str, dialect: str = "bigquery") -> dict[str,
             return {}
         cols: dict[str, str] = {}
         for proj in select_expr.expressions:
-            if isinstance(proj, exp.Star):
-                continue
+            if isinstance(proj, exp.Star) or (
+                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+            ):
+                # A wildcard makes the full output schema unknown; returning a partial
+                # projection set could falsely report documented columns as removed.
+                return {}
             col_name = proj.alias_or_name
             if not col_name:
                 continue

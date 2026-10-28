@@ -497,6 +497,18 @@ def test_schema_diff_uses_sql_projections_when_manifest_columns_are_partial() ->
     assert any(change.column == "orders" and change.change_type == "DROPPED" for change in stale_orders_diff.changes)
 
 
+def test_schema_diff_keeps_documented_columns_when_query_projects_wildcard() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    target_manifest["nodes"]["model.pkg.orders_metrics"]["compiled_code"] = (
+        "SELECT *, 1 AS new_column FROM `proj.core_prod.events_base`"
+    )
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    assert not any(diff.model_name == "orders_metrics" for diff in diffs)
+
+
 def test_cycle_detection_in_manifest() -> None:
     manifest = {
         "nodes": {
