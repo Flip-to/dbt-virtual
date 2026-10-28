@@ -242,6 +242,17 @@ def compute_manifest_fingerprints(
     """Compute Merkle-DAG fingerprints for all virtual_env nodes in a dbt manifest."""
     nodes: dict[str, dict[str, Any]] = manifest.get("nodes") or {}
     virtual_nodes = {uid: n for uid, n in nodes.items() if is_virtual_node(n)}
+    virtual_name_uids: dict[str, str] = {}
+    for uid, node in virtual_nodes.items():
+        name = str(node.get("name", ""))
+        previous_uid = virtual_name_uids.get(name)
+        if previous_uid is not None:
+            raise ValueError(
+                f"Duplicate virtual model name '{name}' in manifest nodes "
+                f"'{previous_uid}' and '{uid}'. dbt-virtual requires unique names "
+                "because environment state and physical identifiers are keyed by model name."
+            )
+        virtual_name_uids[name] = uid
 
     computed: dict[str, NodeFingerprint] = {}
     visiting: set[str] = set()
