@@ -17,10 +17,56 @@ from sqlglot.errors import SqlglotError
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
 
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL comments without interpreting comment markers inside quoted text."""
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    while i < len(sql):
+        char = sql[i]
+        if quote is not None:
+            out.append(char)
+            if char == quote:
+                # SQL escapes quote characters by doubling them.
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    out.append(sql[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            elif char == "\\" and i + 1 < len(sql):
+                # Preserve backslash-escaped quotes used by several warehouse dialects.
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            out.append(char)
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            if end < 0:
+                break
+            out.append("\n")
+            i = end + 1
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                # Keep malformed SQL intact; parsing/execution should report the syntax error.
+                out.append(sql[i:])
+                break
+            out.append(" ")
+            i = end + 2
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -114,9 +160,7 @@ def normalize_sql(
     if not sql:
         return ""
 
-    normalized = sql.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = _BLOCK_COMMENT_RE.sub("", normalized)
-    normalized = _LINE_COMMENT_RE.sub("", normalized)
+    normalized = _strip_sql_comments(sql.replace("\r\n", "\n").replace("\r", "\n"))
 
     # Strip any existing __<fp> suffixes from physical table names
     normalized = _FINGERPRINT_SUFFIX_RE.sub("", normalized)

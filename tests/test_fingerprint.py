@@ -164,6 +164,39 @@ def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
     assert cols == {"customer_id": "", "total_orders": "INT64"}
 
 
+def test_normalize_sql_preserves_comment_markers_inside_quoted_values() -> None:
+    line_comment_marker = "SELECT 'value--still data' AS result"
+    block_comment_marker = "SELECT 'value/*still data*/' AS result"
+
+    assert normalize_sql(line_comment_marker) == line_comment_marker
+    assert normalize_sql(block_comment_marker) == block_comment_marker
+
+
+def test_fingerprint_changes_when_quoted_value_contains_comment_marker() -> None:
+    base_node = {
+        "unique_id": "model.test.comment_marker",
+        "name": "comment_marker",
+        "resource_type": "model",
+        "config": {"materialized": "table"},
+    }
+    line_comment_sql = "SELECT 'value--different' AS result"
+    block_comment_sql = "SELECT 'value/*different*/' AS result"
+    plain_sql = "SELECT 'value' AS result"
+
+    line_comment_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": line_comment_sql, "raw_code": line_comment_sql}
+    )
+    block_comment_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": block_comment_sql, "raw_code": block_comment_sql}
+    )
+    plain_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": plain_sql, "raw_code": plain_sql}
+    )
+
+    assert line_comment_fp.fingerprint != plain_fp.fingerprint
+    assert block_comment_fp.fingerprint != plain_fp.fingerprint
+
+
 def test_physical_version_pinning_and_forward_only_config() -> None:
     """Verify SQLMesh-style physical_version pinning and forward_only config extraction."""
     node_default = _make_node(
