@@ -59,7 +59,6 @@
 {%- endmacro %}
 
 {% macro postgres__create_or_replace_view_sql(view_relation, physical_relation) -%}
-  DROP TABLE IF EXISTS {{ view_relation }} CASCADE;
   DROP VIEW IF EXISTS {{ view_relation }} CASCADE;
   CREATE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
