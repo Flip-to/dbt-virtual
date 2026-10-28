@@ -461,6 +461,20 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     assert payload["diffs"][0]["classification"] == "BREAKING"
 
 
+def test_schema_diff_reports_removed_model_as_breaking() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    del target_manifest["nodes"]["model.pkg.orders_metrics"]
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    assert len(diffs) == 1
+    assert diffs[0].model_name == "orders_metrics"
+    assert diffs[0].removed is True
+    assert diffs[0].classification == "BREAKING"
+    assert diffs[0].to_dict()["removed"] is True
+
+
 def test_cycle_detection_in_manifest() -> None:
     manifest = {
         "nodes": {
