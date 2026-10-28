@@ -103,6 +103,13 @@ def test_virtual_table_alias_override_fails_clearly() -> None:
         "orders_metrics__"
     )
 
+    pinned_alias_node = _make_node()
+    pinned_alias_node["config"]["physical_version"] = "pinned_fp_v1"
+    pinned_alias_node["alias"] = "orders_metrics__pinned_fp_v1"
+    assert compute_node_fingerprint(pinned_alias_node).physical_identifier == (
+        "orders_metrics__pinned_fp_v1"
+    )
+
 
 def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:
     """Changing an upstream virtualized model must propagate a new fingerprint to downstream nodes."""
