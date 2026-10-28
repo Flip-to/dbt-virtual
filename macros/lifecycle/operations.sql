@@ -467,6 +467,26 @@
 
   {{ log("dbt-virtual rollback [" ~ env ~ "]: Rolling back to release " ~ target_release, info=True) }}
 
+  {%- set current_env_query -%}
+    SELECT model_name, resource_type
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment = '{{ env }}'
+    ORDER BY CASE resource_type
+      WHEN 'procedure' THEN 4
+      WHEN 'table_function' THEN 3
+      WHEN 'model' THEN 2
+      WHEN 'function' THEN 1
+      ELSE 0
+    END DESC, model_name ASC
+  {%- endset -%}
+  {%- set current_env_res = run_query(current_env_query) -%}
+  {%- set current_env_types = {} -%}
+  {%- if current_env_res -%}
+    {%- for current_row in current_env_res.rows -%}
+      {%- do current_env_types.update({current_row[0]: current_row[1]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
   {%- set rows_query -%}
     SELECT model_name, resource_type, fingerprint, physical_identifier, routine_ddl_template
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
@@ -475,12 +495,17 @@
   {%- endset -%}
 
   {%- set rows = run_query(rows_query) -%}
+  {%- if not rows or (rows.rows | length) == 0 -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual rollback: No models found for release " ~ target_release) }}
+  {%- endif -%}
+  {%- set rollback_names = [] -%}
   {%- for row in rows.rows -%}
     {%- set model_name = row[0] -%}
     {%- set resource_type = row[1] -%}
     {%- set fp = row[2] -%}
     {%- set phys_ident = row[3] -%}
     {%- set routine_ddl = row[4] -%}
+    {%- do rollback_names.append(model_name) -%}
 
     {%- if resource_type == 'model' -%}
       {%- set phys_table = phys_ident.split('.')[-1] -%}
@@ -503,6 +528,19 @@
       phys_ident,
       target_release
     )) -%}
+  {%- endfor -%}
+
+  {#- Remove objects introduced after the selected release and clear their active pointers. -#}
+  {%- for removed_name, removed_type in current_env_types.items() -%}
+    {%- if removed_name not in rollback_names -%}
+      {%- set removed_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=removed_name, type='view') -%}
+      {{ log("dbt-virtual rollback [" ~ env ~ "]: Removing post-release " ~ removed_type ~ " " ~ removed_rel, info=True) }}
+      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(removed_rel, removed_type)) -%}
+      {%- do dbt_virtual.exec_ddl_dml(
+        "DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments')
+        ~ " WHERE environment = '" ~ env ~ "' AND model_name = '" ~ removed_name ~ "'"
+      ) -%}
+    {%- endif -%}
   {%- endfor -%}
 {%- endmacro %}
 

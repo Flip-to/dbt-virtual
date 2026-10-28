@@ -201,6 +201,11 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
         "SELECT model_name, resource_type, fingerprint, physical_identifier, routine_ddl_template "
         "FROM analytics_physical._releases WHERE release_id = 'v1'"
     )
+    current_prod_rows = sf_exec(
+        "SELECT model_name, resource_type FROM analytics_physical._environments "
+        "WHERE environment = 'prod'"
+    )
+    harness.query_responses.append(FakeResult([tuple(r) for r in current_prod_rows]))
     harness.query_responses.append(FakeResult([tuple(r) for r in rel_v1_rb]))
     harness.executed_queries.clear()
     harness.call_macro("virtual_rollback", env="prod", to_release="v1")
@@ -317,6 +322,11 @@ def run_postgres_e2e(dsn: str) -> None:
         assert cur.fetchone()[0] == 75
         print("[postgres v2] Promoted v2 to prod via view swap: sum=75")
 
+        cur.execute(
+            "SELECT model_name, resource_type FROM analytics_physical._environments "
+            "WHERE environment = 'prod'"
+        )
+        harness.query_responses.append(FakeResult(cur.fetchall()))
         cur.execute(
             "SELECT model_name, resource_type, fingerprint, physical_identifier, routine_ddl_template "
             "FROM analytics_physical._releases WHERE release_id = 'v1'"
