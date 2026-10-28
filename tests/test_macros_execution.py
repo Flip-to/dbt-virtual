@@ -437,6 +437,9 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     assert "AS $$" in sf_tvf
     sf_orphan = sf_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
     assert "REGEXP_LIKE" in sf_orphan
+    assert "QUALIFY DENSE_RANK() OVER (ORDER BY created_at DESC) <= 5" in sf_orphan
+    assert "t.created < DATEADD(day, -7, CURRENT_TIMESTAMP())" in sf_orphan
+    assert "LEFT JOIN protected_tables" in sf_orphan
 
     # Databricks dispatch: SHALLOW CLONE
     dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
