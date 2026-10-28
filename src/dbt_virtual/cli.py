@@ -1,4 +1,4 @@
-"""CLI entry point for dbt-virtual (plan, build, promote, rollback, diff, gc, init-env, drop-env)."""
+"""CLI entry point for dbt-virtual (plan, build, promote, rollback, diff, audit, status, gc, init-env, drop-env)."""
 
 from __future__ import annotations
 
@@ -179,9 +179,38 @@ def cmd_promote(ns: argparse.Namespace) -> int:
         "from_env": ns.from_env,
         "to_env": ns.to_env,
         "release_id": ns.release,
+        "audit": bool(ns.audit),
+        "max_row_drop_pct": float(ns.max_row_drop_pct),
     }
     return _run_dbt(
         ["run-operation", "virtual_promote", "--args", json.dumps(op_args)],
+        project_dir,
+    )
+
+
+def cmd_audit(ns: argparse.Namespace) -> int:
+    project_dir = Path(ns.project_dir).resolve()
+    op_args = {
+        "from_env": ns.from_env,
+        "to_env": ns.to_env,
+        "release_id": ns.release or "",
+        "allow_empty": bool(ns.allow_empty),
+        "max_row_drop_pct": float(ns.max_row_drop_pct),
+    }
+    return _run_dbt(
+        ["run-operation", "virtual_audit", "--args", json.dumps(op_args)],
+        project_dir,
+    )
+
+
+def cmd_status(ns: argparse.Namespace) -> int:
+    project_dir = Path(ns.project_dir).resolve()
+    op_args = {
+        "env": ns.env,
+        "base_env": ns.base_env,
+    }
+    return _run_dbt(
+        ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)],
         project_dir,
     )
 
@@ -311,7 +340,38 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--from", dest="from_env", default="staging", help="Source environment.")
     p_promote.add_argument("--to", dest="to_env", default="prod", help="Target environment.")
     p_promote.add_argument("--release", required=True, help="Release ID to promote.")
+    p_promote.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run virtual_audit quality gate before promoting.",
+    )
+    p_promote.add_argument(
+        "--max-row-drop-pct",
+        type=float,
+        default=100.0,
+        help="Maximum allowed row drop percentage when --audit is enabled.",
+    )
     p_promote.set_defaults(func=cmd_promote)
+
+    # audit
+    p_audit = sub.add_parser("audit", help="Pre-promotion quality gate comparing candidate vs base table row counts.")
+    p_audit.add_argument("--from", dest="from_env", default="staging", help="Candidate environment.")
+    p_audit.add_argument("--to", dest="to_env", default="prod", help="Base environment to compare against.")
+    p_audit.add_argument("--release", default="", help="Optional release ID to audit.")
+    p_audit.add_argument("--allow-empty", action="store_true", help="Allow 0-row candidate tables.")
+    p_audit.add_argument(
+        "--max-row-drop-pct",
+        type=float,
+        default=100.0,
+        help="Fail if row count drops by more than this percentage vs base.",
+    )
+    p_audit.set_defaults(func=cmd_audit)
+
+    # status
+    p_status = sub.add_parser("status", help="Export live warehouse virtual environment state JSON.")
+    p_status.add_argument("--env", default="staging", help="Target environment to inspect.")
+    p_status.add_argument("--base-env", default="prod", help="Base environment to compare.")
+    p_status.set_defaults(func=cmd_status)
 
     # rollback
     p_rollback = sub.add_parser("rollback", help="Instant rollback of views and routines to a previous release.")

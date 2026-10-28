@@ -1,17 +1,234 @@
-{% macro virtual_promote(from_env='staging', to_env='prod', release_id='') -%}
+{% macro exec_ddl_dml(sql_text) -%}
+  {%- for stmt in sql_text.split(';') -%}
+    {%- if (stmt | trim) != '' -%}
+      {%- if statement is defined -%}
+        {%- call statement('dbt_virtual_ddl_dml', fetch_result=False, auto_begin=True) -%}
+          {{ stmt }}
+        {%- endcall -%}
+        {%- if adapter.commit is defined -%}
+          {%- do adapter.commit() -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- do run_query(stmt) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro virtual_acquire_lock(env='prod', owner='dbt-virtual', ttl_minutes=15) -%}
+  {#-
+    Concurrency guard / lease lock:
+    Clears expired locks for `env`, verifies no active lock is held by another owner,
+    and acquires a lease in `<physical_schema>._locks`.
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set locks_rel = dbt_virtual.registry_relation(phys_schema, '_locks') -%}
+
+  {%- do dbt_virtual.ensure_registry() -%}
+
+  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND expires_at <= " ~ dbt_virtual.current_timestamp_sql()) -%}
+
+  {%- set active_query -%}
+    SELECT owner, expires_at
+    FROM {{ locks_rel }}
+    WHERE environment = '{{ env }}'
+      AND owner != '{{ owner }}'
+      AND expires_at > {{ dbt_virtual.current_timestamp_sql() }}
+    LIMIT 1
+  {%- endset -%}
+
+  {%- set active_res = run_query(active_query) -%}
+  {%- if active_res and (active_res.rows | length) > 0 -%}
+    {%- set holder = active_res.rows[0][0] -%}
+    {%- set exp = active_res.rows[0][1] -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "' is currently locked by '" ~ holder ~ "' (expires at " ~ exp ~ ").") }}
+  {%- endif -%}
+
+  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
+  {%- do dbt_virtual.exec_ddl_dml(
+    "INSERT INTO " ~ locks_rel ~ " (environment, owner, acquired_at, expires_at) VALUES ("
+    ~ "'" ~ env ~ "', '" ~ owner ~ "', "
+    ~ dbt_virtual.current_timestamp_sql() ~ ", "
+    ~ dbt_virtual.timestamp_add_minutes_sql(ttl_minutes) ~ ")"
+  ) -%}
+  {{ log("dbt-virtual lock [" ~ env ~ "]: Acquired lock for owner='" ~ owner ~ "' (ttl=" ~ ttl_minutes ~ "m)", info=True) }}
+{%- endmacro %}
+
+
+{% macro virtual_release_lock(env='prod', owner='dbt-virtual') -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set locks_rel = dbt_virtual.registry_relation(phys_schema, '_locks') -%}
+  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
+  {{ log("dbt-virtual lock [" ~ env ~ "]: Released lock for owner='" ~ owner ~ "'", info=True) }}
+{%- endmacro %}
+
+
+{% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0) -%}
+  {#-
+    SQLMesh-style pre-promotion quality gate:
+    1. Resolves candidate `model` tables for `release_id` (or `from_env`).
+    2. Compares candidate table row counts against active `to_env` (`prod`) physical tables.
+    3. Fails fast via `exceptions.raise_compiler_error` if:
+       - A candidate table has 0 rows while `to_env` has > 0 rows (unless `allow_empty=true`).
+       - Candidate row count drops by more than `max_row_drop_pct` percent compared to `to_env`.
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+
+  {%- if release_id != '' -%}
+    {%- set cand_query -%}
+      SELECT model_name, physical_identifier
+      FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
+      WHERE release_id = '{{ release_id }}'
+        AND resource_type = 'model'
+      ORDER BY model_name ASC
+    {%- endset -%}
+  {%- else -%}
+    {%- set cand_query -%}
+      SELECT model_name, physical_identifier
+      FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+      WHERE environment = '{{ from_env }}'
+        AND resource_type = 'model'
+      ORDER BY model_name ASC
+    {%- endset -%}
+  {%- endif -%}
+
+  {%- set cand_rows = run_query(cand_query) -%}
+  {%- if not cand_rows or (cand_rows.rows | length) == 0 -%}
+    {{ log("dbt-virtual audit: No candidate models found for audit.", info=True) }}
+    {{ return('') }}
+  {%- endif -%}
+
+  {%- set base_query -%}
+    SELECT model_name, physical_identifier
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment = '{{ to_env }}'
+      AND resource_type = 'model'
+  {%- endset -%}
+  {%- set base_rows = run_query(base_query) -%}
+  {%- set base_map = {} -%}
+  {%- if base_rows -%}
+    {%- for brow in base_rows.rows -%}
+      {%- do base_map.update({brow[0]: brow[1]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- for row in cand_rows.rows -%}
+    {%- set model_name = row[0] -%}
+    {%- set cand_ident = row[1] -%}
+    {%- set cand_tbl = cand_ident.split('.')[-1] -%}
+    {%- set cand_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=cand_tbl, type='table') -%}
+    {%- set cand_cnt_res = run_query("SELECT COUNT(*) FROM " ~ cand_rel) -%}
+    {%- set cand_cnt = cand_cnt_res.rows[0][0] | int if (cand_cnt_res and (cand_cnt_res.rows | length) > 0) else 0 -%}
+
+    {%- set base_ident = base_map.get(model_name, '') -%}
+    {%- if base_ident != '' -%}
+      {%- set base_tbl = base_ident.split('.')[-1] -%}
+      {%- set base_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=base_tbl, type='table') -%}
+      {%- set base_cnt_res = run_query("SELECT COUNT(*) FROM " ~ base_rel) -%}
+      {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
+
+      {%- if cand_cnt == 0 and base_cnt > 0 and not allow_empty -%}
+        {{ exceptions.raise_compiler_error(
+          "dbt-virtual audit failed for model '" ~ model_name ~ "': candidate table " ~ cand_rel
+          ~ " is empty (0 rows) while " ~ to_env ~ " has " ~ base_cnt ~ " rows."
+        ) }}
+      {%- endif -%}
+
+      {%- if base_cnt > 0 and (max_row_drop_pct | float) < 100.0 -%}
+        {%- set drop_pct = ((base_cnt - cand_cnt) * 100.0) / base_cnt -%}
+        {%- if drop_pct > (max_row_drop_pct | float) -%}
+          {{ exceptions.raise_compiler_error(
+            "dbt-virtual audit failed for model '" ~ model_name ~ "': row count dropped by "
+            ~ (drop_pct | round(2)) ~ "% (" ~ base_cnt ~ " -> " ~ cand_cnt
+            ~ "), exceeding max_row_drop_pct=" ~ max_row_drop_pct ~ "%."
+          ) }}
+        {%- endif -%}
+      {%- endif -%}
+      {{ log("dbt-virtual audit [" ~ model_name ~ "]: OK (candidate=" ~ cand_cnt ~ " rows, " ~ to_env ~ "=" ~ base_cnt ~ " rows)", info=True) }}
+    {%- else -%}
+      {%- if cand_cnt == 0 and not allow_empty -%}
+        {{ exceptions.raise_compiler_error(
+          "dbt-virtual audit failed for new model '" ~ model_name ~ "': candidate table " ~ cand_rel ~ " has 0 rows."
+        ) }}
+      {%- endif -%}
+      {{ log("dbt-virtual audit [" ~ model_name ~ "]: OK (new model, candidate=" ~ cand_cnt ~ " rows)", info=True) }}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro virtual_export_state(env='staging', base_env='prod') -%}
+  {#-
+    Live warehouse state introspection:
+    Queries `_environments`, `_intervals`, and physical fingerprint tables, then logs a
+    machine-readable `DBT_VIRTUAL_STATE_JSON:{...}` line that `dbt-virtual status` / `plan` can consume.
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+
+  {%- set env_query -%}
+    SELECT environment, model_name, fingerprint
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment IN ('{{ env }}', '{{ base_env }}')
+  {%- endset -%}
+  {%- set env_rows = run_query(env_query) -%}
+
+  {%- set env_state = {} -%}
+  {%- set base_env_state = {} -%}
+  {%- if env_rows -%}
+    {%- for r in env_rows.rows -%}
+      {%- if r[0] == env -%}
+        {%- do env_state.update({r[1]: r[2]}) -%}
+      {%- endif -%}
+      {%- if r[0] == base_env -%}
+        {%- do base_env_state.update({r[1]: r[2]}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(phys_schema)) -%}
+  {%- set existing_tables = [] -%}
+  {%- if tbl_rows -%}
+    {%- for r in tbl_rows.rows -%}
+      {%- do existing_tables.append(r[0]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set payload = {
+    'env': env,
+    'base_env': base_env,
+    'physical_schema': phys_schema,
+    'env_state': env_state,
+    'base_env_state': base_env_state,
+    'existing_physical_tables': existing_tables
+  } -%}
+  {{ log("DBT_VIRTUAL_STATE_JSON:" ~ tojson(payload), info=True) }}
+{%- endmacro %}
+
+
+{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0) -%}
   {#-
     Zero-rebuild promotion:
-    1. Verifies every physical table in `release_id` (or `from_env` active state) exists.
-    2. Deploys objects in strict dependency tier order:
+    1. Optionally runs `virtual_audit` quality gate when `audit=true`.
+    2. Verifies every physical table in `release_id` (or `from_env` active state) exists.
+    3. Deploys objects in strict dependency tier order:
        - Tier 1: scalar UDFs (`function`)
        - Tier 2: virtual views (`model`) -> `<physical_schema>.<model>__<fp>`
        - Tier 3: table functions (`table_function`)
        - Tier 4: stored procedures (`procedure`)
-    3. Updates `_environments` and `_releases` via multi-adapter dispatch macros.
+    4. Validates promoted routines via `validate_routine_exists_sql` and updates `_environments` / `_releases`.
   -#}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set to_schema = dbt_virtual.get_env_schema(to_env) -%}
+
+  {%- if audit -%}
+    {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct) -%}
+  {%- endif -%}
 
   {%- if release_id != '' -%}
     {%- set query -%}
@@ -79,18 +296,19 @@
       {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
 
       {{ log("dbt-virtual promote [" ~ to_env ~ "]: " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
-      {%- do run_query(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
       {%- set target_phys_ident = phys_ident -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', to_schema) -%}
       {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
-      {%- do run_query(rendered_ddl) -%}
+      {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
+      {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
       {%- set target_phys_ident = to_schema ~ '.' ~ model_name -%}
     {%- else -%}
       {%- set target_phys_ident = phys_ident -%}
     {%- endif -%}
 
-    {%- do run_query(dbt_virtual.upsert_environment_pointer_sql(
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       to_env,
       model_name,
@@ -102,7 +320,7 @@
   {%- endfor -%}
 
   {%- if release_id != '' -%}
-    {%- do run_query("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
+    {%- do dbt_virtual.exec_ddl_dml("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
   {%- endif -%}
 {%- endmacro %}
 
@@ -126,9 +344,9 @@
     {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
 
     {{ log("dbt-virtual reuse [" ~ env ~ "]: Pointing " ~ view_rel ~ " -> " ~ phys_rel ~ " (zero compute)", info=True) }}
-    {%- do run_query(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
 
-    {%- do run_query(dbt_virtual.upsert_environment_pointer_sql(
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env,
       model_name,
@@ -149,7 +367,7 @@
   -#}
   {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
 
-  {%- do run_query(dbt_virtual.create_schema_if_not_exists_sql(env_schema)) -%}
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_schema_if_not_exists_sql(env_schema)) -%}
   {%- do dbt_virtual.virtual_promote(from_env=from_env, to_env=env, release_id='') -%}
 {%- endmacro %}
 
@@ -168,8 +386,8 @@
   {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
 
   {{ log("dbt-virtual drop-env: Dropping schema " ~ env_schema ~ " and cleaning _environments for env=" ~ env, info=True) }}
-  {%- do run_query(dbt_virtual.drop_schema_cascade_sql(env_schema)) -%}
-  {%- do run_query("DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments') ~ " WHERE environment = '" ~ env ~ "'") -%}
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_schema_cascade_sql(env_schema)) -%}
+  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments') ~ " WHERE environment = '" ~ env ~ "'") -%}
 {%- endmacro %}
 
 
@@ -222,14 +440,14 @@
       {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
       {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Re-pointing " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
-      {%- do run_query(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', env_schema) -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying routine " ~ env_schema ~ "." ~ model_name, info=True) }}
-      {%- do run_query(rendered_ddl) -%}
+      {%- do dbt_virtual.exec_ddl_dml(rendered_ddl) -%}
     {%- endif -%}
 
-    {%- do run_query(dbt_virtual.upsert_environment_pointer_sql(
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env,
       model_name,
@@ -266,7 +484,7 @@
       {{ log("dbt-virtual gc [DRY-RUN]: Would drop " ~ drop_rel, info=True) }}
     {%- else -%}
       {{ log("dbt-virtual gc: Dropping " ~ drop_rel, info=True) }}
-      {%- do run_query("DROP TABLE IF EXISTS " ~ drop_rel) -%}
+      {%- do dbt_virtual.exec_ddl_dml("DROP TABLE IF EXISTS " ~ drop_rel) -%}
     {%- endif -%}
   {%- endfor -%}
 {%- endmacro %}

@@ -1,7 +1,7 @@
 {% macro virtual_schema_name(custom_schema_name, node) -%}
   {%- if dbt_virtual.is_virtual_node(node) -%}
-    {%- set node_cfg = node.get('config', {}) -%}
-    {%- set mat = node_cfg.get('materialized', 'view') -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', 'view') -%}
     {%- set cfg = dbt_virtual.get_config() -%}
     {%- if mat in ['table', 'incremental'] -%}
       {{ return(cfg.get('physical_schema')) }}
@@ -20,10 +20,10 @@
 
 
 {% macro virtual_alias_name(custom_alias_name, node) -%}
-  {%- set base_name = (custom_alias_name | trim) if custom_alias_name is not none else node.name -%}
+  {%- set base_name = (custom_alias_name | trim) if custom_alias_name is not none else dbt_virtual.node_attr(node, 'name', '') -%}
   {%- if dbt_virtual.is_virtual_node(node) -%}
-    {%- set node_cfg = node.get('config', {}) -%}
-    {%- set mat = node_cfg.get('materialized', 'view') -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', 'view') -%}
     {%- if mat in ['table', 'incremental'] -%}
       {%- set fp = dbt_virtual.get_fingerprint(node) -%}
       {{ return(base_name ~ '__' ~ fp) }}
@@ -66,7 +66,8 @@
         type='view'
       )) }}
     {%- elif mode == 'hybrid' -%}
-      {%- set caller_mat = model.get('config', {}).get('materialized', 'view') if model is defined else 'view' -%}
+      {%- set caller_cfg = dbt_virtual.node_attr(model, 'config', {}) if model is defined else {} -%}
+      {%- set caller_mat = dbt_virtual.node_attr(caller_cfg, 'materialized', 'view') -%}
       {%- if caller_mat in ['table_function', 'function', 'procedure', 'view'] -%}
         {{ return(api.Relation.create(
           database=raw_rel.database,

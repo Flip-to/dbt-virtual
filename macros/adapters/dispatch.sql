@@ -156,6 +156,23 @@
   )
   PARTITION BY DATE(created_at)
   CLUSTER BY release_id, status;
+
+  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._locks (
+    environment STRING NOT NULL,
+    owner STRING NOT NULL,
+    acquired_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMP NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._intervals (
+    model_name STRING NOT NULL,
+    fingerprint STRING NOT NULL,
+    physical_identifier STRING NOT NULL,
+    start_ts STRING NOT NULL,
+    end_ts STRING NOT NULL,
+    recorded_at TIMESTAMP NOT NULL
+  )
+  CLUSTER BY model_name, fingerprint;
 {%- endmacro %}
 
 {% macro snowflake__ensure_registry_tables_sql(physical_schema) -%}
@@ -186,6 +203,22 @@
     promoted_at TIMESTAMP,
     rolled_back_at TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
+    environment VARCHAR NOT NULL,
+    owner VARCHAR NOT NULL,
+    acquired_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMP NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._intervals (
+    model_name VARCHAR NOT NULL,
+    fingerprint VARCHAR NOT NULL,
+    physical_identifier VARCHAR NOT NULL,
+    start_ts VARCHAR NOT NULL,
+    end_ts VARCHAR NOT NULL,
+    recorded_at TIMESTAMP NOT NULL
+  );
 {%- endmacro %}
 
 {% macro default__ensure_registry_tables_sql(physical_schema) -%}
@@ -215,6 +248,22 @@
     created_at TIMESTAMP,
     promoted_at TIMESTAMP,
     rolled_back_at TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
+    environment VARCHAR,
+    owner VARCHAR,
+    acquired_at TIMESTAMP,
+    expires_at TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._intervals (
+    model_name VARCHAR,
+    fingerprint VARCHAR,
+    physical_identifier VARCHAR,
+    start_ts VARCHAR,
+    end_ts VARCHAR,
+    recorded_at TIMESTAMP
   );
 {%- endmacro %}
 
@@ -410,3 +459,59 @@ $$
     )
   ORDER BY table_name
 {%- endmacro %}
+
+
+{% macro timestamp_add_minutes_sql(minutes) -%}
+  {{ return(adapter.dispatch('timestamp_add_minutes_sql', 'dbt_virtual')(minutes)) }}
+{%- endmacro %}
+
+{% macro bigquery__timestamp_add_minutes_sql(minutes) -%}
+  TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {{ minutes }} MINUTE)
+{%- endmacro %}
+
+{% macro snowflake__timestamp_add_minutes_sql(minutes) -%}
+  DATEADD(minute, {{ minutes }}, CURRENT_TIMESTAMP)
+{%- endmacro %}
+
+{% macro default__timestamp_add_minutes_sql(minutes) -%}
+  (CURRENT_TIMESTAMP + INTERVAL '{{ minutes }} minutes')
+{%- endmacro %}
+
+
+{% macro list_physical_tables_sql(physical_schema) -%}
+  {{ return(adapter.dispatch('list_physical_tables_sql', 'dbt_virtual')(physical_schema)) }}
+{%- endmacro %}
+
+{% macro bigquery__list_physical_tables_sql(physical_schema) -%}
+  SELECT table_name
+  FROM `{{ target.database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES
+  WHERE table_type = 'BASE TABLE'
+    AND REGEXP_CONTAINS(table_name, r'__[0-9a-f]{8,64}$')
+  ORDER BY table_name
+{%- endmacro %}
+
+{% macro default__list_physical_tables_sql(physical_schema) -%}
+  SELECT table_name
+  FROM information_schema.tables
+  WHERE LOWER(table_schema) = LOWER('{{ physical_schema }}')
+    AND table_type = 'BASE TABLE'
+    AND table_name LIKE '%\_\_%' ESCAPE '\'
+  ORDER BY table_name
+{%- endmacro %}
+
+
+{% macro validate_routine_exists_sql(env_schema, routine_name) -%}
+  {{ return(adapter.dispatch('validate_routine_exists_sql', 'dbt_virtual')(env_schema, routine_name)) }}
+{%- endmacro %}
+
+{% macro bigquery__validate_routine_exists_sql(env_schema, routine_name) -%}
+  SELECT routine_name
+  FROM `{{ target.database }}`.`{{ env_schema }}`.INFORMATION_SCHEMA.ROUTINES
+  WHERE routine_name = '{{ routine_name }}'
+  LIMIT 1
+{%- endmacro %}
+
+{% macro default__validate_routine_exists_sql(env_schema, routine_name) -%}
+  SELECT '{{ routine_name }}' AS routine_name
+{%- endmacro %}
+

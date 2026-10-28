@@ -19,7 +19,8 @@
     {{ return('') }}
   {%- endif -%}
 
-  {%- set mat = model.get('config', {}).get('materialized', '') -%}
+  {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
+  {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', '') -%}
   {%- if mat != 'incremental' or flags.FULL_REFRESH -%}
     {{ return('') }}
   {%- endif -%}
@@ -122,7 +123,8 @@
     {{ return('') }}
   {%- endif -%}
 
-  {%- set mat = model.get('config', {}).get('materialized', '') -%}
+  {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
+  {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', '') -%}
   {%- if mat not in ['table', 'incremental'] -%}
     {{ return('') }}
   {%- endif -%}
@@ -187,6 +189,26 @@
       NULL
     );
     {%- endif %}
+
+    {%- set start_ts = var('_dbt_virtual_start', '') -%}
+    {%- set end_ts = var('_dbt_virtual_end', '') -%}
+    {%- if start_ts != '' and end_ts != '' %}
+    INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_intervals') }} (
+      model_name,
+      fingerprint,
+      physical_identifier,
+      start_ts,
+      end_ts,
+      recorded_at
+    ) VALUES (
+      '{{ model.name }}',
+      '{{ fp }}',
+      '{{ phys_schema }}.{{ this.identifier }}',
+      '{{ start_ts }}',
+      '{{ end_ts }}',
+      {{ dbt_virtual.current_timestamp_sql() }}
+    );
+    {%- endif %}
   {%- endset -%}
 
   {{ return(sql_statements) }}
@@ -203,9 +225,9 @@
     {%- set release_id = var('_dbt_virtual_release', '') -%}
     {%- do dbt_virtual.ensure_registry() -%}
 
-    {%- set node_cfg = node.get('config', {}) -%}
-    {%- set params_sig = node_cfg.get('parameters', '') -%}
-    {%- set returns_sig = node_cfg.get('returns', '') -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- set params_sig = dbt_virtual.node_attr(node_cfg, 'parameters', '') -%}
+    {%- set returns_sig = dbt_virtual.node_attr(node_cfg, 'returns', '') -%}
 
     {%- if routine_type == 'function' -%}
       {%- set dep_tier = 1 -%}
@@ -262,7 +284,7 @@
         '{{ target_relation.schema }}.{{ target_relation.identifier }}',
         {{ dbt.string_literal(ddl_template) }},
         'candidate',
-        CURRENT_TIMESTAMP(),
+        {{ dbt_virtual.current_timestamp_sql() }},
         NULL,
         NULL
       );

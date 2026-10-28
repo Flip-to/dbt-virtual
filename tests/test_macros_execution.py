@@ -165,6 +165,7 @@ class MacroTestHarness:
             "var": _var,
             "local_md5": _local_md5,
             "fromjson": json.loads,
+            "tojson": json.dumps,
             "log": lambda msg, info=False: self.logs.append(str(msg)) or "",
             "execute": self.execute,
             "target": self.target,
@@ -585,4 +586,115 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
     harness.vars_dict["tvf_test_fixtures"] = False
     ref_rel = harness.call_macro("tvf_test_ref", "orders_metrics")
     assert isinstance(ref_rel, FakeRelation)
+
+
+def test_virtual_audit_lock_intervals_and_export_state() -> None:
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+                "env_schemas": {
+                    "staging": "analytics_staging",
+                    "prod": "analytics",
+                },
+            },
+            "_dbt_virtual_fps": {"orders_metrics": "fp1111222233"},
+            "_dbt_virtual_release": "v1",
+            "_dbt_virtual_start": "2026-10-01",
+            "_dbt_virtual_end": "2026-10-27",
+        }
+    )
+
+    # 1. Interval tracking in sync_env_view when _dbt_virtual_start / _dbt_virtual_end are set
+    harness.model = {
+        "name": "orders_metrics",
+        "config": {"materialized": "incremental", "virtual_env": True},
+    }
+    harness.this = FakeRelation("test_proj", "analytics_physical", "orders_metrics__fp1111222233")
+    sync_sql = harness.call_macro("sync_env_view")
+    assert "INSERT INTO `test_proj`.`analytics_physical`._intervals" in sync_sql
+    assert "'2026-10-01'" in sync_sql
+    assert "'2026-10-27'" in sync_sql
+
+    # 2. Concurrency lock acquisition & conflict detection
+    harness.executed_queries.clear()
+    harness.query_responses.append(FakeResult([]))  # delete expired
+    harness.query_responses.append(FakeResult([]))  # check active lock -> none
+    harness.query_responses.append(FakeResult([]))  # delete self
+    harness.query_responses.append(FakeResult([]))  # insert lock
+    harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
+    lock_queries = "\n".join(harness.executed_queries)
+    assert "INSERT INTO `test_proj`.`analytics_physical`._locks" in lock_queries
+    assert "'ci_job_1'" in lock_queries
+
+    # Active lock held by another owner raises RuntimeError
+    harness.query_responses.append(FakeResult([]))  # delete expired
+    harness.query_responses.append(FakeResult([("ci_job_other", "2026-10-27T23:59:59Z")]))
+    try:
+        harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
+        raise AssertionError("Expected RuntimeError on lock conflict")
+    except RuntimeError as exc:
+        assert "dbt-virtual lock conflict" in str(exc)
+
+    harness.executed_queries.clear()
+    harness.call_macro("virtual_release_lock", env="prod", owner="ci_job_1")
+    assert "DELETE FROM `test_proj`.`analytics_physical`._locks" in "\n".join(harness.executed_queries)
+
+    # 3. virtual_audit quality gate: pass vs fail on empty candidate or excessive row drop
+    harness.executed_queries.clear()
+    harness.query_responses = [
+        FakeResult([("orders_metrics", "analytics_physical.orders_metrics__fp222")]),  # candidate
+        FakeResult([("orders_metrics", "analytics_physical.orders_metrics__fp111")]),  # base
+        FakeResult([(95,)]),  # candidate count = 95
+        FakeResult([(100,)]),  # base count = 100 (5% drop <= 10% max)
+    ]
+    harness.call_macro(
+        "virtual_audit",
+        from_env="staging",
+        to_env="prod",
+        release_id="v2",
+        allow_empty=False,
+        max_row_drop_pct=10.0,
+    )
+
+    # Excessive row drop (100 -> 50 = 50% > 10%) fails fast
+    harness.query_responses = [
+        FakeResult([("orders_metrics", "analytics_physical.orders_metrics__fp222")]),
+        FakeResult([("orders_metrics", "analytics_physical.orders_metrics__fp111")]),
+        FakeResult([(50,)]),
+        FakeResult([(100,)]),
+    ]
+    try:
+        harness.call_macro(
+            "virtual_audit",
+            from_env="staging",
+            to_env="prod",
+            release_id="v2",
+            allow_empty=False,
+            max_row_drop_pct=10.0,
+        )
+        raise AssertionError("Expected RuntimeError on excessive row drop")
+    except RuntimeError as exc:
+        assert "exceeding max_row_drop_pct" in str(exc)
+
+    # 4. virtual_export_state logs structured JSON marker
+    harness.logs.clear()
+    harness.query_responses = [
+        FakeResult(
+            [
+                ("staging", "orders_metrics", "fp222"),
+                ("prod", "orders_metrics", "fp111"),
+            ]
+        ),
+        FakeResult([("orders_metrics__fp111",), ("orders_metrics__fp222",)]),
+    ]
+    harness.call_macro("virtual_export_state", env="staging", base_env="prod")
+    state_logs = [m for m in harness.logs if m.startswith("DBT_VIRTUAL_STATE_JSON:")]
+    assert len(state_logs) == 1
+    exported = json.loads(state_logs[0].split("DBT_VIRTUAL_STATE_JSON:", 1)[1])
+    assert exported["env_state"] == {"orders_metrics": "fp222"}
+    assert exported["base_env_state"] == {"orders_metrics": "fp111"}
+    assert exported["existing_physical_tables"] == ["orders_metrics__fp111", "orders_metrics__fp222"]
+
 

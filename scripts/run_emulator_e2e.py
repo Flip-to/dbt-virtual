@@ -115,6 +115,28 @@ def run_e2e() -> int:
         )
         """
     )
+    q(
+        f"""
+        CREATE TABLE IF NOT EXISTS `{project}.analytics_physical._locks` (
+          environment STRING,
+          owner STRING,
+          acquired_at TIMESTAMP,
+          expires_at TIMESTAMP
+        )
+        """
+    )
+    q(
+        f"""
+        CREATE TABLE IF NOT EXISTS `{project}.analytics_physical._intervals` (
+          model_name STRING,
+          fingerprint STRING,
+          physical_identifier STRING,
+          start_ts STRING,
+          end_ts STRING,
+          recorded_at TIMESTAMP
+        )
+        """
+    )
 
     # 2. Compute v1 manifest fingerprints & build in staging
     manifest_v1 = {
@@ -394,6 +416,8 @@ def run_e2e() -> int:
             },
             "_dbt_virtual_fps": {"orders_metrics": fp_v1},
             "_dbt_virtual_release": "v1_macro_check",
+            "_dbt_virtual_start": "2026-10-01",
+            "_dbt_virtual_end": "2026-10-27",
         },
         target_database=project,
     )
@@ -406,13 +430,36 @@ def run_e2e() -> int:
     for stmt in [s.strip() for s in rendered_sync_sql.split(";") if s.strip()]:
         q(stmt)
 
-    # Verify macro-rendered MERGE and INSERT landed in `_environments` and `_releases`
+    # Verify macro-rendered MERGE and INSERT landed in `_environments`, `_releases`, and `_intervals`
     macro_rel_rows = q(
         f"SELECT model_name, fingerprint FROM `{project}.analytics_physical._releases` "
         f"WHERE release_id = 'v1_macro_check'"
     )
     assert macro_rel_rows == [{"model_name": "orders_metrics", "fingerprint": fp_v1}], macro_rel_rows
-    print("[macro-sql] Jinja macro `sync_env_view` SQL executed on emulator:", macro_rel_rows)
+
+    interval_rows = q(
+        f"SELECT model_name, start_ts, end_ts FROM `{project}.analytics_physical._intervals` "
+        f"WHERE fingerprint = '{fp_v1}'"
+    )
+    assert interval_rows == [
+        {"model_name": "orders_metrics", "start_ts": "2026-10-01", "end_ts": "2026-10-27"}
+    ], interval_rows
+    print("[macro-sql] Jinja macro `sync_env_view` + `_intervals` executed on emulator:", interval_rows)
+
+    # 10. Verify concurrency lock (`_locks`) & routine existence validation on BigQuery emulator
+    q(
+        f"""
+        INSERT INTO `{project}.analytics_physical._locks` (environment, owner, acquired_at, expires_at)
+        VALUES ('prod', 'ci_runner_1', CURRENT_TIMESTAMP(), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 15 MINUTE))
+        """
+    )
+    active_locks = q(
+        f"SELECT owner FROM `{project}.analytics_physical._locks` "
+        f"WHERE environment = 'prod' AND expires_at > CURRENT_TIMESTAMP()"
+    )
+    assert active_locks == [{"owner": "ci_runner_1"}], active_locks
+    q(f"DELETE FROM `{project}.analytics_physical._locks` WHERE environment = 'prod' AND owner = 'ci_runner_1'")
+    print("[locks] BigQuery concurrency lease acquisition & release verified.")
 
     print("All dbt-virtual emulator E2E checks PASSED.")
     return 0

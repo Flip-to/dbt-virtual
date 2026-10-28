@@ -5,11 +5,13 @@ config-version: 2
 require-dbt-version: [">=1.6.0", "<2.0.0"]
 
 macro-paths: ["macros"]
+model-paths: ["models"]
 
 clean-targets:
   - "target"
   - "dbt_packages"
   - ".dbt_virtual"
+  - "tests"
 
 vars:
   dbt_virtual:

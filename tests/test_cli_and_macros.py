@@ -347,8 +347,40 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
             )
             == 0
         )
+        assert (
+            main(
+                [
+                    "--project-dir",
+                    str(tmp_path),
+                    "audit",
+                    "--from",
+                    "staging",
+                    "--to",
+                    "prod",
+                    "--release",
+                    "v2026.10.27",
+                    "--max-row-drop-pct",
+                    "15.0",
+                ]
+            )
+            == 0
+        )
+        assert (
+            main(
+                [
+                    "--project-dir",
+                    str(tmp_path),
+                    "status",
+                    "--env",
+                    "staging",
+                    "--base-env",
+                    "prod",
+                ]
+            )
+            == 0
+        )
 
-    assert len(recorded_cmds) == 6
+    assert len(recorded_cmds) == 8
     build_cmd = recorded_cmds[0]
     assert build_cmd[:3] == ["build", "--target", "staging"]
     assert "--full-refresh" in build_cmd
@@ -364,6 +396,8 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
     assert recorded_cmds[3][:2] == ["run-operation", "virtual_init_env"]
     assert recorded_cmds[4][:2] == ["run-operation", "virtual_drop_env"]
     assert recorded_cmds[5][:2] == ["run-operation", "virtual_gc"]
+    assert recorded_cmds[6][:2] == ["run-operation", "virtual_audit"]
+    assert recorded_cmds[7][:2] == ["run-operation", "virtual_export_state"]
 
 
 def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:

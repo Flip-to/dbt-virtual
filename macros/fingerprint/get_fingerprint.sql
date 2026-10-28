@@ -18,6 +18,26 @@
 {%- endmacro %}
 
 
+{% macro node_attr(obj, key, default=none) -%}
+  {%- if obj is none or obj is undefined -%}
+    {{ return(default) }}
+  {%- endif -%}
+  {%- if obj is mapping -%}
+    {{ return(obj.get(key, default)) }}
+  {%- endif -%}
+  {%- if obj[key] is defined -%}
+    {{ return(obj[key]) }}
+  {%- endif -%}
+  {%- if key == 'virtual_env' or key == 'virtual_env_epoch' or key == 'parameters' or key == 'returns' -%}
+    {%- set extra = dbt_virtual.node_attr(obj, '_extra', {}) -%}
+    {%- if extra is mapping and key in extra -%}
+      {{ return(extra.get(key, default)) }}
+    {%- endif -%}
+  {%- endif -%}
+  {{ return(default) }}
+{%- endmacro %}
+
+
 {% macro is_virtual_node(node) -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- if not cfg.get('enabled', true) -%}
@@ -26,12 +46,12 @@
   {%- if node is none or node is undefined -%}
     {{ return(false) }}
   {%- endif -%}
-  {%- set node_cfg = node.get('config', {}) -%}
-  {%- if node_cfg.get('virtual_env') == true -%}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+  {%- if dbt_virtual.node_attr(node_cfg, 'virtual_env', false) == true -%}
     {{ return(true) }}
   {%- endif -%}
-  {%- set meta = node_cfg.get('meta', {}) -%}
-  {%- if meta.get('virtual_env') == true -%}
+  {%- set meta = dbt_virtual.node_attr(node_cfg, 'meta', {}) -%}
+  {%- if dbt_virtual.node_attr(meta, 'virtual_env', false) == true -%}
     {{ return(true) }}
   {%- endif -%}
   {{ return(false) }}
@@ -57,14 +77,15 @@
 
 
 {% macro compute_node_self_payload(node) -%}
-  {%- set node_cfg = node.get('config', {}) -%}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+  {%- set raw_code = dbt_virtual.node_attr(node, 'raw_code', '') or dbt_virtual.node_attr(node, 'raw_sql', '') -%}
   {%- set payload = (
-    (node.get('raw_code', '') or node.get('raw_sql', ''))
-    ~ '|' ~ (node_cfg.get('materialized', '') | string)
-    ~ '|' ~ (node_cfg.get('incremental_strategy', '') | string)
-    ~ '|' ~ (node_cfg.get('partition_by', '') | tojson)
-    ~ '|' ~ (node_cfg.get('cluster_by', '') | tojson)
-    ~ '|' ~ (node_cfg.get('virtual_env_epoch', 1) | string)
+    raw_code
+    ~ '|' ~ (dbt_virtual.node_attr(node_cfg, 'materialized', '') | string)
+    ~ '|' ~ (dbt_virtual.node_attr(node_cfg, 'incremental_strategy', '') | string)
+    ~ '|' ~ (dbt_virtual.node_attr(node_cfg, 'partition_by', '') | tojson)
+    ~ '|' ~ (dbt_virtual.node_attr(node_cfg, 'cluster_by', '') | tojson)
+    ~ '|' ~ (dbt_virtual.node_attr(node_cfg, 'virtual_env_epoch', 1) | string)
   ) -%}
   {{ return(local_md5(payload)[:12]) }}
 {%- endmacro %}
@@ -72,7 +93,7 @@
 
 {% macro get_fingerprint(node, depth=0) -%}
   {%- set precomputed = var('_dbt_virtual_fps', {}) -%}
-  {%- set model_name = node.get('name', '') -%}
+  {%- set model_name = dbt_virtual.node_attr(node, 'name', '') -%}
   {%- if model_name in precomputed -%}
     {{ return(precomputed[model_name]) }}
   {%- endif -%}
@@ -83,7 +104,8 @@
   {%- set self_hash = dbt_virtual.compute_node_self_payload(node) -%}
   {%- set parent_parts = [] -%}
   {%- if execute and graph is defined and graph.nodes is defined and depth < 8 -%}
-    {%- set parent_uids = node.get('depends_on', {}).get('nodes', []) | sort -%}
+    {%- set dep_obj = dbt_virtual.node_attr(node, 'depends_on', {}) -%}
+    {%- set parent_uids = (dbt_virtual.node_attr(dep_obj, 'nodes', []) or []) | sort -%}
     {%- for p_uid in parent_uids -%}
       {%- set p_node = graph.nodes.get(p_uid) -%}
       {%- if p_node is not none and dbt_virtual.is_virtual_node(p_node) -%}

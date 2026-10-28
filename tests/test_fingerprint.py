@@ -162,3 +162,57 @@ def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
     cols = extract_sql_output_columns(sql_b)
     assert cols == {"customer_id": "", "total_orders": "INT64"}
 
+
+def test_property_based_sql_normalization_and_dag_determinism() -> None:
+    """Property-based fuzzing for SQL normalization idempotence and Merkle-DAG determinism."""
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+
+    ident_strategy = st.from_regex(r"[a-z][a-z0-9_]{1,12}", fullmatch=True)
+    ws_strategy = st.sampled_from([" ", "  ", "\n", "\t", " /* comment */ "])
+
+    @settings(max_examples=40)
+    @given(
+        col1=ident_strategy,
+        col2=ident_strategy,
+        ws1=ws_strategy,
+        ws2=ws_strategy,
+        fp_hex=st.from_regex(r"[0-9a-f]{12}", fullmatch=True),
+    )
+    def _check_invariants(col1: str, col2: str, ws1: str, ws2: str, fp_hex: str) -> None:
+        sql_raw = (
+            f"SELECT{ws1}{col1},{ws2}COUNT(*) AS {col2} "
+            f"FROM `proj.analytics_staging.tbl__{fp_hex}` GROUP BY 1"
+        )
+        norm1 = normalize_sql(
+            sql_raw,
+            self_identifier=f"tbl__{fp_hex}",
+            known_schemas=["analytics_staging", "analytics"],
+        )
+        # Idempotence: normalizing an already-normalized query produces the exact same string
+        norm2 = normalize_sql(
+            norm1,
+            self_identifier=f"tbl__{fp_hex}",
+            known_schemas=["analytics_staging", "analytics"],
+        )
+        assert norm1 == norm2
+        assert fp_hex not in norm1
+
+        # Target-schema invariance: compiling against `analytics` vs `analytics_staging` yields identical fingerprint
+        sql_prod = (
+            f"SELECT {col1}, COUNT(*) AS {col2} "
+            f"FROM `proj.analytics.tbl__abcdef012345` GROUP BY 1"
+        )
+        node_stg = _make_node(compiled_code=sql_raw, schema="analytics_staging")
+        node_prd = _make_node(compiled_code=sql_prod, schema="analytics")
+        fp_s = compute_node_fingerprint(
+            node_stg, known_schemas=["analytics_staging", "analytics"]
+        )
+        fp_p = compute_node_fingerprint(
+            node_prd, known_schemas=["analytics_staging", "analytics"]
+        )
+        assert fp_s.fingerprint == fp_p.fingerprint
+
+    _check_invariants()
+
+

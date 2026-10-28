@@ -120,17 +120,23 @@ dbt-virtual build --env staging --release v2026.10.27
 # 3. Check column-level schema compatibility (BREAKING vs NON_BREAKING) before promotion
 dbt-virtual diff --base-manifest prod_manifest.json --fail-on-breaking
 
-# 4. Zero-rebuild promote from staging -> prod (swaps views + deploys routines in tier order 1->2->3->4)
-dbt-virtual promote --from staging --to prod --release v2026.10.27
+# 4. Run pre-promotion quality gate (verifies candidate tables are non-empty and within row-drop thresholds)
+dbt-virtual audit --from staging --to prod --release v2026.10.27 --max-row-drop-pct 15.0
 
-# 5. Instant rollback to previous release on gate failure
+# 5. Zero-rebuild promote from staging -> prod (swaps views + deploys routines in tier order 1->2->3->4)
+dbt-virtual promote --from staging --to prod --release v2026.10.27 --audit
+
+# 6. Export live warehouse state (active environment pointers & physical tables)
+dbt-virtual status --env staging --base-env prod
+
+# 7. Instant rollback to previous release on gate failure
 dbt-virtual rollback --env prod
 
-# 6. Ephemeral PR environments (0-compute bootstrap from prod & teardown on PR close)
+# 8. Ephemeral PR environments (0-compute bootstrap from prod & teardown on PR close)
 dbt-virtual init-env --env pr_123 --from prod
 dbt-virtual drop-env --env pr_123
 
-# 7. Janitor garbage collection of unreferenced physical tables
+# 9. Janitor garbage collection of unreferenced physical tables
 dbt-virtual gc --dry-run
 ```
 
