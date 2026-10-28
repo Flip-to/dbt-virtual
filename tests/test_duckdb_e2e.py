@@ -201,3 +201,22 @@ def test_duckdb_full_virtual_lifecycle_e2e() -> None:
 
     prod_sum_rb = con.execute("SELECT SUM(orders) FROM analytics.orders_metrics").fetchone()[0]
     assert prod_sum_rb == 35
+
+
+def test_duckdb_gc_only_selects_fingerprint_suffix_tables() -> None:
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE SCHEMA analytics_physical")
+    con.execute("CREATE TABLE analytics_physical.orders__deadbeef AS SELECT 1 AS id")
+    con.execute("CREATE TABLE analytics_physical.daily__archive AS SELECT 1 AS id")
+    harness = MacroTestHarness(adapter_type="duckdb", target_name="prod")
+    registry_sql = harness.call_macro("ensure_registry_tables_sql", "analytics_physical")
+    for stmt in [s.strip() for s in registry_sql.split(";") if s.strip()]:
+        con.execute(stmt)
+
+    orphan_query = harness.call_macro(
+        "find_orphan_tables_sql", "analytics_physical", 5, 7
+    )
+    orphan_names = {row[0] for row in con.execute(orphan_query).fetchall()}
+
+    assert "orders__deadbeef" in orphan_names
+    assert "daily__archive" not in orphan_names

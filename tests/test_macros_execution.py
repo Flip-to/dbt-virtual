@@ -438,6 +438,27 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     sf_orphan = sf_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
     assert "REGEXP_LIKE" in sf_orphan
 
+    for adapter_type, matcher in (
+        ("duckdb", "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"),
+        ("postgres", "LOWER(t.table_name) ~ '__[0-9a-f]{8,64}$'"),
+        ("databricks", "LOWER(t.table_name) RLIKE '__[0-9a-f]{8,64}$'"),
+    ):
+        adapter_harness = MacroTestHarness(adapter_type=adapter_type, target_name="prod")
+        orphan_sql = adapter_harness.call_macro(
+            "find_orphan_tables_sql", "analytics_physical", 5, 7
+        )
+        assert matcher in orphan_sql
+        assert "table_name LIKE '%\\_\\_%'" not in orphan_sql
+
+    unsupported_harness = MacroTestHarness(adapter_type="unsupported", target_name="prod")
+    try:
+        unsupported_harness.call_macro(
+            "find_orphan_tables_sql", "analytics_physical", 5, 7
+        )
+        raise AssertionError("Expected an error for adapters without a safe GC matcher")
+    except RuntimeError as exc:
+        assert "no safe fingerprint table matcher is configured" in str(exc)
+
     # Databricks dispatch: SHALLOW CLONE
     dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
     dbx_clone = dbx_harness.call_macro("clone_table_sql", src, dst)
