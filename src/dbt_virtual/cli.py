@@ -34,14 +34,17 @@ def _load_manifest(project_dir: Path, manifest_override: str | None = None) -> d
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
-def _load_state_file(state_path: str | None) -> tuple[dict[str, str], dict[str, str], set[str]]:
+def _load_state_file(
+    state_path: str | None,
+) -> tuple[dict[str, str], dict[str, str], set[str] | None]:
     """Load optional warehouse state snapshot JSON (`env_state`, `base_env_state`, `existing_physical_tables`)."""
     if not state_path:
         return {}, {}, set()
     raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
     env_state = dict(raw.get("env_state") or {})
     base_env_state = dict(raw.get("base_env_state") or {})
-    existing_tables = set(raw.get("existing_physical_tables") or [])
+    existing_tables_raw = raw.get("existing_physical_tables")
+    existing_tables = set(existing_tables_raw) if existing_tables_raw is not None else None
     return env_state, base_env_state, existing_tables
 
 

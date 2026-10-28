@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import jinja2
 
-from dbt_virtual.cli import main
+from dbt_virtual.cli import _load_state_file, main
 from dbt_virtual.fingerprint import compute_manifest_fingerprints
 from dbt_virtual.planner import (
     classify_plan_actions,
@@ -191,6 +191,32 @@ def test_planner_reuse_and_seed_incremental_classification(tmp_path: Path) -> No
     )
     assert seed_inc["model.pkg.orders_metrics"].action == "SEED_INCREMENTAL"
     assert seed_inc["model.pkg.orders_metrics"].base_fingerprint == "old000111222"
+
+    # An explicit empty catalog snapshot disproves the stale base pointer; there is nothing to seed.
+    stale_base = classify_plan_actions(
+        fps,
+        env_state={},
+        base_env_state={"orders_metrics": "old000111222"},
+        existing_physical_tables=set(),
+    )
+    assert stale_base["model.pkg.orders_metrics"].action == "FULL_BUILD"
+
+    stale_target = classify_plan_actions(
+        fps,
+        env_state={"orders_metrics": orders_fp},
+        existing_physical_tables=set(),
+    )
+    assert stale_target["model.pkg.orders_metrics"].action == "FULL_BUILD"
+
+
+def test_state_file_without_catalog_snapshot_keeps_pointer_assumption(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"base_env_state": {"orders_metrics": "oldfp"}}))
+
+    _, base_state, existing_tables = _load_state_file(str(state_path))
+
+    assert base_state == {"orders_metrics": "oldfp"}
+    assert existing_tables is None
 
 
 def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> None:
