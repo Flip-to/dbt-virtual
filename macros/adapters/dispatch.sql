@@ -404,6 +404,8 @@ $$
       WHERE status IN ('promoted', 'candidate')
       GROUP BY release_id
     )
+    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
+    WHERE TRUE
     QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
@@ -435,6 +437,8 @@ $$
       WHERE status IN ('promoted', 'candidate')
       GROUP BY release_id
     )
+    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
+    WHERE TRUE
     QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
