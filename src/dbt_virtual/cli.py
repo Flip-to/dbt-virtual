@@ -144,9 +144,13 @@ def cmd_build(ns: argparse.Namespace) -> int:
         if rc != 0:
             return rc
 
-    # If all virtual models are REUSE and no explicit --select was passed, skip dbt build altogether
-    if not models_to_build and reused_models and not ns.select:
-        print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
+    # If the plan has nothing to build and no explicit selector overrides it, do not
+    # fall through to an unscoped `dbt build` (which would build the whole project).
+    if not models_to_build and not ns.select:
+        if reused_models:
+            print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
+        else:
+            print("dbt-virtual build: No planned models require a build.")
         return 0
 
     by_name = {fp.name: fp.fingerprint for fp in fps.values()}

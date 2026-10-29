@@ -318,6 +318,42 @@ def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> N
     assert "zero compute" in capsys.readouterr().out
 
 
+def test_cli_build_skips_unscoped_dbt_build_for_empty_and_reused_routine_plans(
+    tmp_path: Path, capsys
+) -> None:
+    sample = _sample_manifest()
+    routine = sample["nodes"]["model.pkg.udf_dimension_key"]
+    routine_manifest = {"nodes": {routine["unique_id"]: routine}}
+    routine_fp = compute_manifest_fingerprints(routine_manifest)[routine["unique_id"]].fingerprint
+    nonvirtual = sample["nodes"]["model.pkg.events_base"]
+    empty_virtual_manifest = {"nodes": {nonvirtual["unique_id"]: nonvirtual}}
+    cases = [
+        (empty_virtual_manifest, None),
+        (routine_manifest, {"env_state": {routine["name"]: routine_fp}}),
+    ]
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        for index, (manifest, state) in enumerate(cases):
+            project_dir = tmp_path / str(index)
+            target_dir = project_dir / "target"
+            target_dir.mkdir(parents=True)
+            (target_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            args = ["--project-dir", str(project_dir), "build", "--skip-compile"]
+            if state is not None:
+                state_path = project_dir / "state.json"
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                args.extend(["--state-file", str(state_path)])
+            assert main(args) == 0
+
+    assert recorded_cmds == []
+    assert capsys.readouterr().out.count("No planned models require a build.") == 2
+
+
 def test_cli_build_selects_planned_virtual_nodes_without_reuse(tmp_path: Path) -> None:
     target_dir = tmp_path / "target"
     target_dir.mkdir(parents=True)
