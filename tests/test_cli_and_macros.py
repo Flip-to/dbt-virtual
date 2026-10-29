@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import jinja2
 
-from dbt_virtual.cli import main
+from dbt_virtual.cli import _load_state_file, main
 from dbt_virtual.fingerprint import compute_manifest_fingerprints
 from dbt_virtual.planner import (
     classify_plan_actions,
@@ -162,6 +163,57 @@ def test_cli_plan_json_and_text(tmp_path: Path, capsys) -> None:
     assert "FULL_BUILD" in txt_out
 
 
+def test_cli_status_writes_exported_state_json(tmp_path: Path, capsys) -> None:
+    state = {
+        "env": "staging",
+        "base_env": "prod",
+        "env_state": {"orders_metrics": "fp123"},
+        "base_env_state": {"orders_metrics": "fp000"},
+        "existing_physical_tables": ["orders_metrics__fp123"],
+    }
+    marker_output = f"DBT_VIRTUAL_STATE_JSON:{json.dumps(state)}\n"
+    completed = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout=marker_output, stderr="")
+    output_path = tmp_path / "target" / "state.json"
+
+    with patch("dbt_virtual.cli.subprocess.run", return_value=completed) as run:
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "status",
+                "--env",
+                "staging",
+                "--base-env",
+                "prod",
+                "--output",
+                "target/state.json",
+            ]
+        )
+
+    assert rc == 0
+    assert run.call_args.kwargs["cwd"] == tmp_path
+    assert run.call_args.kwargs["capture_output"] is True
+    assert json.loads(output_path.read_text(encoding="utf-8")) == state
+    assert "DBT_VIRTUAL_STATE_JSON:" in capsys.readouterr().out
+
+    missing_output_path = tmp_path / "missing.json"
+    no_marker = subprocess.CompletedProcess(args=["dbt"], returncode=0, stdout="dbt completed\n", stderr="")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=no_marker):
+        rc_missing = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_missing == 1
+    assert not missing_output_path.exists()
+
+    failed = subprocess.CompletedProcess(args=["dbt"], returncode=17, stdout="", stderr="dbt failed")
+    with patch("dbt_virtual.cli.subprocess.run", return_value=failed):
+        rc_failed = main(
+            ["--project-dir", str(tmp_path), "status", "--output", str(missing_output_path)]
+        )
+    assert rc_failed == 17
+    assert not missing_output_path.exists()
+
+
 def test_planner_reuse_and_seed_incremental_classification(tmp_path: Path) -> None:
     manifest = _sample_manifest()
     fps = compute_manifest_fingerprints(manifest, known_schemas=["analytics_staging"])
@@ -191,6 +243,32 @@ def test_planner_reuse_and_seed_incremental_classification(tmp_path: Path) -> No
     )
     assert seed_inc["model.pkg.orders_metrics"].action == "SEED_INCREMENTAL"
     assert seed_inc["model.pkg.orders_metrics"].base_fingerprint == "old000111222"
+
+    # An explicit empty catalog snapshot disproves the stale base pointer; there is nothing to seed.
+    stale_base = classify_plan_actions(
+        fps,
+        env_state={},
+        base_env_state={"orders_metrics": "old000111222"},
+        existing_physical_tables=set(),
+    )
+    assert stale_base["model.pkg.orders_metrics"].action == "FULL_BUILD"
+
+    stale_target = classify_plan_actions(
+        fps,
+        env_state={"orders_metrics": orders_fp},
+        existing_physical_tables=set(),
+    )
+    assert stale_target["model.pkg.orders_metrics"].action == "FULL_BUILD"
+
+
+def test_state_file_without_catalog_snapshot_keeps_pointer_assumption(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"base_env_state": {"orders_metrics": "oldfp"}}))
+
+    _, base_state, existing_tables = _load_state_file(str(state_path))
+
+    assert base_state == {"orders_metrics": "oldfp"}
+    assert existing_tables is None
 
 
 def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> None:
@@ -238,6 +316,74 @@ def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> N
     assert len(recorded_cmds) == 1
     assert recorded_cmds[0][:2] == ["run-operation", "virtual_sync_reused_views"]
     assert "zero compute" in capsys.readouterr().out
+
+
+def test_cli_build_skips_unscoped_dbt_build_for_empty_and_reused_routine_plans(
+    tmp_path: Path, capsys
+) -> None:
+    sample = _sample_manifest()
+    routine = sample["nodes"]["model.pkg.udf_dimension_key"]
+    routine_manifest = {"nodes": {routine["unique_id"]: routine}}
+    routine_fp = compute_manifest_fingerprints(routine_manifest)[routine["unique_id"]].fingerprint
+    nonvirtual = sample["nodes"]["model.pkg.events_base"]
+    empty_virtual_manifest = {"nodes": {nonvirtual["unique_id"]: nonvirtual}}
+    cases = [
+        (empty_virtual_manifest, None),
+        (routine_manifest, {"env_state": {routine["name"]: routine_fp}}),
+    ]
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        for index, (manifest, state) in enumerate(cases):
+            project_dir = tmp_path / str(index)
+            target_dir = project_dir / "target"
+            target_dir.mkdir(parents=True)
+            (target_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            args = ["--project-dir", str(project_dir), "build", "--skip-compile"]
+            if state is not None:
+                state_path = project_dir / "state.json"
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                args.extend(["--state-file", str(state_path)])
+            assert main(args) == 0
+
+    assert recorded_cmds == []
+    assert capsys.readouterr().out.count("No planned models require a build.") == 2
+
+
+def test_cli_build_selects_planned_virtual_nodes_without_reuse(tmp_path: Path) -> None:
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(
+        json.dumps(_sample_manifest()), encoding="utf-8"
+    )
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir",
+                str(tmp_path),
+                "build",
+                "--env",
+                "staging",
+                "--skip-compile",
+            ]
+        )
+
+    assert rc == 0
+    assert len(recorded_cmds) == 1
+    build_args = recorded_cmds[0]
+    selected = build_args[build_args.index("--select") + 1].split()
+    assert set(selected) == {"orders_metrics", "udf_dimension_key", "tvf_orders_report"}
+    assert "events_base" not in selected
 
 
 def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> None:
@@ -431,6 +577,9 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     target_manifest["nodes"]["model.pkg.orders_metrics"]["columns"] = {
         "customer_id": {"name": "customer_id", "data_type": "STRING"}
     }
+    target_manifest["nodes"]["model.pkg.orders_metrics"]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
 
     diffs = diff_manifests(base_manifest, target_manifest)
     assert len(diffs) == 1
@@ -459,6 +608,65 @@ def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["has_breaking_changes"] is True
     assert payload["diffs"][0]["classification"] == "BREAKING"
+
+
+def test_schema_diff_uses_sql_projections_when_manifest_columns_are_partial() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    model_uid = "model.pkg.orders_metrics"
+    # Only customer_id is documented; orders is present in the compiled query but undocumented.
+    partial_columns = {"customer_id": {"name": "customer_id", "data_type": "STRING"}}
+    base_manifest["nodes"][model_uid]["columns"] = partial_columns
+    target_manifest["nodes"][model_uid]["columns"] = partial_columns
+    target_manifest["nodes"][model_uid]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    orders_diff = next(diff for diff in diffs if diff.model_name == "orders_metrics")
+    assert orders_diff.classification == "BREAKING"
+    assert any(
+        change.column == "orders" and change.change_type == "DROPPED"
+        for change in orders_diff.changes
+    )
+
+    stale_base = _sample_manifest()
+    stale_target = _sample_manifest()
+    # Even if docs still mention `orders`, the compiled projection is the current query shape.
+    stale_target["nodes"][model_uid]["compiled_code"] = (
+        "SELECT customer_id FROM `proj.core_prod.events_base`"
+    )
+    stale_diffs = diff_manifests(stale_base, stale_target)
+    stale_orders_diff = next(diff for diff in stale_diffs if diff.model_name == "orders_metrics")
+    assert stale_orders_diff.classification == "BREAKING"
+    assert any(change.column == "orders" and change.change_type == "DROPPED" for change in stale_orders_diff.changes)
+
+
+def test_schema_diff_keeps_documented_columns_when_query_projects_wildcard() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    target_manifest["nodes"]["model.pkg.orders_metrics"]["compiled_code"] = (
+        "SELECT *, 1 AS new_column FROM `proj.core_prod.events_base`"
+    )
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    assert not any(diff.model_name == "orders_metrics" for diff in diffs)
+
+
+def test_schema_diff_reports_removed_model_as_breaking() -> None:
+    base_manifest = _sample_manifest()
+    target_manifest = _sample_manifest()
+    del target_manifest["nodes"]["model.pkg.orders_metrics"]
+
+    diffs = diff_manifests(base_manifest, target_manifest)
+
+    assert len(diffs) == 1
+    assert diffs[0].model_name == "orders_metrics"
+    assert diffs[0].removed is True
+    assert diffs[0].classification == "BREAKING"
+    assert diffs[0].to_dict()["removed"] is True
 
 
 def test_cycle_detection_in_manifest() -> None:

@@ -156,8 +156,12 @@ def extract_sql_output_columns(sql: str, dialect: str = "bigquery") -> dict[str,
             return {}
         cols: dict[str, str] = {}
         for proj in select_expr.expressions:
-            if isinstance(proj, exp.Star):
-                continue
+            if isinstance(proj, exp.Star) or (
+                isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)
+            ):
+                # A wildcard makes the full output schema unknown; returning a partial
+                # projection set could falsely report documented columns as removed.
+                return {}
             col_name = proj.alias_or_name
             if not col_name:
                 continue
@@ -250,6 +254,24 @@ def compute_node_fingerprint(
     resource_type = node.get("resource_type", "model")
     config_subset = extract_relevant_config(node)
     materialized = str(config_subset["materialized"])
+    alias = node.get("alias") or name
+    generated_alias = re.fullmatch(rf"{re.escape(name)}__[0-9a-f]{{8,64}}", alias)
+    pinned_alias = (
+        f"{name}__{config_subset['physical_version']}"
+        if config_subset.get("physical_version") is not None
+        else None
+    )
+    if (
+        is_virtual_node(node)
+        and materialized in {"table", "incremental"}
+        and alias != name
+        and generated_alias is None
+        and alias != pinned_alias
+    ):
+        raise ValueError(
+            f"Virtual table model '{name}' uses alias '{alias}'. "
+            "dbt-virtual currently requires alias to match the model name."
+        )
 
     compiled_sql = node.get("compiled_code") or node.get("compiled_sql") or ""
     raw_sql = node.get("raw_code") or node.get("raw_sql") or ""
@@ -315,6 +337,22 @@ def compute_manifest_fingerprints(
     adapter_type = (manifest.get("metadata") or {}).get("adapter_type")
     sql_dialect = dialect or (str(adapter_type).removeprefix("dbt-") if adapter_type else "bigquery")
     virtual_nodes = {uid: n for uid, n in nodes.items() if is_virtual_node(n)}
+    virtual_name_uids: dict[str, str] = {}
+    for uid, node in virtual_nodes.items():
+        name = str(node.get("name", ""))
+        previous_uid = virtual_name_uids.get(name)
+        if previous_uid is not None:
+            raise ValueError(
+                f"Duplicate virtual model name '{name}' in manifest nodes "
+                f"'{previous_uid}' and '{uid}'. dbt-virtual requires unique names "
+                "because environment state and physical identifiers are keyed by model name."
+            )
+        virtual_name_uids[name] = uid
+    dependency_nodes = {
+        uid: n
+        for uid, n in nodes.items()
+        if is_virtual_node(n) or n.get("resource_type") == "model"
+    }
 
     computed: dict[str, NodeFingerprint] = {}
     visiting: set[str] = set()
@@ -326,11 +364,11 @@ def compute_manifest_fingerprints(
             raise ValueError(f"Cycle detected in dbt-virtual dependency graph at {uid}")
         visiting.add(uid)
 
-        node = virtual_nodes[uid]
+        node = dependency_nodes[uid]
         depends_on = (node.get("depends_on") or {}).get("nodes") or []
         upstream_fps: dict[str, str] = {}
         for parent_uid in depends_on:
-            if parent_uid in virtual_nodes:
+            if parent_uid in dependency_nodes:
                 parent_fp = _resolve(parent_uid)
                 upstream_fps[parent_uid] = parent_fp.fingerprint
 
@@ -348,7 +386,7 @@ def compute_manifest_fingerprints(
     for uid in sorted(virtual_nodes):
         _resolve(uid)
 
-    return computed
+    return {uid: computed[uid] for uid in sorted(virtual_nodes)}
 
 
 def write_fingerprints_file(

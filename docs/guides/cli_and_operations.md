@@ -55,7 +55,7 @@ dbt-virtual build \
 Performs AST-level and manifest-level column schema diffing between a base `manifest.json` (e.g. `prod`) and candidate `manifest.json` (`staging`), classifying every change as:
 - **`NON_BREAKING`**: `COLUMN_ADDED`
 - **`TYPE_WIDENED`** *(Non-breaking)*: Compatible type widening (`INT64 -> NUMERIC / FLOAT64 / BIGNUMERIC`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`, or synonyms like `INT == INT64`)
-- **`BREAKING`**: `COLUMN_REMOVED` or incompatible/narrowing `TYPE_CHANGED` (`FLOAT64 -> INT64`, `STRING -> INT64`)
+- **`BREAKING`**: removed models, `COLUMN_REMOVED`, or incompatible/narrowing `TYPE_CHANGED` (`FLOAT64 -> INT64`, `STRING -> INT64`)
 
 ```bash
 dbt-virtual diff \

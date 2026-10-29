@@ -120,9 +120,12 @@ class ModelSchemaDiff:
 
     model_name: str
     changes: list[ColumnChange] = field(default_factory=list)
+    removed: bool = False
 
     @property
     def classification(self) -> str:
+        if self.removed:
+            return "BREAKING"
         if not self.changes:
             return "IDENTICAL"
         if any(c.is_breaking for c in self.changes):
@@ -133,6 +136,7 @@ class ModelSchemaDiff:
         return {
             "model_name": self.model_name,
             "classification": self.classification,
+            "removed": self.removed,
             "changes": [c.to_dict() for c in self.changes],
         }
 
@@ -164,9 +168,11 @@ def classify_plan_actions(
     base_map = base_env_state or {}
     phys_tables = set(existing_physical_tables or set())
 
-    # Any fingerprint active in env_state or base_env_state implies its physical table exists
-    for model_name, fp in (*env_map.items(), *base_map.items()):
-        phys_tables.add(f"{model_name}__{fp}")
+    # Without a catalog snapshot, treat state pointers as evidence that physical tables exist.
+    # When a snapshot is supplied, it is authoritative and can reveal stale registry pointers.
+    if existing_physical_tables is None:
+        for model_name, fp in (*env_map.items(), *base_map.items()):
+            phys_tables.add(f"{model_name}__{fp}")
 
     actions: dict[str, NodePlanAction] = {}
     for uid, fp_obj in sorted(fingerprints.items()):
@@ -187,7 +193,12 @@ def classify_plan_actions(
         elif not full_refresh and fp_obj.physical_identifier in phys_tables:
             action = "REUSE"
             reason = f"Physical table {fp_obj.physical_identifier} already exists in warehouse (0 compute)"
-        elif not full_refresh and mat == "incremental" and fp_obj.name in base_map:
+        elif (
+            not full_refresh
+            and mat == "incremental"
+            and fp_obj.name in base_map
+            and f"{fp_obj.name}__{base_map[fp_obj.name]}" in phys_tables
+        ):
             action = "SEED_INCREMENTAL"
             reason = (
                 f"Zero-copy CLONE from base fingerprint {base_map[fp_obj.name]} + incremental delta"
@@ -289,16 +300,27 @@ def diff_manifests(
     new_nodes = new_manifest.get("nodes") or {}
 
     def _extract_cols(node: dict[str, Any]) -> dict[str, str]:
+        compiled = node.get("compiled_code") or node.get("compiled_sql") or ""
+        inferred = extract_sql_output_columns(compiled, dialect=dialect)
         declared = {
             col_name: (col_meta.get("data_type") or "")
             for col_name, col_meta in (node.get("columns") or {}).items()
         }
-        if declared:
+        if not inferred:
             return declared
-        compiled = node.get("compiled_code") or node.get("compiled_sql") or ""
-        return extract_sql_output_columns(compiled, dialect=dialect)
+        # Compiled projections determine which columns exist; declared metadata may
+        # be partial, but provides types when available.
+        declared_types = {name.lower(): data_type for name, data_type in declared.items()}
+        return {
+            name: declared_types.get(name.lower(), inferred_type)
+            for name, inferred_type in inferred.items()
+        }
 
     diffs: list[ModelSchemaDiff] = []
+    for uid, old_node in sorted(old_nodes.items()):
+        if uid not in new_nodes and old_node.get("resource_type") == "model":
+            diffs.append(ModelSchemaDiff(model_name=old_node.get("name", uid), removed=True))
+
     for uid, new_node in sorted(new_nodes.items()):
         if uid not in old_nodes:
             continue
