@@ -462,23 +462,106 @@ $$
   ORDER BY 1
 {%- endmacro %}
 
+{% macro duckdb__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
+  {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
+    physical_schema,
+    retention_releases,
+    retention_days,
+    "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"
+  )) }}
+{%- endmacro %}
+
+{% macro postgres__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
+  {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
+    physical_schema,
+    retention_releases,
+    retention_days,
+    "LOWER(t.table_name) ~ '__[0-9a-f]{8,64}$'"
+  )) }}
+{%- endmacro %}
+
+{% macro databricks__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
+  {{ return(dbt_virtual.find_orphan_tables_with_suffix_sql(
+    physical_schema,
+    retention_releases,
+    retention_days,
+    "LOWER(t.table_name) RLIKE '__[0-9a-f]{8,64}$'"
+  )) }}
+{%- endmacro %}
+
+{% macro find_orphan_tables_with_suffix_sql(physical_schema, retention_releases, retention_days, suffix_predicate) -%}
+  WITH protected_releases AS (
+    SELECT release_id
+    FROM (
+      SELECT release_id,
+        DENSE_RANK() OVER (ORDER BY release_created_at DESC) AS release_rank
+      FROM (
+        SELECT release_id, MAX(created_at) AS release_created_at
+        FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+        WHERE status IN ('promoted', 'candidate')
+        GROUP BY release_id
+      ) AS release_times
+    ) AS ranked_releases
+    WHERE release_rank <= {{ retention_releases }}
+  ),
+  protected_tables AS (
+    SELECT LOWER(REPLACE(physical_identifier, '{{ physical_schema }}.', '')) AS table_name
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+    WHERE resource_type = 'model'
+    UNION
+    SELECT LOWER(REPLACE(r.physical_identifier, '{{ physical_schema }}.', '')) AS table_name
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS r
+    INNER JOIN protected_releases AS pr USING (release_id)
+    WHERE r.resource_type = 'model'
+  )
+  SELECT LOWER(t.table_name) AS table_name
+  FROM information_schema.tables AS t
+  LEFT JOIN protected_tables AS p ON LOWER(t.table_name) = p.table_name
+  WHERE LOWER(t.table_schema) = LOWER('{{ physical_schema }}')
+    AND t.table_type = 'BASE TABLE'
+    AND {{ suffix_predicate }}
+    AND {{ dbt_virtual.orphan_table_age_predicate_sql(physical_schema, retention_days) }}
+    AND p.table_name IS NULL
+  ORDER BY 1
+{%- endmacro %}
+
+{% macro orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {{ return(adapter.dispatch('orphan_table_age_predicate_sql', 'dbt_virtual')(physical_schema, retention_days)) }}
+{%- endmacro %}
+
+{% macro duckdb__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- DuckDB has no portable creation timestamp for tables; require recorded release age, failing safe for untracked tables. -#}
+  EXISTS (
+    SELECT 1
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS age_r
+    WHERE age_r.resource_type = 'model'
+      AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
+    GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
+      HAVING MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+  )
+{%- endmacro %}
+
+{% macro postgres__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- PostgreSQL's portable catalogs omit table creation time; use release timestamps and retain untracked tables. -#}
+  EXISTS (
+    SELECT 1
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS age_r
+    WHERE age_r.resource_type = 'model'
+      AND LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', '')) = LOWER(t.table_name)
+    GROUP BY LOWER(REPLACE(age_r.physical_identifier, '{{ physical_schema }}.', ''))
+      HAVING MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '{{ retention_days }} days'
+  )
+{%- endmacro %}
+
+{% macro databricks__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  t.created < DATEADD(DAY, -{{ retention_days }}, CURRENT_TIMESTAMP())
+{%- endmacro %}
+
 {% macro default__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
-  SELECT table_name
-  FROM information_schema.tables
-  WHERE table_schema = '{{ physical_schema }}'
-    AND table_type = 'BASE TABLE'
-    AND table_name LIKE '%\_\_%' ESCAPE '\'
-    AND table_name NOT IN (
-      SELECT REPLACE(physical_identifier, '{{ physical_schema }}.', '')
-      FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
-      WHERE resource_type = 'model'
-      UNION
-      SELECT REPLACE(physical_identifier, '{{ physical_schema }}.', '')
-      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-      WHERE resource_type = 'model'
-        AND status IN ('promoted', 'candidate')
-    )
-  ORDER BY table_name
+  {{ exceptions.raise_compiler_error(
+    "dbt-virtual gc is not supported for adapter '" ~ target.type
+    ~ "': no safe fingerprint table matcher is configured."
+  ) }}
 {%- endmacro %}
 
 

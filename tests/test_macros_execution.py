@@ -545,10 +545,39 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     assert "GROUP BY release_id" in bq_orphan
     assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= 5" in bq_orphan
 
+    for adapter_type, matcher in (
+        ("duckdb", "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"),
+        ("postgres", "LOWER(t.table_name) ~ '__[0-9a-f]{8,64}$'"),
+        ("databricks", "LOWER(t.table_name) RLIKE '__[0-9a-f]{8,64}$'"),
+    ):
+        adapter_harness = MacroTestHarness(adapter_type=adapter_type, target_name="prod")
+        orphan_sql = adapter_harness.call_macro(
+            "find_orphan_tables_sql", "analytics_physical", 5, 7
+        )
+        assert matcher in orphan_sql
+        assert "table_name LIKE '%\\_\\_%'" not in orphan_sql
+
+    unsupported_harness = MacroTestHarness(adapter_type="unsupported", target_name="prod")
+    try:
+        unsupported_harness.call_macro(
+            "find_orphan_tables_sql", "analytics_physical", 5, 7
+        )
+        raise AssertionError("Expected an error for adapters without a safe GC matcher")
+    except RuntimeError as exc:
+        assert "no safe fingerprint table matcher is configured" in str(exc)
+
+    duckdb_orphan = harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
+    assert "MAX(created_at) AS release_created_at" in duckdb_orphan
+    assert "GROUP BY release_id" in duckdb_orphan
+    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC)" in duckdb_orphan
+    assert "MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
+
     # Databricks dispatch: SHALLOW CLONE
     dbx_harness = MacroTestHarness(adapter_type="databricks", target_name="prod")
     dbx_clone = dbx_harness.call_macro("clone_table_sql", src, dst)
     assert "SHALLOW CLONE" in dbx_clone
+    dbx_orphan = dbx_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
+    assert "t.created < DATEADD(DAY, -7, CURRENT_TIMESTAMP())" in dbx_orphan
 
 
 def test_sync_env_view_and_register_routine_deployment() -> None:
