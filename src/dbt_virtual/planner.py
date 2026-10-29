@@ -164,9 +164,11 @@ def classify_plan_actions(
     base_map = base_env_state or {}
     phys_tables = set(existing_physical_tables or set())
 
-    # Any fingerprint active in env_state or base_env_state implies its physical table exists
-    for model_name, fp in (*env_map.items(), *base_map.items()):
-        phys_tables.add(f"{model_name}__{fp}")
+    # Without a catalog snapshot, treat state pointers as evidence that physical tables exist.
+    # When a snapshot is supplied, it is authoritative and can reveal stale registry pointers.
+    if existing_physical_tables is None:
+        for model_name, fp in (*env_map.items(), *base_map.items()):
+            phys_tables.add(f"{model_name}__{fp}")
 
     actions: dict[str, NodePlanAction] = {}
     for uid, fp_obj in sorted(fingerprints.items()):
@@ -187,7 +189,12 @@ def classify_plan_actions(
         elif not full_refresh and fp_obj.physical_identifier in phys_tables:
             action = "REUSE"
             reason = f"Physical table {fp_obj.physical_identifier} already exists in warehouse (0 compute)"
-        elif not full_refresh and mat == "incremental" and fp_obj.name in base_map:
+        elif (
+            not full_refresh
+            and mat == "incremental"
+            and fp_obj.name in base_map
+            and f"{fp_obj.name}__{base_map[fp_obj.name]}" in phys_tables
+        ):
             action = "SEED_INCREMENTAL"
             reason = (
                 f"Zero-copy CLONE from base fingerprint {base_map[fp_obj.name]} + incremental delta"

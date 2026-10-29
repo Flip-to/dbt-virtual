@@ -113,7 +113,16 @@
   {%- endset -%}
   {%- set results = run_query(lookup_query) -%}
   {%- if results and (results.rows | length) > 0 -%}
-    {{ return(true) }}
+    {%- set base_phys_ident = results.rows[0][0] -%}
+    {%- set base_table_name = base_phys_ident.split('.')[-1] -%}
+    {%- set base_relation = adapter.get_relation(
+      database=target.database,
+      schema=phys_schema,
+      identifier=base_table_name
+    ) -%}
+    {%- if base_relation is not none -%}
+      {{ return(true) }}
+    {%- endif -%}
   {%- endif -%}
   {{ return(false) }}
 {%- endmacro %}
