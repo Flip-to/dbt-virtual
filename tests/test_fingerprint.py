@@ -51,6 +51,19 @@ def test_is_virtual_node() -> None:
     assert is_virtual_node({"resource_type": "test", "config": {"virtual_env": True}}) is False
 
 
+def test_duplicate_virtual_model_names_fail_before_fingerprinting() -> None:
+    first = _make_node(name="shared_model")
+    second = {**_make_node(name="shared_model"), "unique_id": "model.other.shared_model"}
+
+    try:
+        compute_manifest_fingerprints(
+            {"nodes": {first["unique_id"]: first, second["unique_id"]: second}}
+        )
+        raise AssertionError("Expected duplicate virtual model names to be rejected")
+    except ValueError as exc:
+        assert "Duplicate virtual model name 'shared_model'" in str(exc)
+
+
 def test_target_schema_invariance() -> None:
     """Compiling the same model under staging vs prod must yield the exact same fingerprint."""
     node_staging = _make_node(
@@ -85,6 +98,30 @@ def test_sql_or_config_change_invalidates_fingerprint() -> None:
 
     assert base.fingerprint != changed_sql.fingerprint
     assert base.fingerprint != changed_epoch.fingerprint
+
+
+def test_virtual_table_alias_override_fails_clearly() -> None:
+    node = _make_node()
+    node["alias"] = "legacy_orders"
+
+    try:
+        compute_node_fingerprint(node)
+        raise AssertionError("Expected virtual alias override to be rejected")
+    except ValueError as exc:
+        assert "currently requires alias to match the model name" in str(exc)
+
+    generated_alias_node = _make_node()
+    generated_alias_node["alias"] = "orders_metrics__abcdef123456"
+    assert compute_node_fingerprint(generated_alias_node).physical_identifier.startswith(
+        "orders_metrics__"
+    )
+
+    pinned_alias_node = _make_node()
+    pinned_alias_node["config"]["physical_version"] = "pinned_fp_v1"
+    pinned_alias_node["alias"] = "orders_metrics__pinned_fp_v1"
+    assert compute_node_fingerprint(pinned_alias_node).physical_identifier == (
+        "orders_metrics__pinned_fp_v1"
+    )
 
 
 def test_merkle_dag_upstream_propagation(tmp_path: Path) -> None:

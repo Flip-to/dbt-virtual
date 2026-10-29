@@ -182,6 +182,24 @@ def compute_node_fingerprint(
     resource_type = node.get("resource_type", "model")
     config_subset = extract_relevant_config(node)
     materialized = str(config_subset["materialized"])
+    alias = node.get("alias") or name
+    generated_alias = re.fullmatch(rf"{re.escape(name)}__[0-9a-f]{{8,64}}", alias)
+    pinned_alias = (
+        f"{name}__{config_subset['physical_version']}"
+        if config_subset.get("physical_version") is not None
+        else None
+    )
+    if (
+        is_virtual_node(node)
+        and materialized in {"table", "incremental"}
+        and alias != name
+        and generated_alias is None
+        and alias != pinned_alias
+    ):
+        raise ValueError(
+            f"Virtual table model '{name}' uses alias '{alias}'. "
+            "dbt-virtual currently requires alias to match the model name."
+        )
 
     compiled_sql = node.get("compiled_code") or node.get("compiled_sql") or ""
     raw_sql = node.get("raw_code") or node.get("raw_sql") or ""
@@ -242,6 +260,17 @@ def compute_manifest_fingerprints(
     """Compute Merkle-DAG fingerprints for all virtual_env nodes in a dbt manifest."""
     nodes: dict[str, dict[str, Any]] = manifest.get("nodes") or {}
     virtual_nodes = {uid: n for uid, n in nodes.items() if is_virtual_node(n)}
+    virtual_name_uids: dict[str, str] = {}
+    for uid, node in virtual_nodes.items():
+        name = str(node.get("name", ""))
+        previous_uid = virtual_name_uids.get(name)
+        if previous_uid is not None:
+            raise ValueError(
+                f"Duplicate virtual model name '{name}' in manifest nodes "
+                f"'{previous_uid}' and '{uid}'. dbt-virtual requires unique names "
+                "because environment state and physical identifiers are keyed by model name."
+            )
+        virtual_name_uids[name] = uid
     dependency_nodes = {
         uid: n
         for uid, n in nodes.items()
