@@ -402,6 +402,36 @@ def test_jinja_merkle_dag_fallback_walks_parent_nodes() -> None:
     assert fp_child_v1 != fp_child_v2
 
 
+def test_jinja_merkle_fallback_tracks_nonvirtual_model_parents() -> None:
+    parent_v1 = {
+        "unique_id": "model.pkg.shared",
+        "name": "shared",
+        "resource_type": "model",
+        "raw_code": "SELECT 1 AS id",
+        "config": {"materialized": "table", "virtual_env": False},
+        "depends_on": {"nodes": []},
+    }
+    child = {
+        "unique_id": "model.pkg.virtual_child",
+        "name": "virtual_child",
+        "resource_type": "model",
+        "raw_code": "SELECT id FROM {{ ref('shared') }}",
+        "config": {"materialized": "table", "virtual_env": True},
+        "depends_on": {"nodes": [parent_v1["unique_id"]]},
+    }
+
+    first = MacroTestHarness()
+    first.graph = {"nodes": {parent_v1["unique_id"]: parent_v1, child["unique_id"]: child}}
+    fp_v1 = first.call_macro("get_fingerprint", child)
+
+    parent_v2 = {**parent_v1, "raw_code": "SELECT 2 AS id"}
+    second = MacroTestHarness()
+    second.graph = {"nodes": {parent_v2["unique_id"]: parent_v2, child["unique_id"]: child}}
+    fp_v2 = second.call_macro("get_fingerprint", child)
+
+    assert fp_v1 != fp_v2
+
+
 def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
     harness = MacroTestHarness(
         vars_dict={

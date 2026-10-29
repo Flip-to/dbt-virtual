@@ -271,6 +271,11 @@ def compute_manifest_fingerprints(
                 "because environment state and physical identifiers are keyed by model name."
             )
         virtual_name_uids[name] = uid
+    dependency_nodes = {
+        uid: n
+        for uid, n in nodes.items()
+        if is_virtual_node(n) or n.get("resource_type") == "model"
+    }
 
     computed: dict[str, NodeFingerprint] = {}
     visiting: set[str] = set()
@@ -282,11 +287,11 @@ def compute_manifest_fingerprints(
             raise ValueError(f"Cycle detected in dbt-virtual dependency graph at {uid}")
         visiting.add(uid)
 
-        node = virtual_nodes[uid]
+        node = dependency_nodes[uid]
         depends_on = (node.get("depends_on") or {}).get("nodes") or []
         upstream_fps: dict[str, str] = {}
         for parent_uid in depends_on:
-            if parent_uid in virtual_nodes:
+            if parent_uid in dependency_nodes:
                 parent_fp = _resolve(parent_uid)
                 upstream_fps[parent_uid] = parent_fp.fingerprint
 
@@ -303,7 +308,7 @@ def compute_manifest_fingerprints(
     for uid in sorted(virtual_nodes):
         _resolve(uid)
 
-    return computed
+    return {uid: computed[uid] for uid in sorted(virtual_nodes)}
 
 
 def write_fingerprints_file(
