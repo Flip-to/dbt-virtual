@@ -287,6 +287,10 @@ def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
     cols = extract_sql_output_columns(sql_b)
     assert cols == {"customer_id": "", "total_orders": "INT64"}
 
+    # Wildcard projections make the complete output schema unknown; don't return a partial set.
+    assert extract_sql_output_columns("SELECT *, id FROM source_table") == {}
+    assert extract_sql_output_columns("SELECT source_table.* FROM source_table") == {}
+
 
 def test_physical_version_pinning_and_forward_only_config() -> None:
     """Verify SQLMesh-style physical_version pinning and forward_only config extraction."""

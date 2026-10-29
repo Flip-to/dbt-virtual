@@ -296,14 +296,21 @@ def diff_manifests(
     new_nodes = new_manifest.get("nodes") or {}
 
     def _extract_cols(node: dict[str, Any]) -> dict[str, str]:
+        compiled = node.get("compiled_code") or node.get("compiled_sql") or ""
+        inferred = extract_sql_output_columns(compiled, dialect=dialect)
         declared = {
             col_name: (col_meta.get("data_type") or "")
             for col_name, col_meta in (node.get("columns") or {}).items()
         }
-        if declared:
+        if not inferred:
             return declared
-        compiled = node.get("compiled_code") or node.get("compiled_sql") or ""
-        return extract_sql_output_columns(compiled, dialect=dialect)
+        # Compiled projections determine which columns exist; declared metadata may
+        # be partial, but provides types when available.
+        declared_types = {name.lower(): data_type for name, data_type in declared.items()}
+        return {
+            name: declared_types.get(name.lower(), inferred_type)
+            for name, inferred_type in inferred.items()
+        }
 
     diffs: list[ModelSchemaDiff] = []
     for uid, new_node in sorted(new_nodes.items()):
