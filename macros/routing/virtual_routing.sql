@@ -25,6 +25,12 @@
     {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
     {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', 'view') -%}
     {%- if mat in ['table', 'incremental'] -%}
+      {%- if base_name != dbt_virtual.node_attr(node, 'name', '') -%}
+        {{ exceptions.raise_compiler_error(
+          "dbt-virtual: custom aliases are not supported for virtual table models. Remove alias from model '"
+          ~ dbt_virtual.node_attr(node, 'name', '') ~ "' so refs resolve to the environment view."
+        ) }}
+      {%- endif -%}
       {%- set fp = dbt_virtual.get_fingerprint(node) -%}
       {{ return(base_name ~ '__' ~ fp) }}
     {%- endif -%}

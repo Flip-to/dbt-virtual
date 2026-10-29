@@ -275,6 +275,12 @@ def test_virtual_schema_and_alias_routing() -> None:
     assert harness.call_macro("virtual_schema_name", None, table_node) == "analytics_physical"
     assert harness.call_macro("virtual_alias_name", None, table_node) == "orders_metrics__825faf9d7511"
 
+    try:
+        harness.call_macro("virtual_alias_name", "legacy_orders", table_node)
+        raise AssertionError("Expected a clear error for a virtual table alias override")
+    except RuntimeError as exc:
+        assert "custom aliases are not supported for virtual table models" in str(exc)
+
     # Routine virtual model routes to env_schema (`analytics_staging`) with logical name
     assert harness.call_macro("virtual_schema_name", None, tvf_node) == "analytics_staging"
     assert harness.call_macro("virtual_alias_name", None, tvf_node) == "tvf_orders_report"
