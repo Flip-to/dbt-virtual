@@ -397,10 +397,16 @@ $$
 
 {% macro bigquery__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
-    SELECT DISTINCT release_id
-    FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
-    WHERE status IN ('promoted', 'candidate')
-    QUALIFY DENSE_RANK() OVER (ORDER BY created_at DESC) <= {{ retention_releases }}
+    SELECT release_id
+    FROM (
+      SELECT release_id, MAX(created_at) AS release_created_at
+      FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
+      WHERE status IN ('promoted', 'candidate')
+      GROUP BY release_id
+    )
+    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
+    WHERE TRUE
+    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT SPLIT(physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
@@ -423,21 +429,36 @@ $$
 {%- endmacro %}
 
 {% macro snowflake__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
+  WITH protected_releases AS (
+    SELECT release_id
+    FROM (
+      SELECT release_id, MAX(created_at) AS release_created_at
+      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
+      WHERE status IN ('promoted', 'candidate')
+      GROUP BY release_id
+    )
+    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
+    WHERE TRUE
+    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
+  ),
+  protected_tables AS (
+    SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2)) AS table_name
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+    WHERE resource_type = 'model'
+    UNION
+    SELECT LOWER(SPLIT_PART(r.physical_identifier, '.', 2)) AS table_name
+    FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} AS r
+    INNER JOIN protected_releases AS pr USING (release_id)
+    WHERE r.resource_type = 'model'
+  )
   SELECT LOWER(t.table_name) AS table_name
   FROM {{ target.database }}.information_schema.tables AS t
+  LEFT JOIN protected_tables AS p ON LOWER(t.table_name) = p.table_name
   WHERE UPPER(t.table_schema) = UPPER('{{ physical_schema }}')
     AND t.table_type = 'BASE TABLE'
     AND REGEXP_LIKE(LOWER(t.table_name), '.*__[0-9a-f]{8,64}$')
-    AND LOWER(t.table_name) NOT IN (
-      SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2))
-      FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
-      WHERE resource_type = 'model'
-      UNION
-      SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2))
-      FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-      WHERE resource_type = 'model'
-        AND status IN ('promoted', 'candidate')
-    )
+    AND t.created < DATEADD(day, -{{ retention_days }}, CURRENT_TIMESTAMP())
+    AND p.table_name IS NULL
   ORDER BY 1
 {%- endmacro %}
 
