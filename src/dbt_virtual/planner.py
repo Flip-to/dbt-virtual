@@ -120,9 +120,12 @@ class ModelSchemaDiff:
 
     model_name: str
     changes: list[ColumnChange] = field(default_factory=list)
+    removed: bool = False
 
     @property
     def classification(self) -> str:
+        if self.removed:
+            return "BREAKING"
         if not self.changes:
             return "IDENTICAL"
         if any(c.is_breaking for c in self.changes):
@@ -133,6 +136,7 @@ class ModelSchemaDiff:
         return {
             "model_name": self.model_name,
             "classification": self.classification,
+            "removed": self.removed,
             "changes": [c.to_dict() for c in self.changes],
         }
 
@@ -313,6 +317,10 @@ def diff_manifests(
         }
 
     diffs: list[ModelSchemaDiff] = []
+    for uid, old_node in sorted(old_nodes.items()):
+        if uid not in new_nodes and old_node.get("resource_type") == "model":
+            diffs.append(ModelSchemaDiff(model_name=old_node.get("name", uid), removed=True))
+
     for uid, new_node in sorted(new_nodes.items()):
         if uid not in old_nodes:
             continue
