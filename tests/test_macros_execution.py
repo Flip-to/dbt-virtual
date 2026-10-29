@@ -68,6 +68,7 @@ class MacroTestHarness:
         self.flags = type("Flags", (), {"FULL_REFRESH": False})()
         self.model: dict[str, Any] = {}
         self.this: FakeRelation | None = None
+        self.ref_relations: dict[str, FakeRelation] = {}
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -214,11 +215,14 @@ class MacroTestHarness:
                 (),
                 {
                     "ref": staticmethod(
-                        lambda name: FakeRelation(
-                            self.target["database"],
-                            "analytics_physical",
-                            f"{name}__abcdef123456",
-                            "table",
+                        lambda name: self.ref_relations.get(
+                            name,
+                            FakeRelation(
+                                self.target["database"],
+                                "analytics_physical",
+                                f"{name}__abcdef123456",
+                                "table",
+                            ),
                         )
                     ),
                     "is_incremental": staticmethod(lambda: False),
@@ -271,6 +275,12 @@ def test_virtual_schema_and_alias_routing() -> None:
     assert harness.call_macro("virtual_schema_name", None, table_node) == "analytics_physical"
     assert harness.call_macro("virtual_alias_name", None, table_node) == "orders_metrics__825faf9d7511"
 
+    try:
+        harness.call_macro("virtual_alias_name", "legacy_orders", table_node)
+        raise AssertionError("Expected a clear error for a virtual table alias override")
+    except RuntimeError as exc:
+        assert "custom aliases are not supported for virtual table models" in str(exc)
+
     # Routine virtual model routes to env_schema (`analytics_staging`) with logical name
     assert harness.call_macro("virtual_schema_name", None, tvf_node) == "analytics_staging"
     assert harness.call_macro("virtual_alias_name", None, tvf_node) == "tvf_orders_report"
@@ -296,6 +306,34 @@ def test_virtual_ref_modes_env_view_physical_and_hybrid() -> None:
     assert rel_a.schema == "analytics_staging"
     assert rel_a.identifier == "orders_metrics"
     assert rel_a.type == "view"
+
+    # A non-fingerprinted physical table whose name contains `__` must keep its relation.
+    harness_a.ref_relations["daily__archive"] = FakeRelation(
+        "test_proj", "analytics_physical", "daily__archive", "table"
+    )
+    rel_unrelated = harness_a.call_macro("virtual_ref", "daily__archive")
+    assert rel_unrelated.schema == "analytics_physical"
+    assert rel_unrelated.identifier == "daily__archive"
+
+    harness_a.graph = {
+        "nodes": {
+            "model.pkg.pinned": {
+                "name": "pinned_orders",
+                "resource_type": "model",
+                "config": {
+                    "materialized": "incremental",
+                    "virtual_env": True,
+                    "physical_version": "pinned_fp_v1",
+                },
+            }
+        }
+    }
+    harness_a.ref_relations["pinned_orders"] = FakeRelation(
+        "test_proj", "analytics_physical", "pinned_orders__pinned_fp_v1", "table"
+    )
+    rel_pinned = harness_a.call_macro("virtual_ref", "pinned_orders")
+    assert rel_pinned.schema == "analytics_staging"
+    assert rel_pinned.identifier == "pinned_orders"
 
     # 2. Option B (`physical`) keeps direct `<physical_schema>.<model>__<fp>` table relation
     harness_b = MacroTestHarness(
@@ -364,6 +402,36 @@ def test_jinja_merkle_dag_fallback_walks_parent_nodes() -> None:
     assert fp_child_v1 != fp_child_v2
 
 
+def test_jinja_merkle_fallback_tracks_nonvirtual_model_parents() -> None:
+    parent_v1 = {
+        "unique_id": "model.pkg.shared",
+        "name": "shared",
+        "resource_type": "model",
+        "raw_code": "SELECT 1 AS id",
+        "config": {"materialized": "table", "virtual_env": False},
+        "depends_on": {"nodes": []},
+    }
+    child = {
+        "unique_id": "model.pkg.virtual_child",
+        "name": "virtual_child",
+        "resource_type": "model",
+        "raw_code": "SELECT id FROM {{ ref('shared') }}",
+        "config": {"materialized": "table", "virtual_env": True},
+        "depends_on": {"nodes": [parent_v1["unique_id"]]},
+    }
+
+    first = MacroTestHarness()
+    first.graph = {"nodes": {parent_v1["unique_id"]: parent_v1, child["unique_id"]: child}}
+    fp_v1 = first.call_macro("get_fingerprint", child)
+
+    parent_v2 = {**parent_v1, "raw_code": "SELECT 2 AS id"}
+    second = MacroTestHarness()
+    second.graph = {"nodes": {parent_v2["unique_id"]: parent_v2, child["unique_id"]: child}}
+    fp_v2 = second.call_macro("get_fingerprint", child)
+
+    assert fp_v1 != fp_v2
+
+
 def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
     harness = MacroTestHarness(
         vars_dict={
@@ -392,6 +460,34 @@ def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
     assert "ADD COLUMN IF NOT EXISTS coupon_code STRING" in sql
     # Verify adapter.cache_added(this) was called so dbt knows the table now exists
     assert harness.cache_added_relations == [harness.this]
+
+
+def test_is_incremental_requires_existing_base_physical_table() -> None:
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+            }
+        }
+    )
+    harness.model = {
+        "name": "orders_metrics",
+        "config": {"materialized": "incremental", "virtual_env": True},
+    }
+    harness.query_responses.append(
+        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
+    )
+
+    assert harness.call_macro("is_incremental") is False
+
+    harness.existing_relations.add(
+        ("test_proj", "analytics_physical", "orders_metrics__prodfp000000")
+    )
+    harness.query_responses.append(
+        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
+    )
+    assert harness.call_macro("is_incremental") is True
 
 
 def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
@@ -547,6 +643,14 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
                     "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf_report`() AS (SELECT * FROM `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`orders_metrics`)",
                     3,
                 ),
+                (
+                    "sp_update",
+                    "procedure",
+                    "fpsp",
+                    "analytics_staging.sp_update",
+                    "CREATE OR REPLACE PROCEDURE `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`sp_update`() BEGIN INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (1); UPDATE `test_proj`.`analytics`.`audit_log` SET id = id + 1; END;",
+                    4,
+                ),
             ]
         )
     )
@@ -566,6 +670,11 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
     assert "CREATE OR REPLACE FUNCTION `test_proj`.`analytics`.`udf_double`" not in joined_queries
     assert "CREATE OR REPLACE VIEW `test_proj`.`analytics`.`orders_metrics`" in joined_queries
     assert "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`analytics`.`tvf_report`" in joined_queries
+    assert (
+        "CREATE OR REPLACE PROCEDURE `test_proj`.`analytics`.`sp_update`() BEGIN "
+        "INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (1); UPDATE "
+        "`test_proj`.`analytics`.`audit_log` SET id = id + 1; END;"
+    ) in harness.executed_queries
     assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`legacy_view`" in joined_queries
     assert "SET status = 'promoted'" in joined_queries
 
@@ -575,19 +684,47 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
     harness.query_responses.append(
         FakeResult(
             [
+                ("orders_metrics", "model"),
+                ("new_model", "model"),
+                ("new_fn", "function"),
+            ]
+        )
+    )
+    harness.query_responses.append(
+        FakeResult(
+            [
                 (
                     "orders_metrics",
                     "model",
                     "fp000",
                     "analytics_physical.orders_metrics__fp000",
                     None,
-                )
+                ),
+                (
+                    "sp_rollback",
+                    "procedure",
+                    "fpsp0",
+                    "analytics.sp_rollback",
+                    "CREATE OR REPLACE PROCEDURE `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`sp_rollback`() BEGIN INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (2); UPDATE `test_proj`.`analytics`.`audit_log` SET id = id + 1; END;",
+                ),
             ]
         )
     )
     harness.call_macro("virtual_rollback", env="prod", to_release="")
     rollback_queries = "\n".join(harness.executed_queries)
     assert "SELECT * FROM `test_proj`.`analytics_physical`.`orders_metrics__fp000`" in rollback_queries
+    assert (
+        "CREATE OR REPLACE PROCEDURE `test_proj`.`analytics`.`sp_rollback`() BEGIN "
+        "INSERT INTO `test_proj`.`analytics`.`audit_log` VALUES (2); UPDATE "
+        "`test_proj`.`analytics`.`audit_log` SET id = id + 1; END;"
+    ) in harness.executed_queries
+    assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`new_model`" in rollback_queries
+    assert "DROP FUNCTION IF EXISTS `test_proj`.`analytics`.`new_fn`" in rollback_queries
+    assert "WHERE environment = 'prod' AND model_name = 'new_model'" in rollback_queries
+    assert "WHERE environment = 'prod' AND model_name = 'new_fn'" in rollback_queries
+    assert rollback_queries.index("DROP VIEW IF EXISTS `test_proj`.`analytics`.`new_model`") < rollback_queries.index(
+        "DROP FUNCTION IF EXISTS `test_proj`.`analytics`.`new_fn`"
+    )
 
     # 3. virtual_drop_env protects base_environment ('prod') and allows dropping 'pr_42'
     try:
