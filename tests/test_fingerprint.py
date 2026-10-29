@@ -338,6 +338,16 @@ def test_fingerprint_suffix_normalization_preserves_string_literals_in_same_scan
     assert compute_node_fingerprint(base).fingerprint != compute_node_fingerprint(changed).fingerprint
 
 
+def test_bigquery_double_quoted_strings_keep_fingerprint_shaped_text() -> None:
+    first_sql = 'SELECT "customer__deadbeef123456" AS label'
+    second_sql = 'SELECT "customer__cafebabe123456" AS label'
+    assert normalize_sql(first_sql, use_ast=False) != normalize_sql(second_sql, use_ast=False)
+    # Postgres double quotes are identifiers, so the physical suffix is still normalized.
+    assert normalize_sql(
+        'SELECT * FROM "analytics"."orders__deadbeef123456"', use_ast=False, dialect="postgres"
+    ) == normalize_sql('SELECT * FROM "analytics"."orders"', use_ast=False, dialect="postgres")
+
+
 def test_postgres_comment_scanner_does_not_treat_backslash_as_string_escape() -> None:
     sql = "SELECT 'a\\' -- trailing comment'"
 

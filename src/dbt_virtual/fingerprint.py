@@ -29,10 +29,13 @@ def _strip_sql_comments_and_fp_suffixes(sql: str, dialect: str = "bigquery") -> 
     backslash_escapes = False
     dialect_name = dialect.lower()
     backslash_escape_dialects = {"bigquery", "duckdb", "hive", "mysql", "snowflake", "spark"}
+    # In these dialects `"..."` is a string literal, not a quoted identifier.
+    double_quote_string_dialects = {"bigquery", "databricks", "hive", "mysql", "spark"}
+    string_quotes = {"'", '"'} if dialect_name in double_quote_string_dialects else {"'"}
     while i < len(sql):
         char = sql[i]
         if quote is not None:
-            if quote != "'":
+            if quote not in string_quotes:
                 fingerprint_match = _FINGERPRINT_SUFFIX_RE.match(sql, i)
                 if fingerprint_match:
                     i = fingerprint_match.end()
@@ -54,7 +57,7 @@ def _strip_sql_comments_and_fp_suffixes(sql: str, dialect: str = "bigquery") -> 
             i += 1
             continue
 
-        if char == "'":
+        if char in string_quotes:
             quote = char
             previous_is_escape_prefix = (
                 i > 0
