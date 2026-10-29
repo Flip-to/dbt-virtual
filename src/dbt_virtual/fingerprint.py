@@ -17,10 +17,82 @@ from sqlglot.errors import SqlglotError
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
 
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
+
+
+def _strip_sql_comments_and_fp_suffixes(sql: str, dialect: str = "bigquery") -> str:
+    """Strip comments and relation fingerprints in one quote-aware SQL scan."""
+    out: list[str] = []
+    i = 0
+    quote: str | None = None
+    backslash_escapes = False
+    dialect_name = dialect.lower()
+    backslash_escape_dialects = {"bigquery", "duckdb", "hive", "mysql", "snowflake", "spark"}
+    # In these dialects `"..."` is a string literal, not a quoted identifier.
+    double_quote_string_dialects = {"bigquery", "databricks", "hive", "mysql", "spark"}
+    string_quotes = {"'", '"'} if dialect_name in double_quote_string_dialects else {"'"}
+    while i < len(sql):
+        char = sql[i]
+        if quote is not None:
+            if quote not in string_quotes:
+                fingerprint_match = _FINGERPRINT_SUFFIX_RE.match(sql, i)
+                if fingerprint_match:
+                    i = fingerprint_match.end()
+                    continue
+            out.append(char)
+            if char == quote:
+                # SQL escapes quote characters by doubling them.
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    out.append(sql[i + 1])
+                    i += 2
+                    continue
+                quote = None
+                backslash_escapes = False
+            elif backslash_escapes and char == "\\" and i + 1 < len(sql):
+                # Only dialects with backslash string escapes treat the next character specially.
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if char in string_quotes:
+            quote = char
+            previous_is_escape_prefix = (
+                i > 0
+                and sql[i - 1] in {"e", "E"}
+                and (i < 2 or not (sql[i - 2].isalnum() or sql[i - 2] == "_"))
+            )
+            backslash_escapes = dialect_name in backslash_escape_dialects or previous_is_escape_prefix
+            out.append(char)
+            i += 1
+        elif char in {'"', "`"}:
+            quote = char
+            out.append(char)
+            i += 1
+        elif sql.startswith("--", i):
+            end = sql.find("\n", i)
+            if end < 0:
+                break
+            out.append("\n")
+            i = end + 1
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                # Keep malformed SQL intact; parsing/execution should report the syntax error.
+                out.append(sql[i:])
+                break
+            out.append(" ")
+            i = end + 2
+        else:
+            fingerprint_match = _FINGERPRINT_SUFFIX_RE.match(sql, i)
+            if fingerprint_match:
+                i = fingerprint_match.end()
+                continue
+            out.append(char)
+            i += 1
+    return "".join(out)
 
 
 @dataclass(frozen=True)
@@ -118,12 +190,10 @@ def normalize_sql(
     if not sql:
         return ""
 
-    normalized = sql.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = _BLOCK_COMMENT_RE.sub("", normalized)
-    normalized = _LINE_COMMENT_RE.sub("", normalized)
-
-    # Strip any existing __<fp> suffixes from physical table names
-    normalized = _FINGERPRINT_SUFFIX_RE.sub("", normalized)
+    normalized = _strip_sql_comments_and_fp_suffixes(
+        sql.replace("\r\n", "\n").replace("\r", "\n"),
+        dialect=dialect,
+    )
 
     # Replace known environment / physical schemas with a canonical schema token
     if known_schemas:
@@ -179,6 +249,7 @@ def compute_node_fingerprint(
     upstream_fingerprints: dict[str, str] | None = None,
     known_schemas: list[str] | None = None,
     fp_length: int = DEFAULT_FINGERPRINT_LENGTH,
+    dialect: str = "bigquery",
 ) -> NodeFingerprint:
     """Compute the deterministic Merkle-DAG fingerprint for a single dbt manifest node."""
     unique_id = node["unique_id"]
@@ -216,12 +287,14 @@ def compute_node_fingerprint(
         compiled_sql,
         self_identifier=node.get("alias") or name,
         known_schemas=schemas_to_strip,
+        dialect=dialect,
     )
     norm_raw = normalize_sql(
         raw_sql,
         self_identifier=name,
         known_schemas=schemas_to_strip,
         use_ast=False,
+        dialect=dialect,
     )
 
     sorted_upstreams = dict(sorted((upstream_fingerprints or {}).items()))
@@ -260,9 +333,12 @@ def compute_manifest_fingerprints(
     *,
     known_schemas: list[str] | None = None,
     fp_length: int = DEFAULT_FINGERPRINT_LENGTH,
+    dialect: str | None = None,
 ) -> dict[str, NodeFingerprint]:
     """Compute Merkle-DAG fingerprints for all virtual_env nodes in a dbt manifest."""
     nodes: dict[str, dict[str, Any]] = manifest.get("nodes") or {}
+    adapter_type = (manifest.get("metadata") or {}).get("adapter_type")
+    sql_dialect = dialect or (str(adapter_type).removeprefix("dbt-") if adapter_type else "bigquery")
     virtual_nodes = {uid: n for uid, n in nodes.items() if is_virtual_node(n)}
     virtual_name_uids: dict[str, str] = {}
     for uid, node in virtual_nodes.items():
@@ -304,6 +380,7 @@ def compute_manifest_fingerprints(
             upstream_fingerprints=upstream_fps,
             known_schemas=known_schemas,
             fp_length=fp_length,
+            dialect=sql_dialect,
         )
         visiting.remove(uid)
         computed[uid] = fp_obj

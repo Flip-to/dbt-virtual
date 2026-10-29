@@ -292,6 +292,84 @@ def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
     assert extract_sql_output_columns("SELECT source_table.* FROM source_table") == {}
 
 
+def test_normalize_sql_preserves_comment_markers_inside_quoted_values() -> None:
+    line_comment_marker = "SELECT 'value--still data' AS result"
+    block_comment_marker = "SELECT 'value/*still data*/' AS result"
+
+    assert normalize_sql(line_comment_marker) == line_comment_marker
+    assert normalize_sql(block_comment_marker) == block_comment_marker
+
+
+def test_fingerprint_changes_when_quoted_value_contains_comment_marker() -> None:
+    base_node = {
+        "unique_id": "model.test.comment_marker",
+        "name": "comment_marker",
+        "resource_type": "model",
+        "config": {"materialized": "table"},
+    }
+    line_comment_sql = "SELECT 'value--different' AS result"
+    block_comment_sql = "SELECT 'value/*different*/' AS result"
+    plain_sql = "SELECT 'value' AS result"
+
+    line_comment_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": line_comment_sql, "raw_code": line_comment_sql}
+    )
+    block_comment_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": block_comment_sql, "raw_code": block_comment_sql}
+    )
+    plain_fp = compute_node_fingerprint(
+        {**base_node, "compiled_code": plain_sql, "raw_code": plain_sql}
+    )
+
+    assert line_comment_fp.fingerprint != plain_fp.fingerprint
+    assert block_comment_fp.fingerprint != plain_fp.fingerprint
+
+
+def test_fingerprint_suffix_normalization_preserves_string_literals_in_same_scan() -> None:
+    first_sql = "SELECT 'customer__deadbeef123456' AS label"
+    second_sql = "SELECT 'customer__cafebabe123456' AS label"
+    assert normalize_sql(first_sql) != normalize_sql(second_sql)
+    assert normalize_sql(
+        "SELECT * FROM `proj.analytics.orders__deadbeef123456`"
+    ) == normalize_sql("SELECT * FROM `proj.analytics.orders`")
+
+    base = _make_node(compiled_code=first_sql, raw_code=first_sql)
+    changed = _make_node(compiled_code=second_sql, raw_code=second_sql)
+    assert compute_node_fingerprint(base).fingerprint != compute_node_fingerprint(changed).fingerprint
+
+
+def test_bigquery_double_quoted_strings_keep_fingerprint_shaped_text() -> None:
+    first_sql = 'SELECT "customer__deadbeef123456" AS label'
+    second_sql = 'SELECT "customer__cafebabe123456" AS label'
+    assert normalize_sql(first_sql, use_ast=False) != normalize_sql(second_sql, use_ast=False)
+    # Postgres double quotes are identifiers, so the physical suffix is still normalized.
+    assert normalize_sql(
+        'SELECT * FROM "analytics"."orders__deadbeef123456"', use_ast=False, dialect="postgres"
+    ) == normalize_sql('SELECT * FROM "analytics"."orders"', use_ast=False, dialect="postgres")
+
+
+def test_postgres_comment_scanner_does_not_treat_backslash_as_string_escape() -> None:
+    sql = "SELECT 'a\\' -- trailing comment'"
+
+    assert normalize_sql(sql, use_ast=False, dialect="postgres") == "SELECT 'a\\'"
+
+    node = _make_node(compiled_code=sql, raw_code=sql)
+    without_comment = _make_node(compiled_code="SELECT 'a\\'", raw_code="SELECT 'a\\'")
+    with_comment = compute_manifest_fingerprints(
+        {
+            "metadata": {"adapter_type": "postgres"},
+            "nodes": {node["unique_id"]: node},
+        }
+    )[node["unique_id"]]
+    clean = compute_manifest_fingerprints(
+        {
+            "metadata": {"adapter_type": "postgres"},
+            "nodes": {without_comment["unique_id"]: without_comment},
+        }
+    )[without_comment["unique_id"]]
+    assert with_comment.fingerprint == clean.fingerprint
+
+
 def test_physical_version_pinning_and_forward_only_config() -> None:
     """Verify SQLMesh-style physical_version pinning and forward_only config extraction."""
     node_default = _make_node(
