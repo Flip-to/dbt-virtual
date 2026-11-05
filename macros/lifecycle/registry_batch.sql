@@ -64,7 +64,7 @@
   INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} (
     release_id, source_environment, target_environment, model_name, resource_type, dependency_tier,
     fingerprint, physical_identifier, routine_ddl_template, status, created_at, promoted_at, rolled_back_at,
-    schema_key
+    schema_key, build_quality
   ) VALUES
   {{ values | join(',\n') }}
 {%- endmacro %}
@@ -166,6 +166,18 @@
       }) -%}
     {%- endfor -%}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointers_sql(phys_schema, env_name, env_rows)) -%}
+    {#- Promotion guards read `build_quality` ('partial' for windowed / --empty builds); stamp the
+        whole chunk at once, as the per-model path does for one row. -#}
+    {%- set quality = dbt_virtual.build_quality() -%}
+    {%- set chunk_names = [] -%}
+    {%- for row in chunk -%}
+      {%- do chunk_names.append(dbt_virtual.sql_string_literal(row['name'])) -%}
+    {%- endfor -%}
+    {%- do dbt_virtual.exec_sql_statement(
+      "UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_environments')
+      ~ " SET build_quality = '" ~ quality ~ "' WHERE environment = " ~ dbt_virtual.sql_string_literal(env_name)
+      ~ " AND model_name IN (" ~ (chunk_names | join(', ')) ~ ")"
+    ) -%}
 
     {%- if release_id != '' -%}
       {%- set values = [] -%}
@@ -177,7 +189,7 @@
           ~ ", " ~ dbt_virtual.sql_string_literal(row['physical_identifier']) ~ ", "
           ~ (dbt_virtual.sql_string_literal(row['routine_ddl_template']) if row['routine_ddl_template'] is not none else 'NULL')
           ~ ", 'candidate', " ~ dbt_virtual.current_timestamp_sql() ~ ", NULL, NULL, "
-          ~ dbt_virtual.sql_nullable_literal(row['schema_key']) ~ ")"
+          ~ dbt_virtual.sql_nullable_literal(row['schema_key']) ~ ", '" ~ dbt_virtual.build_quality() ~ "')"
         ) -%}
       {%- endfor -%}
       {#- Idempotent: a re-run (or a project that also lists `flush_registry` in its own on-run-end)

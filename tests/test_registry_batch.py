@@ -89,7 +89,7 @@ def test_flush_registry_writes_all_successful_nodes_in_one_merge() -> None:
     assert "CREATE OR REPLACE TABLE FUNCTION" in releases[0]
     # Intervals are recorded for tables only.
     assert intervals[0].count("'2026-10-01'") == 5
-    assert len(queries) == 4  # MERGE, DELETE (idempotency), INSERT releases, INSERT intervals
+    assert len(queries) == 5  # MERGE, build_quality UPDATE, DELETE (idempotency), INSERT releases, INSERT intervals
 
 
 def test_flush_registry_default_adapter_uses_one_delete_and_one_insert() -> None:
@@ -97,7 +97,7 @@ def test_flush_registry_default_adapter_uses_one_delete_and_one_insert() -> None
     harness.call_macro("flush_registry", _results())
 
     env_stmts = [q for q in harness.executed_queries if "_environments" in q]
-    assert len(env_stmts) == 2  # DELETE + INSERT, one pair for all nodes
+    assert len(env_stmts) == 3  # DELETE + INSERT for all nodes, plus one build_quality UPDATE
     assert env_stmts[0].startswith("DELETE FROM")
     assert env_stmts[0].count("'m") == 5 and "'tvf'" in env_stmts[0]
     assert env_stmts[1].count("CURRENT_TIMESTAMP") == 6
