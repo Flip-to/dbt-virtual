@@ -247,7 +247,7 @@ The same layout, run on DuckDB, is covered by `tests/test_dbt_duckdb_multi_schem
 - **Type**: `boolean`
 - **Default**: `false`
 - **What it does**:
-  On BigQuery, Snowflake and Databricks, seeds and adoptions use `CREATE TABLE ... AS SELECT *` instead of a zero-copy `CLONE`. Meant for emulators and engines without `CLONE`; a target named `emulator` gets the same behaviour (`macros/adapters/dispatch.sql`, `*__clone_table_sql`). DuckDB and PostgreSQL always copy with `CREATE TABLE ... AS SELECT *`.
+  On BigQuery, Snowflake and Databricks (experimental, see [Warehouse Support](warehouse_support.md)), seeds and adoptions use `CREATE TABLE ... AS SELECT *` instead of a zero-copy `CLONE`. Meant for emulators and engines without `CLONE`; a target named `emulator` gets the same behaviour (`macros/adapters/dispatch.sql`, `*__clone_table_sql`). DuckDB and PostgreSQL always copy with `CREATE TABLE ... AS SELECT *`.
 
 ---
 

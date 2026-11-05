@@ -171,6 +171,7 @@
 
 
 {% macro seed_incremental_clones(model_names=none) -%}
+  {%- do dbt_virtual.warn_if_experimental_adapter() -%}
   {#-
     Seeds new fingerprint tables of virtualized incremental models from `base_environment` ('prod')
     via zero-copy `CLONE`, BEFORE dbt materializes them.

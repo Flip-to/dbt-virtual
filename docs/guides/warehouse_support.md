@@ -1,6 +1,9 @@
 # Multi-Warehouse Support Matrix
 
-`dbt-virtual` is designed with **Google BigQuery** as its primary first-class warehouse while supporting **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks** via `adapter.dispatch('...', 'dbt_virtual')` in [`macros/adapters/dispatch.sql`](https://github.com/Flip-to/dbt-virtual/blob/main/macros/adapters/dispatch.sql).
+`dbt-virtual` is designed with **Google BigQuery** as its primary first-class warehouse while supporting **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks** (experimental, see below) via `adapter.dispatch('...', 'dbt_virtual')` in [`macros/adapters/dispatch.sql`](https://github.com/Flip-to/dbt-virtual/blob/main/macros/adapters/dispatch.sql).
+
+!!! warning "Databricks is experimental"
+    The `databricks__` macros are checked only as SQL text by the macro harness (`tests/test_macros_execution.py`). No CI job and no maintainer run has executed them on Databricks. Expect to find bugs; try it in a throwaway catalog first. With `target.type == 'databricks'`, `virtual_promote`, `virtual_rollback`, `virtual_init_env` and incremental seeding log a warning. Reason and exit criteria: [decision](https://github.com/Flip-to/dbt-virtual/blob/main/docs/decisions/20261105_databricks_experimental.md).
 
 ---
 
@@ -16,7 +19,7 @@
 | **Table Function (`table_function`)** | `CREATE OR REPLACE TABLE FUNCTION ... AS (SELECT ...)` | `CREATE OR REPLACE FUNCTION ... RETURNS TABLE(...) AS $$ ... $$` | `CREATE OR REPLACE FUNCTION ... RETURNS <returns> LANGUAGE SQL AS $$ ... $$` (`default__`) | DuckDB: **not virtualized** (dbt-duckdb's own materialization runs); PostgreSQL `CREATE OR REPLACE FUNCTION ...` |
 | **Stored Procedure (`procedure`)** | `CREATE OR REPLACE PROCEDURE ... BEGIN ... END` (body supplied by the model) | `CREATE OR REPLACE PROCEDURE ... LANGUAGE SQL AS $$ ... $$` | `CREATE OR REPLACE PROCEDURE ... LANGUAGE SQL AS $$ ... $$` (`default__`) | DuckDB no-op (`SELECT 1`); PostgreSQL `CREATE OR REPLACE PROCEDURE ...` |
 | **Orphan Table Discovery (`find_orphan_tables_sql`)** | `INFORMATION_SCHEMA.TABLES` (`table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')` + `REGEXP_CONTAINS`) | `INFORMATION_SCHEMA.TABLES` (`REGEXP_LIKE` + `DATEADD`) | `information_schema.tables` (`RLIKE` + `CREATED` age cutoff) | DuckDB `regexp_matches` + recorded release age; PostgreSQL `~` + recorded release age; unsupported adapters fail closed |
-| **CI Verification** | [`Flip-to/bigquery-emulator`](https://github.com/Flip-to/bigquery-emulator) E2E in CI | [`nnnkkk7/snowflake-emulator`](https://github.com/nnnkkk7/snowflake-emulator) E2E in CI | Macro Execution Harness only (SQL not executed) | Real `dbt-core` + `dbt-duckdb` E2E in CI; PostgreSQL in the Snowflake-emulator E2E script |
+| **CI Verification** | [`Flip-to/bigquery-emulator`](https://github.com/Flip-to/bigquery-emulator) E2E in CI | [`nnnkkk7/snowflake-emulator`](https://github.com/nnnkkk7/snowflake-emulator) E2E in CI | Macro Execution Harness only (SQL not executed): **experimental** | Real `dbt-core` + `dbt-duckdb` E2E in CI; PostgreSQL in the Snowflake-emulator E2E script |
 
 On BigQuery, Snowflake and Databricks, `use_ctas_for_clone: true` (or a target named `emulator`) replaces `CLONE` with `CREATE TABLE ... AS SELECT *`, for emulators without `CLONE`.
 

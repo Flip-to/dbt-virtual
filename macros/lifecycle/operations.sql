@@ -464,6 +464,7 @@
 
 
 {% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='', data_diff=false, data_diff_max_mismatch_pct=none, source_database='', source_schema='') -%}
+  {%- do dbt_virtual.warn_if_experimental_adapter() -%}
   {#-
     Zero-rebuild promotion:
     -1. Cross-location (`physical_locations`, or `source_database` / `source_schema`): when the release
@@ -893,6 +894,7 @@
 
 
 {% macro virtual_init_env(env='pr_env', from_env='prod') -%}
+  {%- do dbt_virtual.warn_if_experimental_adapter() -%}
   {#-
     SQLMesh-style instant virtual environment bootstrap:
     Creates schema `<env_schema>` and points all virtual views at `from_env`'s active physical tables
@@ -988,6 +990,7 @@
 
 
 {% macro virtual_rollback(env='prod', to_release='', lock=false, lock_owner='', location=none, skip_empty=false) -%}
+  {%- do dbt_virtual.warn_if_experimental_adapter() -%}
   {#-
     Instant rollback:
     Repoints all views in `env` back to `to_release` (or the most recent prior `promoted` release in `_releases`).
