@@ -100,7 +100,7 @@
 {%- endmacro %}
 
 
-{% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0, location=none) -%}
+{% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0, location=none, check_coverage=true, coverage_ignore_before='') -%}
   {#-
     SQLMesh-style pre-promotion quality gate:
     1. Resolves candidate `model` tables for `release_id` (or `from_env`).
@@ -108,6 +108,9 @@
     3. Fails fast via `exceptions.raise_compiler_error` if:
        - A candidate table has 0 rows while `to_env` has > 0 rows (unless `allow_empty=true`).
        - Candidate row count drops by more than `max_row_drop_pct` percent compared to `to_env`.
+       - (BigQuery, `check_coverage=true`) The candidate lacks partitions the `to_env` table has, ignoring
+         `__NULL__` / `__UNPARTITIONED__` and partitions older than `coverage_ignore_before`
+         (argument or `vars.dbt_virtual.coverage_ignore_before`, e.g. '2026-01-01'). Other adapters skip it.
   -#}
   {%- if location is none and dbt_virtual.is_multi_location() -%}
     {%- for loc in dbt_virtual.physical_locations() -%}
@@ -117,6 +120,8 @@
   {%- endif -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {%- set ignore_before = coverage_ignore_before if coverage_ignore_before != '' else (cfg.get('coverage_ignore_before') or '') -%}
+  {%- set coverage_skip_logged = namespace(value=false) -%}
 
   {%- if release_id != '' -%}
     {%- set cand_query -%}
@@ -188,6 +193,34 @@
           ) }}
         {%- endif -%}
       {%- endif -%}
+      {%- if check_coverage and cand_tbl != base_tbl -%}
+        {%- set coverage_sql = dbt_virtual.partition_coverage_sql(cand_rel, base_rel) -%}
+        {%- if (coverage_sql | trim) == '' -%}
+          {%- if not coverage_skip_logged.value -%}
+            {{ log("dbt-virtual audit: partition coverage check skipped (only implemented for BigQuery).", info=True) }}
+            {%- set coverage_skip_logged.value = true -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set coverage_res = run_query(coverage_sql) -%}
+          {%- set missing_ids = [] -%}
+          {%- if coverage_res -%}
+            {%- for crow in coverage_res.rows -%}
+              {%- if not dbt_virtual.partition_is_before(crow[0], ignore_before) -%}
+                {%- do missing_ids.append(crow[0] | string) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- if missing_ids | length > 0 -%}
+            {{ exceptions.raise_compiler_error(
+              "dbt-virtual audit failed for model '" ~ model_name ~ "': candidate table " ~ cand_rel ~ " lacks "
+              ~ (missing_ids | length) ~ " partition(s) that " ~ to_env ~ " has: "
+              ~ (dbt_virtual.partition_ranges(missing_ids | sort) | join(', '))
+              ~ (" (partitions before " ~ ignore_before ~ " ignored)" if ignore_before != '' else '')
+              ~ ". A windowed or failed build is incomplete."
+            ) }}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
       {{ log("dbt-virtual audit [" ~ model_name ~ "]: OK (candidate=" ~ cand_cnt ~ " rows, " ~ to_env ~ "=" ~ base_cnt ~ " rows)", info=True) }}
     {%- else -%}
       {%- if cand_cnt == 0 and not allow_empty -%}
@@ -219,6 +252,9 @@
     {%- do payload['existing_physical_tables'].extend(part['existing_physical_tables']) -%}
     {%- do payload['registered_physical_tables'].extend(part['registered_physical_tables']) -%}
     {%- do payload['physical_schemas'].extend(part['physical_schemas']) -%}
+    {%- if 'partial_physical_tables' in part -%}
+      {%- do payload['partial_physical_tables'].extend(part['partial_physical_tables']) -%}
+    {%- endif -%}
   {%- endfor -%}
   {%- do payload.update({'registered_physical_tables': payload['registered_physical_tables'] | unique | list | sort}) -%}
   {{ log("DBT_VIRTUAL_STATE_JSON:" ~ tojson(payload), info=True) }}
@@ -271,7 +307,31 @@
     {%- endfor -%}
   {%- endif -%}
 
+  {#- Tables whose latest registration is a windowed / `--empty` build: never reuse or clone them. -#}
+  {%- set quality_query -%}
+    SELECT physical_identifier, build_quality, ts FROM (
+      SELECT physical_identifier, build_quality, updated_at AS ts FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} WHERE resource_type = 'model'
+      UNION ALL
+      SELECT physical_identifier, build_quality, created_at AS ts FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
+    ) AS q
+    ORDER BY ts ASC
+  {%- endset -%}
+  {%- set quality_rows = run_query(quality_query) -%}
+  {%- set latest_quality = {} -%}
+  {%- if quality_rows -%}
+    {%- for r in quality_rows.rows -%}
+      {%- do latest_quality.update({r[0].split('.')[-1]: r[1]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set partial_tables = [] -%}
+  {%- for tbl, quality in latest_quality.items() -%}
+    {%- if quality == 'partial' -%}
+      {%- do partial_tables.append(tbl) -%}
+    {%- endif -%}
+  {%- endfor -%}
+
   {%- set payload = {
+    'partial_physical_tables': partial_tables | sort,
     'registered_physical_tables': registered_tables | unique | list | sort,
     'env': env,
     'base_env': base_env,
@@ -348,9 +408,16 @@
 {%- endmacro %}
 
 
-{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false) -%}
+{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='') -%}
   {#-
     Zero-rebuild promotion:
+    0. Guards (guards.sql), checked before anything is changed; the macro raises listing every problem:
+       - `expected_fps_json` (`{model: fingerprint}` of the `to_env` code; the CLI always passes it): a
+         release row with another fingerprint was built from different code or variables.
+       - rows marked `build_quality = 'partial'` (windowed or `--empty` build) are refused.
+       - with `release_id`: the release must be sealed (`dbt-virtual build --release` seals it after a
+         successful `dbt build`) unless `allow_unsealed=true`. Releases from before sealing existed carry
+         no seal and no build_quality; they are refused only with `require_sealed=true` (the CLI default).
     1. Optionally runs `virtual_audit` quality gate when `audit=true`.
     2. Verifies every physical table in `release_id` (or `from_env` active state) exists.
     3. Deploys objects in strict dependency tier order:
@@ -376,13 +443,14 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
   {%- set ensured_schemas = [] -%}
+  {%- do dbt_virtual.ensure_registry() -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
   {%- if lock -%}
     {%- do dbt_virtual.virtual_acquire_lock(env=to_env, owner=owner, location=location) -%}
   {%- endif -%}
 
   {%- if audit -%}
-    {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct, location=location) -%}
+    {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct, location=location, check_coverage=check_coverage, coverage_ignore_before=coverage_ignore_before) -%}
   {%- endif -%}
 
   {%- if release_id != '' -%}
@@ -394,7 +462,9 @@
         physical_identifier,
         routine_ddl_template,
         dependency_tier,
-        schema_key
+        schema_key,
+        build_quality,
+        sealed_at
       FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
       WHERE release_id = '{{ release_id }}'
       ORDER BY CASE resource_type WHEN 'model' THEN 1 WHEN 'function' THEN 2 WHEN 'table_function' THEN 3 ELSE 4 END ASC, model_name ASC
@@ -422,7 +492,8 @@
           WHEN 'table_function' THEN 3
           ELSE 4
         END AS dependency_tier,
-        e.schema_key
+        e.schema_key,
+        e.build_quality
       FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} AS e
       WHERE e.environment = '{{ from_env }}'
       ORDER BY CASE e.resource_type WHEN 'model' THEN 1 WHEN 'function' THEN 2 WHEN 'table_function' THEN 3 ELSE 4 END ASC, e.model_name ASC
@@ -439,6 +510,16 @@
       {{ return('skipped') }}
     {%- endif -%}
     {{ exceptions.raise_compiler_error("dbt-virtual promote: No models found for env=" ~ from_env ~ " release=" ~ release_id) }}
+  {%- endif -%}
+
+  {%- set guard_problems = dbt_virtual.promotion_guard_problems(
+    rows.rows, to_env, release_id, expected_fps_json, allow_unsealed, require_sealed, 7, 8 if release_id != '' else none
+  ) -%}
+  {%- if guard_problems | length > 0 -%}
+    {%- if lock -%}
+      {%- do dbt_virtual.virtual_release_lock(env=to_env, owner=owner) -%}
+    {%- endif -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual promote refused (nothing was changed): " ~ (guard_problems | join(' | '))) }}
   {%- endif -%}
 
   {%- set ordered = dbt_virtual.ordered_registry_rows(rows.rows, 6) -%}
@@ -568,6 +649,18 @@
       ) -%}
     {%- endif -%}
   {%- endfor -%}
+
+  {#- A MERGE keeps the old `build_quality` of a pointer it updates; everything promoted here passed the guard. -#}
+  {%- if promoted_names | length > 0 -%}
+    {%- set promoted_literals = [] -%}
+    {%- for promoted_name in promoted_names -%}
+      {%- do promoted_literals.append("'" ~ promoted_name ~ "'") -%}
+    {%- endfor -%}
+    {%- do dbt_virtual.exec_ddl_dml(
+      "UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_environments') ~ " SET build_quality = 'full'"
+      ~ " WHERE environment = '" ~ to_env ~ "' AND build_quality = 'partial' AND model_name IN (" ~ (promoted_literals | join(', ')) ~ ")"
+    ) -%}
+  {%- endif -%}
 
   {%- if release_id != '' -%}
     {%- do dbt_virtual.exec_ddl_dml("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
@@ -1098,7 +1191,7 @@
   {%- endif -%}
 
   {%- set env_query -%}
-    SELECT model_name, resource_type, fingerprint, physical_identifier, schema_key
+    SELECT model_name, resource_type, fingerprint, physical_identifier, schema_key, build_quality
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment = '{{ env }}'
   {%- endset -%}
@@ -1106,7 +1199,7 @@
   {%- set env_ptrs = {} -%}
   {%- if env_rows -%}
     {%- for row in env_rows.rows -%}
-      {%- do env_ptrs.update({row[0]: {'resource_type': row[1], 'fingerprint': row[2], 'physical_identifier': row[3], 'schema_key': dbt_virtual.row_value(row, 4)}}) -%}
+      {%- do env_ptrs.update({row[0]: {'resource_type': row[1], 'fingerprint': row[2], 'physical_identifier': row[3], 'schema_key': dbt_virtual.row_value(row, 4), 'build_quality': dbt_virtual.row_value(row, 5) or 'full'}}) -%}
     {%- endfor -%}
   {%- endif -%}
 
@@ -1144,7 +1237,7 @@
         ~ ptr['fingerprint'] ~ "', '" ~ ptr['physical_identifier'] ~ "', "
         ~ (dbt_virtual.sql_string_literal(template) if template is not none else 'NULL')
         ~ ", 'candidate', " ~ dbt_virtual.current_timestamp_sql() ~ ", NULL, NULL, "
-        ~ dbt_virtual.sql_nullable_literal(ptr['schema_key']) ~ ")"
+        ~ dbt_virtual.sql_nullable_literal(ptr['schema_key']) ~ ", '" ~ ptr['build_quality'] ~ "')"
       ) -%}
     {%- endif -%}
   {%- endfor -%}
@@ -1154,11 +1247,14 @@
       INSERT INTO {{ releases_rel }} (
         release_id, source_environment, target_environment, model_name, resource_type, dependency_tier,
         fingerprint, physical_identifier, routine_ddl_template, status, created_at, promoted_at, rolled_back_at,
-        schema_key
+        schema_key, build_quality
       ) VALUES
       {{ batch | join(',\n') }}
     {%- endset -%}
     {%- do dbt_virtual.exec_sql_statement(insert_sql) -%}
   {%- endfor -%}
+  {#- Every row of the release is in: seal it. Only reached after a successful `dbt build`, so
+      `virtual_promote` can tell a finished release from one whose build failed half-way. -#}
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.seal_release_sql(phys_schema, release_id)) -%}
   {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: added " ~ (values | length) ~ " unchanged object(s) from env=" ~ env ~ ".", info=True) }}
 {%- endmacro %}

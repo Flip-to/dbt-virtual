@@ -102,12 +102,21 @@ dbt-virtual audit \
 
 ### `dbt-virtual promote`
 Executes zero-rebuild promotion from `--from` (`staging`) to `--to` (`prod`):
-1. Takes the lease lock on `--to` in `_locks` (skip with `--no-lock`); it is released when the promote finishes.
-2. Optionally runs `virtual_audit` when `--audit` is passed.
-3. Verifies all physical tables of the release exist in `physical_schema`.
-4. Skips objects whose fingerprint is already active in `--to` (partial promotion).
-5. Deploys **environment views first**, then **routines in DAG order** (each after the views and routines it reads; at equal depth UDFs, then table functions, then procedures), each into the target environment's schema for its custom schema.
-6. **Demotes** (`DROP VIEW` / `DROP FUNCTION` / ...) objects active in `--to` that are not in the release **and** are no longer virtual nodes in the project.
+1. Compiles the project for `--to` and passes the expected fingerprints to `virtual_promote` (see the guards below).
+2. Takes the lease lock on `--to` in `_locks` (skip with `--no-lock`); it is released when the promote finishes or is refused.
+3. **Refuses, before changing anything**, a release that is partial, unsealed or built from other code (guards below).
+4. Runs `virtual_audit` (row counts and, on BigQuery, partition coverage) when `--audit` is on; it is on by default when `--to` is the base environment.
+5. Verifies all physical tables of the release exist in `physical_schema`.
+6. Skips objects whose fingerprint is already active in `--to` (partial promotion).
+7. Deploys **environment views first**, then **routines in DAG order** (each after the views and routines it reads; at equal depth UDFs, then table functions, then procedures), each into the target environment's schema for its custom schema.
+8. **Demotes** (`DROP VIEW` / `DROP FUNCTION` / ...) objects active in `--to` that are not in the release **and** are no longer virtual nodes in the project.
+
+**Promotion guards** (an incomplete table never reaches `--to`):
+
+- **Fingerprint**: every release row must have the fingerprint of the code compiled for `--to` (a windowed build renders other SQL, so it and its descendants differ). Macro argument `expected_fps_json`, always set by the CLI.
+- **Partial**: `sync_env_view` marks rows `build_quality = 'partial'` when dbt runs with `--empty`, when a var listed in `vars.dbt_virtual.partial_build_vars` is set, or when `_dbt_virtual_partial: true`. Partial rows are refused, and `plan` / `build` never reuse or clone a partial table (`status --output` exports `partial_physical_tables`).
+- **Sealed**: `dbt-virtual build --release` seals the release (`_releases.sealed_at`) only after `dbt build` succeeded. An unsealed release is refused unless `--allow-unsealed`. A release created before sealing existed has no seal; it is refused while `--require-sealed` is on (default). After checking its tables, seal it with `dbt run-operation virtual_seal_release --args '{release_id: v1}'` or pass `--no-require-sealed`.
+- **Coverage** (BigQuery, part of `--audit`): the candidate must have every partition the current target table has, except `__NULL__`, `__UNPARTITIONED__` and partitions older than `--coverage-ignore-before` (or `vars.dbt_virtual.coverage_ignore_before`). Missing ranges are reported. Other adapters skip it; `--no-coverage-check` disables it.
 
 ```bash
 dbt-virtual promote \
@@ -122,8 +131,13 @@ dbt-virtual promote \
 |---|---|---|
 | `--from` / `--to` | `staging` / `prod` | Source and target environments. |
 | `--release` | required | Release to promote. |
-| `--audit` | `False` | Run the `audit` gate first. |
+| `--audit` / `--no-audit` | on when `--to` is the base environment | Run the `audit` gate first. |
 | `--max-row-drop-pct` | `100.0` | Row-drop threshold for `--audit`. |
+| `--no-coverage-check` / `--coverage-ignore-before` | off / unset | Coverage part of the audit (BigQuery). |
+| `--skip-fingerprint-check` | `False` | **Dangerous**: do not compare fingerprints with the code of `--to`. A windowed, `--empty` or other-branch build can then be promoted. |
+| `--compile-target` / `--skip-compile` / `--known-schema` | `--to` / `False` / none | How the expected fingerprints are computed. |
+| `--require-sealed` / `--no-require-sealed` | on | Also refuse releases that predate sealing. |
+| `--allow-unsealed` | `False` | **Dangerous**: promote a release whose build did not finish. |
 | `--no-lock` | `False` | Do not take the lease lock. |
 | `--lock-owner` | `dbt-virtual-cli:<user>@<host>` | Lease owner. The default is stable per user and machine, so a promote that failed while holding the lock can be retried right away; in CI pass the job's own lock owner if it already holds the lock. |
 

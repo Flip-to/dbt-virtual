@@ -143,7 +143,10 @@ def test_real_dbt_duckdb_project_e2e(tmp_path: Path) -> None:
             "--profiles-dir",
             str(proj_dir),
             "--args",
-            json.dumps({"from_env": "staging", "to_env": "prod", "release_id": "v1", "audit": True}),
+            # A raw `dbt build` (not `dbt-virtual build --release`) leaves the release unsealed.
+            json.dumps(
+                {"from_env": "staging", "to_env": "prod", "release_id": "v1", "audit": True, "allow_unsealed": True}
+            ),
         ],
         proj_dir,
     )

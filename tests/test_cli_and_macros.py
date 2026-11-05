@@ -435,6 +435,7 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
                     "prod",
                     "--release",
                     "v2026.10.27",
+                    "--skip-compile",
                 ]
             )
             == 0

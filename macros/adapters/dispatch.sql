@@ -138,7 +138,8 @@
     physical_identifier STRING NOT NULL,
     release_id STRING,
     updated_at TIMESTAMP NOT NULL,
-    schema_key STRING
+    schema_key STRING,
+    build_quality STRING
   )
   CLUSTER BY environment, model_name;
 
@@ -156,7 +157,9 @@
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
     rolled_back_at TIMESTAMP,
-    schema_key STRING
+    schema_key STRING,
+    build_quality STRING,
+    sealed_at TIMESTAMP
   )
   PARTITION BY DATE(created_at)
   CLUSTER BY release_id, status;
@@ -190,7 +193,8 @@
     physical_identifier VARCHAR NOT NULL,
     release_id VARCHAR,
     updated_at TIMESTAMP NOT NULL,
-    schema_key VARCHAR
+    schema_key VARCHAR,
+    build_quality VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
@@ -207,7 +211,9 @@
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
     rolled_back_at TIMESTAMP,
-    schema_key VARCHAR
+    schema_key VARCHAR,
+    build_quality VARCHAR,
+    sealed_at TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
@@ -238,7 +244,8 @@
     physical_identifier VARCHAR,
     release_id VARCHAR,
     updated_at TIMESTAMP,
-    schema_key VARCHAR
+    schema_key VARCHAR,
+    build_quality VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
@@ -255,7 +262,9 @@
     created_at TIMESTAMP,
     promoted_at TIMESTAMP,
     rolled_back_at TIMESTAMP,
-    schema_key VARCHAR
+    schema_key VARCHAR,
+    build_quality VARCHAR,
+    sealed_at TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
@@ -282,12 +291,18 @@
 
 {% macro bigquery__registry_migrations_sql(physical_schema) -%}
   ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS schema_key STRING;
-  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key STRING
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS build_quality STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS build_quality STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS sealed_at TIMESTAMP
 {%- endmacro %}
 
 {% macro default__registry_migrations_sql(physical_schema) -%}
   ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR;
-  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS sealed_at TIMESTAMP
 {%- endmacro %}
 
 

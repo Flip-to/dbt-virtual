@@ -161,15 +161,17 @@ def test_rollback_gc_and_locks_iterate_locations() -> None:
 
 def test_export_state_merges_every_location() -> None:
     harness = _harness()
-    # Per location: environment rows, physical tables, registered tables.
+    # Per location: environment rows, physical tables, registered tables, build quality.
     harness.query_responses.extend(
         [
             FakeResult([("staging", "eu_model", "fpeu"), ("prod", "eu_model", "fpeu0")]),
             FakeResult([("eu_model__fpeu",)]),
             FakeResult([("rt_virtual_physical.eu_model__fpeu",)]),
+            FakeResult([]),  # build_quality rows (promotion guards)
             FakeResult([("staging", "us_model", "fpus")]),
             FakeResult([("us_model__fpus",)]),
             FakeResult([("rt_virtual_physical_us.us_model__fpus",)]),
+            FakeResult([]),
         ]
     )
     harness.call_macro("virtual_export_state", env="staging", base_env="prod")

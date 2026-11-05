@@ -207,6 +207,22 @@ The same layout, run on DuckDB, is covered by `tests/test_dbt_duckdb_multi_schem
 
 ---
 
+### `partial_build_vars`
+- **Type**: list of var names
+- **Default**: `[]`
+- **What it does**:
+  Names of dbt vars whose presence means a windowed build (e.g. `["backfill_start", "ci_core_window_start"]`). When one is set, `sync_env_view` registers the table as `build_quality = 'partial'` and `virtual_promote` refuses it. dbt `--empty` and `_dbt_virtual_partial: true` mark a build partial without being listed. Do not give these vars a default in `dbt_project.yml` unless every run is a windowed one: a set var counts as partial.
+
+---
+
+### `coverage_ignore_before`
+- **Type**: date string (e.g. `"2026-01-01"`)
+- **Default**: unset
+- **What it does**:
+  The BigQuery partition coverage audit ignores partitions older than this date (`--coverage-ignore-before` / the macro argument override it).
+
+---
+
 ### `require_cli_fingerprints`
 - **Type**: `boolean` (or a string that renders to `true` / `1` / `yes`, e.g. `"{{ env_var('DBT_VIRTUAL_STRICT', 'false') }}"`)
 - **Default**: `false`
