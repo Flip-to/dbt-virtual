@@ -28,6 +28,7 @@ src/dbt_virtual/
 scripts/
   check_docs_layout.py        # Offline CI guard for specs, decisions, tech_debt, beans, and links
   run_emulator_e2e.py         # End-to-end test harness against Flip-to/bigquery-emulator
+  emulator_e2e_gap_steps.py   # Emulator E2E steps 20-25: data diff, promote by CLONE, authorize_env_views, view metadata, expire envs, shared-table guard
   run_snowflake_emulator_e2e.py # End-to-end test harness against nnnkkk7/snowflake-emulator & PostgreSQL
   run_bigquery_sandbox_e2e.py # Opt-in lifecycle E2E against REAL BigQuery in throwaway datasets (not in CI)
 tests/

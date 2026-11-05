@@ -12,12 +12,34 @@
       {%- call statement('ensure_registry', fetch_result=False) -%}
         {{ dbt_virtual.ensure_registry_tables_sql(phys_schema) }}
       {%- endcall -%}
-    {%- elif adapter.get_columns_in_relation is defined -%}
+    {%- else -%}
+      {%- do dbt_virtual.migrate_registry_if_old(location) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro migrate_registry_if_old(location=none, phys_schema=none) -%}
+  {#- Adds the columns a registry written by an older dbt-virtual lacks (`schema_key`, `build_quality`,
+      `sealed_at`). Never creates a missing registry, so read-only commands (`status`) can call it.
+      Idempotent: the ALTERs are `ADD COLUMN IF NOT EXISTS`, and nothing runs for a current registry. -#}
+  {%- if execute -%}
+    {%- set phys_schema = phys_schema or dbt_virtual.physical_schema_for(location) -%}
+    {%- set releases_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_releases') -%}
+    {%- if releases_rel is not none and adapter.get_columns_in_relation is defined -%}
       {%- set column_names = adapter.get_columns_in_relation(releases_rel) | map(attribute='name') | map('lower') | list -%}
       {%- if 'schema_key' not in column_names or 'build_quality' not in column_names or 'sealed_at' not in column_names -%}
-        {%- call statement('migrate_registry', fetch_result=False) -%}
-          {{ dbt_virtual.registry_migrations_sql(phys_schema) }}
-        {%- endcall -%}
+        {%- if model is defined and model and dbt_virtual.node_attr(model, 'resource_type', '') in ['model', 'snapshot', 'seed'] -%}
+          {#- Inside a model's hooks dbt commits the transaction itself. (In an operation or an `on-run-end`
+              hook `model` is the operation node, so it must be checked by resource type.) -#}
+          {%- call statement('migrate_registry', fetch_result=False) -%}
+            {{ dbt_virtual.registry_migrations_sql(phys_schema) }}
+          {%- endcall -%}
+        {%- else -%}
+          {#- In an operation (`status`, `rollback`, `flush_registry`) nothing commits a statement block: the
+              ALTERs would be rolled back when the connection closes, so run them with their own commit. -#}
+          {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.registry_migrations_sql(phys_schema)) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
   {%- endif -%}

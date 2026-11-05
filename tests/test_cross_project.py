@@ -187,3 +187,41 @@ def test_export_state_reads_the_base_environment_from_its_location() -> None:
     assert any("`ci_proj`.`phys_ci`.INFORMATION_SCHEMA.TABLES" in q for q in queries)
     payload = next(m for m in h.logs if m.startswith("DBT_VIRTUAL_STATE_JSON:"))
     assert '"base_physical_tables"' in payload
+
+
+def test_bigquery_gates_read_prod_from_its_own_location() -> None:
+    """Found on real BigQuery (docs/findings/20261105_bigquery_sandbox_verification.md): run from a CI
+    target, `virtual_audit` and `virtual_data_diff` read `to_env`'s registry from the CI location, saw
+    no prod pointers and reported every model as new, so the gates passed without comparing anything."""
+    from types import SimpleNamespace
+
+    h = _harness(target_name="staging", target_database="ci_proj")
+    h.graph["nodes"]["model.p.orders"] = {"name": "orders", "resource_type": "model", "config": {"unique_key": "id"}}
+    h.adapter_extras["get_columns_in_relation"] = lambda rel: [SimpleNamespace(name="id")]
+    h.adapter_extras["quote"] = lambda name: f"`{name}`"
+    h.query_responses.extend(
+        [
+            FakeResult([("orders", "phys_ci.orders__fp2")]),  # candidate release rows (CI registry)
+            FakeResult([("orders", "phys_prod.orders__fp1")]),  # prod pointer (prod registry)
+        ]
+    )
+    h.call_macro("virtual_data_diff", from_env="staging", to_env="prod", release_id="r1")
+    q = h.executed_queries
+    assert "`ci_proj`.`phys_ci`._releases" in q[0]
+    assert "`prod_proj`.`phys_prod`._environments" in q[1]
+    assert any("`prod_proj`.`phys_prod`.`orders__fp1`" in x for x in q[2:])
+    assert any("`ci_proj`.`phys_ci`.`orders__fp2`" in x for x in q[2:])
+
+    a = _harness(target_name="staging", target_database="ci_proj")
+    a.query_responses.extend(
+        [
+            FakeResult([("orders", "phys_ci.orders__fp2")]),
+            FakeResult([("orders", "phys_prod.orders__fp1")]),
+            FakeResult([(4,)]),
+            FakeResult([(3,)]),
+        ]
+    )
+    a.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="r1", check_coverage=False)
+    assert "`prod_proj`.`phys_prod`._environments" in a.executed_queries[1]
+    assert "`prod_proj`.`phys_prod`.__TABLES__" in a.executed_queries[3]
+    assert any("audit [orders]: OK (candidate=4 rows, prod=3 rows)" in m for m in a.logs)

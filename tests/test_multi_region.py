@@ -147,6 +147,8 @@ def test_rollback_gc_and_locks_iterate_locations() -> None:
     assert "rt_virtual_physical_us" in gc_sql and "`rt_virtual_physical`" in gc_sql
 
     locked = _harness()
+    for _ in range(2):  # per location: ensure_registry, the acquire statement, the live leases read back
+        locked.query_responses.extend([FakeResult([]), FakeResult([]), FakeResult([("me", "2999-01-01")])])
     locked.call_macro("virtual_acquire_lock", env="prod", owner="me")
     lock_sql = "\n".join(locked.executed_queries)
     assert "`test_proj`.`rt_virtual_physical`._locks" in lock_sql

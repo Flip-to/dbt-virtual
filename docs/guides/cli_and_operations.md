@@ -298,3 +298,21 @@ dbt run-operation virtual_seed_incremental_clones --target staging \
 dbt run-operation virtual_snapshot_release --target staging \
   --args '{env: staging, release_id: v1, models_json: {orders_metrics: {materialized: incremental}}}' --vars "$VARS"
 ```
+
+## Upgrading from 0.1.0
+
+Switch `packages.yml` to the new version, run `dbt deps`, and use the CLI as before. Verified by
+`tests/test_dbt_duckdb_upgrade_v010.py` (real dbt on DuckDB) and `scripts/run_emulator_concurrency_upgrade_e2e.py`
+(BigQuery emulator), which build and promote with the `v0.1.0` tag and then continue with the current code.
+
+- **The registry migrates itself.** A 0.1.0 registry has no `schema_key`, `build_quality` or `sealed_at`.
+  `status`, `build`, `promote`, `rollback` and `drop-env` add them with `ADD COLUMN IF NOT EXISTS` the
+  first time they touch the registry (`migrate_registry_if_old`). Releases written by 0.1.0 stay readable
+  and `rollback --to-release <old release>` works. They carry no seal, so `--require-sealed` refuses them
+  until you run `virtual_seal_release` for the release.
+- **Fingerprints changed since 0.1.0** (they no longer depend on the target's datasets), so the first
+  `dbt-virtual build` after the upgrade names new physical tables (the test rebuilt both `table` models).
+  To keep a 0.1.0 table instead, set `physical_version` on the model to its current fingerprint
+  (`dbt-virtual status` shows it); the build then reuses it with no compute and creates no table.
+  For the same reason `dbt-virtual promote` refuses to re-promote a release built by 0.1.0 (its
+  fingerprints differ from the current code's); not measured: `incremental` models across the upgrade.

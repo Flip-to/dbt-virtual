@@ -473,27 +473,32 @@
 {%- endmacro %}
 
 
-{% macro virtual_data_diff(from_env='staging', to_env='prod', release_id='', models=none, threshold=10000, branching=16, max_depth=8, sample_limit=10, exclude_columns=none, where='', window_days=none, max_mismatch_pct=none) -%}
+{% macro virtual_data_diff(from_env='staging', to_env='prod', release_id='', models=none, threshold=10000, branching=16, max_depth=8, sample_limit=10, exclude_columns=none, where='', window_days=none, max_mismatch_pct=none, source_database='', source_schema='') -%}
   {#-
     Row-level diff of the candidate (`release_id`, else `from_env`) against `to_env`, per model.
     Fails (after logging the JSON summary) when a model's mismatch percentage exceeds
     `max_mismatch_pct`. Models only in the candidate are reported as `new`; they have nothing to diff.
+    With `physical_locations` each side is read from its own location: the candidate from
+    `from_env`'s (or `source_database` / `source_schema`, as `promote` passes for a release that
+    is not cloned yet) and `to_env` from its own. DECISION(cross_project_promote_by_clone).
   -#}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set cand_loc = dbt_virtual.registry_location_for(from_env, phys_schema, source_database, source_schema) -%}
+  {%- set base_loc = dbt_virtual.registry_location_for(to_env, phys_schema) -%}
   {%- set wanted = dbt_virtual.diff_as_list(models) -%}
 
   {%- if release_id != '' -%}
     {%- set cand_query -%}
       SELECT model_name, physical_identifier
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
+      FROM {{ dbt_virtual.registry_relation(cand_loc['schema'], '_releases', cand_loc['database']) }}
       WHERE release_id = '{{ release_id }}' AND resource_type = 'model'
       ORDER BY model_name ASC
     {%- endset -%}
   {%- else -%}
     {%- set cand_query -%}
       SELECT model_name, physical_identifier
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+      FROM {{ dbt_virtual.registry_relation(cand_loc['schema'], '_environments', cand_loc['database']) }}
       WHERE environment = '{{ from_env }}' AND resource_type = 'model'
       ORDER BY model_name ASC
     {%- endset -%}
@@ -502,7 +507,7 @@
 
   {%- set base_query -%}
     SELECT model_name, physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    FROM {{ dbt_virtual.registry_relation(base_loc['schema'], '_environments', base_loc['database']) }}
     WHERE environment = '{{ to_env }}' AND resource_type = 'model'
   {%- endset -%}
   {%- set base_rows = run_query(base_query) -%}
@@ -517,6 +522,9 @@
     'window_days': window_days
   } -%}
   {%- set results = [] -%}
+  {%- if not cand_rows or (cand_rows.rows | length) == 0 -%}
+    {{ log("dbt-virtual data diff: no candidate models found in " ~ cand_loc['schema'] ~ " (nothing was compared).", info=True) }}
+  {%- endif -%}
   {%- if cand_rows -%}
     {%- for row in cand_rows.rows -%}
       {%- set model_name = row[0] -%}
@@ -528,8 +536,8 @@
           {#- Same physical table on both sides: nothing to compare. -#}
           {%- do results.append({'model': model_name, 'status': 'identical', 'same_physical_table': true, 'mismatch_pct': 0.0, 'only_candidate': 0, 'only_target': 0, 'changed': 0, 'queries': {'checksum_queries': 0, 'join_queries': 0, 'sample_queries': 0}}) -%}
         {%- else -%}
-          {%- set cand_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=row[1].split('.')[-1], type='table') -%}
-          {%- set base_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=base_ident.split('.')[-1], type='table') -%}
+          {%- set cand_rel = api.Relation.create(database=cand_loc['database'], schema=cand_loc['schema'], identifier=row[1].split('.')[-1], type='table') -%}
+          {%- set base_rel = api.Relation.create(database=base_loc['database'], schema=base_loc['schema'], identifier=base_ident.split('.')[-1], type='table') -%}
           {%- do results.append(dbt_virtual.diff_model(model_name, cand_rel, base_rel, opts)) -%}
         {%- endif -%}
       {%- endif -%}
@@ -552,4 +560,17 @@
     {{ exceptions.raise_compiler_error("dbt-virtual data diff failed: mismatch exceeds max_mismatch_pct=" ~ max_mismatch_pct ~ "% for " ~ (failed | join(', ')) ~ ".") }}
   {%- endif -%}
   {{ return(summary) }}
+{%- endmacro %}
+
+
+{% macro registry_location_for(env_name, phys_schema, database='', schema='') -%}
+  {#- Where `env_name`'s registry and tables live, for a gate that reads another environment than
+      the current one (`virtual_audit`, `virtual_data_diff`). Without `physical_locations` and
+      without an override it is this run's `{target database, phys_schema}`, as before. -#}
+  {%- set here = {'database': dbt_virtual.active_database(), 'schema': phys_schema} -%}
+  {%- if not (dbt_virtual.get_config().get('physical_locations') or {}) and database == '' and schema == '' -%}
+    {{ return(here) }}
+  {%- endif -%}
+  {%- set loc = dbt_virtual.physical_location(env_name) if (dbt_virtual.get_config().get('physical_locations') or {}) else here -%}
+  {{ return({'database': database or loc['database'], 'schema': schema or loc['schema']}) }}
 {%- endmacro %}

@@ -83,11 +83,34 @@
 
 {% macro virtual_acquire_lock(env='prod', owner='dbt-virtual', ttl_minutes=15, location=none) -%}
   {#-
-    Lease lock on `env` in `<physical_schema>._locks`:
-    1. drop expired leases, 2. write (or refresh) this owner's lease, 3. read every live lease.
-    The live lease with the earliest `acquired_at` (then lowest owner) wins; every contender reads
-    the same rows and picks the same winner, so two runners can no longer both "acquire" the lock,
-    which the previous check-then-insert allowed. A loser removes its lease and fails.
+    Lease lock on `env` in `<physical_schema>._locks`. DECISION(lease_lock_single_statement_acquire)
+    (docs/decisions/20261105_lease_lock_single_statement_acquire.md).
+
+    Protocol, two steps that each commit on their own:
+    1. ONE conditional statement (`lock_upsert_sql`) writes this owner's lease only when the
+       environment has no live lease of another owner (same-owner refresh and takeover of an expired
+       lease are the same statement). The warehouse, not this macro, orders concurrent writers:
+         DuckDB, PostgreSQL  `INSERT ... ON CONFLICT (environment) DO UPDATE ... WHERE` on a UNIQUE
+                             index of `_locks(environment)`: at most one row per environment; a second
+                             concurrent insert of the key waits (PostgreSQL) or fails with a unique
+                             violation (DuckDB), so the loser never holds a lease.
+         BigQuery            `MERGE`: mutating DML on one table is serialized, and a conflicting one is
+                             retried by BigQuery, so the second MERGE sees the first one's row. (A plain
+                             INSERT ... WHERE NOT EXISTS would NOT do: BigQuery runs INSERTs on one
+                             table concurrently without conflict.)
+         Snowflake           `MERGE`: takes the table's DML lock, the second waits, then sees the row.
+                             No constraint backs it (Snowflake does not enforce keys):
+                             TECH_DEBT(snowflake_lock_not_constraint_enforced).
+         Databricks          `MERGE`: Delta conflict detection fails the later concurrent writer.
+    2. Read the live leases back (after the commit of step 1). This runner holds the lock only if NO
+       live lease of another owner is visible. This is the backstop for a warehouse that did not
+       serialize step 1: each runner reads after its own commit, so of two runners that both wrote, the
+       one that reads second sees the other's committed row; at most one can see "only me". Both may
+       see the other and both yield (the caller retries), but two never win. The old protocol ordered
+       the leases by their start time, which a reader cannot decide while the earlier row is not yet
+       visible to it: two runners won (tests/test_registry_concurrency_duckdb.py, "2 runners hold the lock").
+    A loser removes its own lease row (if it wrote one) and fails with "lock conflict". On DuckDB a
+    runner that loses the race at step 1 fails with the unique-violation error instead (nothing to remove).
   -#}
   {%- if location is none and dbt_virtual.is_multi_location() -%}
     {%- for loc in dbt_virtual.physical_locations() -%}
@@ -100,15 +123,9 @@
   {%- set locks_rel = dbt_virtual.registry_relation(phys_schema, '_locks') -%}
 
   {%- do dbt_virtual.ensure_registry(location) -%}
+  {%- do dbt_virtual.ensure_locks_unique_key(phys_schema, locks_rel) -%}
 
-  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND expires_at <= " ~ dbt_virtual.current_timestamp_sql()) -%}
-  {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
-  {%- do dbt_virtual.exec_ddl_dml(
-    "INSERT INTO " ~ locks_rel ~ " (environment, owner, acquired_at, expires_at) VALUES ("
-    ~ "'" ~ env ~ "', '" ~ owner ~ "', "
-    ~ dbt_virtual.current_timestamp_sql() ~ ", "
-    ~ dbt_virtual.timestamp_add_minutes_sql(ttl_minutes) ~ ")"
-  ) -%}
+  {%- do dbt_virtual.exec_sql_statement(dbt_virtual.lock_upsert_sql(locks_rel, env, owner, ttl_minutes)) -%}
 
   {%- set live_query -%}
     SELECT owner, expires_at
@@ -118,9 +135,22 @@
     ORDER BY acquired_at ASC, owner ASC
   {%- endset -%}
   {%- set live = run_query(live_query) -%}
-  {%- if live and (live.rows | length) > 0 and live.rows[0][0] != owner -%}
+  {%- set ns = namespace(other=none, mine=false) -%}
+  {%- if live -%}
+    {%- for row in live.rows -%}
+      {%- if row[0] == owner -%}
+        {%- set ns.mine = true -%}
+      {%- elif ns.other is none -%}
+        {%- set ns.other = row -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if ns.other is not none -%}
     {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
-    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "' is currently locked by '" ~ live.rows[0][0] ~ "' (expires at " ~ live.rows[0][1] ~ ").") }}
+    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "' is currently locked by '" ~ ns.other[0] ~ "' (expires at " ~ ns.other[1] ~ ").") }}
+  {%- endif -%}
+  {%- if not ns.mine -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "': the lease of '" ~ owner ~ "' is not live after the acquire statement (another runner holds or took over the lock); retry.") }}
   {%- endif -%}
   {{ log("dbt-virtual lock [" ~ env ~ "]: Acquired lock for owner='" ~ owner ~ "' (ttl=" ~ ttl_minutes ~ "m)", info=True) }}
 {%- endmacro %}
@@ -203,9 +233,11 @@
     {{ return('') }}
   {%- endif -%}
 
+  {#- `to_env` is read from its own location (it differs from this run's under `physical_locations`). -#}
+  {%- set base_loc = dbt_virtual.registry_location_for(to_env, phys_schema) -%}
   {%- set base_query -%}
     SELECT model_name, physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    FROM {{ dbt_virtual.registry_relation(base_loc['schema'], '_environments', base_loc['database']) }}
     WHERE environment = '{{ to_env }}'
       AND resource_type = 'model'
   {%- endset -%}
@@ -228,7 +260,7 @@
     {%- set base_ident = base_map.get(model_name, '') -%}
     {%- if base_ident != '' -%}
       {%- set base_tbl = base_ident.split('.')[-1] -%}
-      {%- set base_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=base_tbl, type='table') -%}
+      {%- set base_rel = api.Relation.create(database=base_loc['database'], schema=base_loc['schema'], identifier=base_tbl, type='table') -%}
       {%- set base_cnt_res = run_query(dbt_virtual.row_count_sql(base_rel)) -%}
       {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
 
@@ -337,6 +369,10 @@
   {%- set schema_exists = adapter.check_schema_exists(dbt_virtual.active_database(), phys_schema) -%}
   {%- set registry_exists = schema_exists and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_environments') is not none
       and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_releases') is not none -%}
+  {#- A registry written by an older release lacks `build_quality` / `schema_key`; add them first. -#}
+  {%- if registry_exists -%}
+    {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
+  {%- endif -%}
   {%- set env_rows = run_query(env_query) if registry_exists else none -%}
 
   {%- set env_state = {} -%}
@@ -555,7 +591,7 @@
 
   {%- if data_diff -%}
     {#- Row-level diff against `to_env`; fails above `data_diff_max_mismatch_pct` (report only when none). -#}
-    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct) -%}
+    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct, source_database=(src_db if cross else ''), source_schema=(src_schema if cross else '')) -%}
   {%- endif -%}
 
   {%- if release_id != '' -%}
@@ -964,6 +1000,7 @@
     {{ return('') }}
   {%- endif -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
   {%- set env_rel = dbt_virtual.registry_relation(phys_schema, '_environments') -%}
 
   {#- Every custom schema seen in the registry or the project, plus the default (none). -#}
@@ -1044,6 +1081,8 @@
   {%- endif -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {#- A registry written by an older release lacks `schema_key` / `build_quality`; migrate it first. -#}
+  {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
   {%- set ensured_schemas = [] -%}
   {%- set authorized_schemas = [] -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}

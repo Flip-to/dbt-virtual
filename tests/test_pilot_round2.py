@@ -115,18 +115,33 @@ def test_promote_still_skips_an_unchanged_model_whose_env_path_is_a_view() -> No
 # --- 2. a failed promote / rollback releases its lease lock -----------------------------------------
 
 
+def _answer_lock_reads(harness: MacroTestHarness) -> None:
+    """The lock read-back sees this runner's own lease; other queries use the queued responses."""
+    queued = harness.query_responses
+    harness.query_responses = []
+
+    def executor(sql: str):
+        if sql.lstrip().startswith("SELECT owner, expires_at"):
+            return [("me", "later")], []
+        is_select = sql.lstrip().upper().startswith("SELECT")
+        res = queued.pop(0) if (queued and is_select) else FakeResult([])
+        return res.rows, res.column_names
+
+    harness.query_executor = executor
+
+
 def _released_after_acquire(queries: list[str]) -> bool:
-    acquired = _index(queries, "INSERT INTO `test_proj`.`analytics_physical`._locks")
+    acquired = _index(queries, "SELECT owner, expires_at")
     released = [i for i, q in enumerate(queries) if q.startswith("DELETE FROM") and "owner = 'me'" in q]
     return bool(released) and released[-1] > acquired
 
 
 def test_promote_preflight_failure_releases_the_lock() -> None:
     harness = MacroTestHarness(vars_dict=BASE_VARS)  # the physical table does not exist
-    harness.query_responses.extend(FakeResult([]) for _ in range(4))  # acquiring the lock: 3 writes + live leases
     harness.query_responses.append(
         FakeResult([("orders", "model", "fp1", "analytics_physical.orders__fp1", None, 2)])
     )
+    _answer_lock_reads(harness)
     with pytest.raises(RuntimeError, match="pre-flight failed"):
         harness.call_macro(
             "virtual_promote", from_env="staging", to_env="prod", release_id="v1", lock=True, lock_owner="me"
@@ -136,7 +151,7 @@ def test_promote_preflight_failure_releases_the_lock() -> None:
 
 def test_rollback_preflight_failure_releases_the_lock() -> None:
     harness = _rollback_harness(missing_physical="customers__fp_c0")
-    harness.query_responses[:0] = [FakeResult([]) for _ in range(4)]  # acquiring the lock: 3 writes + live leases
+    _answer_lock_reads(harness)
     with pytest.raises(RuntimeError, match="pre-flight failed"):
         harness.call_macro("virtual_rollback", env="prod", to_release="v_adopt", lock=True, lock_owner="me")
     assert _released_after_acquire(harness.executed_queries)

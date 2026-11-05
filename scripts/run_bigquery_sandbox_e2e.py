@@ -23,6 +23,13 @@ It drives the `dbt-virtual` CLI (build/status/plan/promote/rollback/audit/init-e
 and `dbt run-operation`, and checks rows, object locations and routine bodies after each step.
 `macros/`, `dbt_project.yml` and `src/dbt_virtual` are copied when the run starts, so edits made
 to the working tree during a run do not leak into it.
+
+`--extended` adds two more opt-in projects, in the same sandbox (see `extended_single_location`
+and `extended_cross_location`): `authorize_env_views`, env view description / labels / column
+descriptions, `diff-data` on partitioned tables (with bytes billed per query read from
+INFORMATION_SCHEMA.JOBS_BY_USER), the partition coverage audit, `gc --expire-env-days`, and
+promote-by-clone between two datasets that stand for two "locations". `--only-extended` skips the
+base lifecycle. Cross-PROJECT clone needs a second project and is not exercised here.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -137,6 +145,9 @@ class Sandbox:
             raise SystemExit(f"no dbt executable in {self.bin_dir}; pass --dbt-bin-dir")
         self.results: list[tuple[str, bool, str]] = []
         self.step_no = 0
+        self.metrics: list[str] = []
+        self.seen_jobs: set[str] = set()
+        self.started_at = datetime.now(timezone.utc) - timedelta(minutes=2)
 
         from google.cloud import bigquery  # optional dependency, only needed here
 
@@ -547,6 +558,463 @@ def lifecycle(sb: Sandbox) -> None:
     sb.check("dry run dropped nothing", orphan in (sb.objects("physical") or {}))
 
 
+# ------------------------------------------------------------------------------------------------
+# --extended: opt-in checks of the newer features. Each function builds its own dbt project in the
+# same sandbox (every dataset starts with `dbt_virtual_sbx_<run>_x...`, so cleanup drops them).
+# ------------------------------------------------------------------------------------------------
+
+FACTS_DESCRIPTION = "Daily facts; it's a test."
+FACTS_LABELS = {"team": "dbt_virtual", "tier": "sandbox"}
+FACTS_SCHEMA_YML = """version: 2
+models:
+  - name: facts
+    description: "Daily facts; it's a test."
+    config:
+      persist_docs: {relation: true, columns: true}
+      labels: {team: dbt_virtual, tier: sandbox}
+    columns:
+      - name: id
+        description: "Primary key; unique."
+      - name: amount
+        description: "Amount in cents"
+"""
+
+_FACTS_V1 = (
+    "select id, date_sub(current_date(), interval mod(id, 30) day) as day, mod(id * 7, 1000) as amount "
+    "from unnest(generate_array(1, 3000)) as id"
+)
+# v2 vs v1: 24 rows changed (ids that are multiples of 100 but not of 250), 12 rows removed
+# (multiples of 250), 5 rows added (ids 5001..5005, partition = today). 3000 -> 2993 rows.
+_FACTS_V2 = (
+    "select id, day, case when mod(id, 100) = 0 then amount + 1 else amount end as amount "
+    f"from ({_FACTS_V1}) where mod(id, 250) != 0 "
+    "union all select 5000 + n as id, current_date() as day, 1 as amount "
+    "from unnest(generate_array(1, 5)) as n"
+)
+# v3: v2 limited to the last 10 daily partitions (a "windowed build": 20 partitions missing).
+_FACTS_V3 = f"select * from ({_FACTS_V2}) where day >= date_sub(current_date(), interval 9 day)"
+
+
+def facts_sql(version: int, rpf: bool) -> str:
+    body = {1: _FACTS_V1, 2: _FACTS_V2, 3: _FACTS_V3}[version]
+    rpf_cfg = ", require_partition_filter=true" if rpf else ""
+    return (
+        "{{ config(materialized='table', unique_key='id', "
+        f"partition_by={{'field': 'day', 'data_type': 'date'}}{rpf_cfg}) }}}}\n{body}\n"
+    )
+
+
+def ext_project(sb: Sandbox, name: str, ds: dict[str, str], extra_vars: dict,
+                models: dict[str, str], schema_yml: str = "") -> None:
+    """Create a dbt project `name` next to the base one and make it the sandbox's current project."""
+    proj = sb.root / name
+    (proj / "models").mkdir(parents=True)
+    (proj / "macros").mkdir()
+    sb.proj = proj
+    sb.logs = sb.root / f"step_logs_{name}"
+    sb.logs.mkdir()
+    sb.step_no = 0
+    sb.ds = dict(ds)
+    sb.env["DBT_PROFILES_DIR"] = str(proj)
+    pkg = sb.root / "dbt_virtual_pkg"
+    (proj / "packages.yml").write_text(f'packages:\n  - local: "{pkg.as_posix()}"\n', encoding="utf-8")
+    cfg = {
+        "enabled": True, "physical_schema": ds["physical"],
+        "environment": "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}",
+        "base_environment": "prod", "ref_resolution": "env_view",
+        "env_schemas": {"staging": ds["staging"], "prod": ds["prod"]},
+        "retention_releases": 5, "retention_days": 7, **extra_vars,
+    }
+    (proj / "dbt_project.yml").write_text(
+        f"""name: 'dbt_virtual_sbx_{name}'
+version: '1.0.0'
+config-version: 2
+profile: 'dbt_virtual_sbx'
+model-paths: ["models"]
+macro-paths: ["macros"]
+on-run-start:
+  - "{{{{ dbt_virtual.seed_incremental_clones() }}}}"
+vars:
+  dbt_virtual: {json.dumps(cfg)}
+models:
+  dbt_virtual_sbx_{name}:
+    +virtual_env: true
+    +post-hook:
+      - "{{{{ dbt_virtual.sync_env_view() }}}}"
+""", encoding="utf-8")
+    outputs = ""
+    for target, dataset in (("staging", ds["staging"]), ("prod", ds["prod"])):
+        outputs += (
+            f"    {target}:\n      type: bigquery\n      method: oauth\n"
+            f"      project: {sb.project}\n      dataset: {dataset}\n"
+            f"      location: {sb.location}\n      threads: {sb.threads}\n"
+            "      priority: interactive\n      job_retries: 1\n"
+            "      job_execution_timeout_seconds: 600\n"
+            "      maximum_bytes_billed: 10000000000\n"
+        )
+    (proj / "profiles.yml").write_text(
+        f"dbt_virtual_sbx:\n  target: staging\n  outputs:\n{outputs}", encoding="utf-8")
+    (proj / "macros" / "virtual_routing_overrides.sql").write_text(ROUTING_OVERRIDES, encoding="utf-8")
+    if schema_yml:
+        (proj / "models" / "schema.yml").write_text(schema_yml, encoding="utf-8")
+    sb.write_models(models)
+    sb.dbt("dbt deps", "deps")
+
+
+def authorized_entries(sb: Sandbox, physical_key: str, env_dataset: str) -> list[dict]:
+    """The `dataset` access entries of the physical dataset that name `env_dataset`."""
+    props = sb.client.get_dataset(f"{sb.project}.{sb.ds[physical_key]}")._properties
+    return [a["dataset"] for a in props.get("access", [])
+            if a.get("dataset", {}).get("dataset", {}).get("datasetId") == env_dataset]
+
+
+DIFF_JOB_PATTERN = r"dv_seg|dv_only_candidate|dv_kind"
+
+
+def job_stats(sb: Sandbox, pattern: str, expected: int) -> list[dict]:
+    """Query jobs of the current user not reported before whose text matches `pattern` (re2) and
+    the sandbox prefix, from INFORMATION_SCHEMA.JOBS_BY_USER. Retries while the view catches up.
+    `cache` is True for a result served from the query cache (billed 0 bytes)."""
+    sql = (
+        "SELECT job_id, total_bytes_processed AS processed, total_bytes_billed AS billed, "
+        "cache_hit AS cache, error_result.reason AS err "
+        f"FROM `{sb.project}`.`region-{sb.location.lower()}`.INFORMATION_SCHEMA.JOBS_BY_USER "
+        f"WHERE creation_time >= TIMESTAMP('{sb.started_at:%Y-%m-%d %H:%M:%S}') "
+        f"AND job_type = 'QUERY' AND state = 'DONE' AND REGEXP_CONTAINS(query, r'{pattern}') "
+        f"AND query LIKE '%{sb.sbx}%' AND query NOT LIKE '%INFORMATION_SCHEMA.JOBS%' "
+        "ORDER BY creation_time"
+    )
+    fresh: list[dict] = []
+    for _ in range(12):
+        fresh = [r for r in sb.q(sql) if r["job_id"] not in sb.seen_jobs]
+        if len(fresh) >= expected:
+            break
+        time.sleep(5)
+    sb.seen_jobs.update(r["job_id"] for r in fresh)
+    return fresh
+
+
+def cli_json(res: subprocess.CompletedProcess) -> dict:
+    out = res.output  # type: ignore[attr-defined]
+    return json.loads(out[out.index("{"):])
+
+
+def diff_oracle(sb: Sandbox, cand: str, base: str, where: str = "TRUE") -> dict:
+    """Independent full outer join of two `facts` tables (id key; day and amount compared)."""
+    return sb.q(f"""
+      SELECT COUNTIF(b.id IS NULL) AS only_candidate, COUNTIF(c.id IS NULL) AS only_target,
+             COUNTIF(c.id IS NOT NULL AND b.id IS NOT NULL
+                     AND (c.amount != b.amount OR c.day != b.day)) AS changed,
+             COUNTIF(c.id IS NOT NULL) AS candidate_rows, COUNTIF(b.id IS NOT NULL) AS target_rows
+      FROM (SELECT * FROM {cand} WHERE {where}) c
+      FULL OUTER JOIN (SELECT * FROM {base} WHERE {where}) b ON c.id = b.id""")[0]
+
+
+def report_metrics(sb: Sandbox, label: str, stats: list[dict]) -> None:
+    processed = sum(int(r["processed"] or 0) for r in stats)
+    billed = sum(int(r["billed"] or 0) for r in stats)
+    cached = sum(1 for r in stats if r.get("cache"))
+    line = (f"METRIC {label}: {len(stats)} queries ({cached} served from the query cache), "
+            f"bytes processed {processed}, bytes billed {billed}, "
+            f"billed per query {[int(r['billed'] or 0) for r in stats]}")
+    print("    " + line)
+    sb.metrics.append(line)
+
+
+def queries_total(q: dict) -> int:
+    return q["checksum_queries"] + q["join_queries"] + q["sample_queries"]
+
+
+def extended_single_location(sb: Sandbox) -> None:
+    p = sb.project
+    x = f"{sb.sbx}_x1"
+    ds = {"physical": f"{x}_phys", "staging": f"{x}_stg", "prod": f"{x}_prod",
+          "pr_old": f"{x}_prod_pr_old"}
+    ext_project(sb, "proj_x1", ds, {"authorize_env_views": True},
+                {"facts": facts_sql(1, False), "facts_rpf": facts_sql(1, True)}, FACTS_SCHEMA_YML)
+    print(f"\n=== extended 1: single location, datasets {x}_* ===")
+
+    # ---- E1. build + authorize_env_views + env view metadata -------------------------------------
+    sb.cli("x1 build staging r1", "build", "--env", "staging", "--release", "r1")
+    fp1 = dict(sb.fingerprints())
+    stg_auth = authorized_entries(sb, "physical", ds["staging"])
+    sb.check("authorize_env_views: staging dataset authorized once on the physical dataset",
+             len(stg_auth) == 1 and stg_auth[0].get("targetTypes") == ["VIEWS"], stg_auth)
+    sb.check("authorize_env_views: prod dataset not authorized before it has views",
+             authorized_entries(sb, "physical", ds["prod"]) == [])
+    sb.cli("x1 promote r1", "promote", "--from", "staging", "--to", "prod", "--release", "r1")
+    sb.check("authorize_env_views: prod dataset authorized once after promote",
+             len(authorized_entries(sb, "physical", ds["prod"])) == 1,
+             authorized_entries(sb, "physical", ds["prod"]))
+    sb.cli("x1 build staging r1b (all REUSE)", "build", "--env", "staging", "--release", "r1b")
+    sb.cli("x1 promote r1b (again)", "promote", "--from", "staging", "--to", "prod",
+           "--release", "r1b")
+    sb.check("authorize_env_views: no duplicate entries after re-running build and promote",
+             len(authorized_entries(sb, "physical", ds["staging"])) == 1
+             and len(authorized_entries(sb, "physical", ds["prod"])) == 1,
+             (authorized_entries(sb, "physical", ds["staging"]),
+              authorized_entries(sb, "physical", ds["prod"])))
+    sb.check("authorize_env_views: physical dataset keeps its other access entries",
+             len(sb.client.get_dataset(f"{p}.{ds['physical']}")._properties.get("access", [])) >= 3)
+
+    for key in ("staging", "prod"):
+        tbl = sb.client.get_table(f"{p}.{ds[key]}.facts")
+        cols = {f.name: f.description for f in tbl.schema}
+        sb.check(f"view metadata [{key}.facts]: description with ';' and quote",
+                 tbl.description == FACTS_DESCRIPTION, tbl.description)
+        sb.check(f"view metadata [{key}.facts]: labels", dict(tbl.labels or {}) == FACTS_LABELS,
+                 tbl.labels)
+        sb.check(f"view metadata [{key}.facts]: column descriptions (update_columns)",
+                 cols == {"id": "Primary key; unique.", "day": None, "amount": "Amount in cents"},
+                 cols)
+        plain = sb.client.get_table(f"{p}.{ds[key]}.facts_rpf")
+        sb.check(f"view metadata [{key}.facts_rpf]: nothing set without persist_docs/labels",
+                 plain.description is None and not plain.labels, (plain.description, plain.labels))
+
+    # ---- E2. release r2 = v2 data, row-level data diff -----------------------------------------
+    sb.write_models({"facts": facts_sql(2, False), "facts_rpf": facts_sql(2, True)})
+    sb.cli("x1 build staging r2", "build", "--env", "staging", "--release", "r2")
+    fp2 = dict(sb.fingerprints())
+    cand = sb.fq("physical", f"facts__{fp2['facts']}")
+    base = sb.fq("physical", f"facts__{fp1['facts']}")
+    oracle = diff_oracle(sb, cand, base)
+    print(f"    oracle (independent join): {oracle}")
+    sb.check("oracle matches the injected differences",
+             (oracle["only_candidate"], oracle["only_target"], oracle["changed"]) == (5, 12, 24),
+             oracle)
+
+    def diff_model(label: str, *args: str, model: str = "facts", expect_ok: bool = True):
+        res = sb.cli(label, "diff-data", "--from", "staging", "--to", "prod", "--format", "json",
+                     *args, expect_ok=expect_ok)
+        if not expect_ok:
+            return res, None
+        summary = cli_json(res)
+        return res, next(m for m in summary["models"] if m["model"] == model)
+
+    _, m = diff_model("x1 diff-data facts (default threshold)", "--select", "facts")
+    q = m["queries"]
+    sb.check("diff-data facts: counts equal the oracle",
+             (m["only_candidate"], m["only_target"], m["changed"], m["candidate_rows"],
+              m["target_rows"]) == (5, 12, 24, 2993, 3000), m)
+    sb.check("diff-data facts: changed column is amount only",
+             {k: v for k, v in m["column_mismatches"].items() if v} == {"amount": 24},
+             m["column_mismatches"])
+    sb.check("diff-data facts: mismatch_pct = 41/3000", abs(m["mismatch_pct"] - 41 * 100 / 3000) < 1e-3,
+             m["mismatch_pct"])
+    stats = job_stats(sb, DIFF_JOB_PATTERN, queries_total(q))
+    sb.check("diff-data facts: one BigQuery job per reported query", len(stats) == queries_total(q),
+             (q, len(stats)))
+    report_metrics(sb, f"diff-data facts full table {q}", stats)
+    full_processed = sum(int(r["processed"] or 0) for r in stats)
+
+    _, mb = diff_model("x1 diff-data facts (bisection)", "--select", "facts", "--threshold", "20",
+                           "--branching", "4")
+    sb.check("diff-data facts bisection: same counts as the default run",
+             (mb["only_candidate"], mb["only_target"], mb["changed"]) == (5, 12, 24)
+             and mb["segments_split"] > 0, mb)
+    report_metrics(sb, f"diff-data facts bisection {mb['queries']}",
+                   job_stats(sb, DIFF_JOB_PATTERN, queries_total(mb["queries"])))
+
+    _, mw = diff_model("x1 diff-data facts --window-days 3", "--select", "facts",
+                           "--window-days", "3")
+    win = diff_oracle(sb, cand, base, "day >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)")
+    sb.check("diff-data facts --window-days 3: counts equal the windowed oracle",
+             (mw["only_candidate"], mw["only_target"], mw["changed"]) ==
+             (win["only_candidate"], win["only_target"], win["changed"]), (mw, win))
+    wstats = job_stats(sb, DIFF_JOB_PATTERN, queries_total(mw["queries"]))
+    report_metrics(sb, f"diff-data facts --window-days 3 {mw['queries']}", wstats)
+    sb.check("window prunes partitions: fewer bytes processed than the full diff",
+             sum(int(r["processed"] or 0) for r in wstats) < full_processed,
+             (sum(int(r["processed"] or 0) for r in wstats), full_processed))
+
+    # require_partition_filter table: a plain diff cannot scan it; --window-days can.
+    res, _ = diff_model("x1 diff-data facts_rpf without a window", "--select", "facts_rpf",
+                           model="facts_rpf", expect_ok=False)
+    out = res.output  # type: ignore[attr-defined]
+    failed = job_stats(sb, DIFF_JOB_PATTERN, 1)
+    report_metrics(sb, f"diff-data facts_rpf without a window (failed jobs: "
+                   f"{sorted({str(r['err']) for r in failed})})", failed)
+    sb.check("diff-data on a require_partition_filter table needs a window",
+             "partition" in out.lower() and "filter" in out.lower(), out[-400:])
+    cand_r = sb.fq("physical", f"facts_rpf__{fp2['facts_rpf']}")
+    base_r = sb.fq("physical", f"facts_rpf__{fp1['facts_rpf']}")
+    orr = diff_oracle(sb, cand_r, base_r, "day >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)")
+    _, mr = diff_model("x1 diff-data facts_rpf --window-days 7", "--select", "facts_rpf",
+                           "--window-days", "7", model="facts_rpf")
+    sb.check("diff-data facts_rpf --window-days 7: counts equal the windowed oracle",
+             (mr["only_candidate"], mr["only_target"], mr["changed"], mr["candidate_rows"],
+              mr["target_rows"]) == (orr["only_candidate"], orr["only_target"], orr["changed"],
+                                     orr["candidate_rows"], orr["target_rows"]), (mr, orr))
+    report_metrics(sb, f"diff-data facts_rpf --window-days 7 {mr['queries']}",
+                   job_stats(sb, DIFF_JOB_PATTERN, queries_total(mr["queries"])))
+    res = sb.cli("x1 diff-data --max-mismatch-pct 1 fails (1.37% > 1)", "diff-data", "--from",
+                 "staging", "--to", "prod", "--select", "facts", "--max-mismatch-pct", "1",
+                 "--format", "json", expect_ok=False)
+    sb.check("diff-data --max-mismatch-pct gate fails above the threshold",
+             '"passed": false' in res.output, res.output[-300:])  # type: ignore[attr-defined]
+
+    # ---- E3. partition coverage audit (virtual_audit) on real partitions -----------------------
+    res = sb.cli("x1 audit r2 (30 partitions present; one table has require_partition_filter)",
+                 "audit", "--from", "staging", "--to", "prod", "--release", "r2")
+    out = res.output  # type: ignore[attr-defined]
+    sb.check("audit r2 passes incl. coverage on facts and facts_rpf",
+             "audit [facts]: OK" in out and "audit [facts_rpf]: OK" in out, out[-500:])
+    sb.cli("x1 promote r2 --audit", "promote", "--from", "staging", "--to", "prod",
+           "--release", "r2", "--audit")
+    sb.check("prod.facts -> fp2 after promote --audit",
+             f"facts__{fp2['facts']}" in sb.view_target("prod", "facts"), sb.view_target("prod", "facts"))
+
+    sb.write_models({"facts": facts_sql(3, False)})
+    sb.cli("x1 build staging r3 (windowed facts)", "build", "--env", "staging", "--release", "r3")
+    today = datetime.now(timezone.utc).date()
+    first = (today - timedelta(days=29)).strftime("%Y%m%d")
+    last = (today - timedelta(days=10)).strftime("%Y%m%d")
+    res = sb.cli("x1 audit r3 (20 partitions missing)", "audit", "--from", "staging", "--to",
+                 "prod", "--release", "r3", expect_ok=False)
+    out = res.output  # type: ignore[attr-defined]
+    sb.check("audit fails on missing partitions and lists the range",
+             "lacks 20 partition(s)" in out and f"{first}..{last} (20)" in out, out[-600:])
+    ign = (today - timedelta(days=9)).isoformat()
+    res = sb.cli("x1 audit r3 --coverage-ignore-before", "audit", "--from", "staging", "--to",
+                 "prod", "--release", "r3", "--coverage-ignore-before", ign, expect_ok=None)
+    sb.check("audit passes when the missing partitions are before --coverage-ignore-before",
+             res.returncode == 0, res.output[-400:])  # type: ignore[attr-defined]
+    res = sb.cli("x1 audit r3 --no-coverage-check", "audit", "--from", "staging", "--to", "prod",
+                 "--release", "r3", "--no-coverage-check", expect_ok=None)
+    sb.check("audit --no-coverage-check skips the check", res.returncode == 0,
+             res.output[-400:])  # type: ignore[attr-defined]
+
+    # ---- E4. gc --expire-env-days on an old unmapped environment -------------------------------
+    sb.cli("x1 init-env pr_old", "init-env", "--env", "pr_old", "--from", "prod")
+    sb.check("pr_old dataset exists", sb.objects("pr_old") is not None)
+    sb.q(f"UPDATE {sb.fq('physical', '_environments')} SET updated_at = "
+         "TIMESTAMP_SUB(updated_at, INTERVAL 40 DAY) WHERE environment IN ('pr_old', 'staging', 'prod')")
+    res = sb.cli("x1 gc --dry-run --expire-env-days 60", "gc", "--dry-run", "--expire-env-days", "60")
+    sb.check("gc --expire-env-days 60 expires nothing (40 days old)",
+             "expired environment" not in res.output, res.output[-300:])  # type: ignore[attr-defined]
+    res = sb.cli("x1 gc --dry-run --expire-env-days 30", "gc", "--dry-run", "--expire-env-days", "30")
+    out = res.output  # type: ignore[attr-defined]
+    sb.check("gc dry run lists only pr_old (mapped staging/prod are protected)",
+             "Would drop expired environment pr_old" in out
+             and "expired environment staging" not in out and "expired environment prod" not in out,
+             out[-400:])
+    sb.check("dry run dropped nothing", sb.objects("pr_old") is not None)
+    sb.cli("x1 gc --expire-env-days 30", "gc", "--expire-env-days", "30")
+    sb.check("pr_old dataset dropped by gc", sb.objects("pr_old") is None)
+    sb.check("pr_old pointers removed", sb.registry("_environments", "environment = 'pr_old'") == [])
+    rows_now = sb.q(f"SELECT COUNT(*) AS n FROM {sb.fq('prod', 'facts')}")[0]["n"]
+    sb.check("prod view intact after gc; staging and prod pointers kept",
+             rows_now == 2993 and len(sb.registry("_environments", "environment = 'staging'")) == 2
+             and len(sb.registry("_environments", "environment = 'prod'")) == 2,
+             rows_now)
+
+
+def extended_cross_location(sb: Sandbox) -> None:
+    """Promote-by-clone between two datasets in one project (two `physical_locations` that differ
+    by schema only). A cross-PROJECT clone would need a second project and is not exercised."""
+    p = sb.project
+    x = f"{sb.sbx}_x2"
+    ds = {"physical": f"{x}_phys_ci", "phys_prod": f"{x}_phys_prod", "staging": f"{x}_stg",
+          "prod": f"{x}_prod"}
+    locs = {"prod": {"database": p, "schema": ds["phys_prod"]},
+            "default": {"database": p, "schema": ds["physical"]}}
+    orders = "{{ config(materialized='table', unique_key='id') }}\nselect id, amount from {{ ref('events') }}\n"
+    tvf = ("{{ config(materialized='table_function', parameters='min_amount INT64') }}\n"
+           "select id, amount from {{ ref('orders') }} where amount >= min_amount\n")
+    ext_project(sb, "proj_x2", ds, {"physical_locations": locs},
+                {"events": EVENTS_V1, "orders": orders, "big_orders": tvf})
+    print(f"\n=== extended 2: two locations (schemas), datasets {x}_* ===")
+
+    def phys_prod_tables() -> dict[str, str]:
+        rows = sb.q(f"SELECT table_name, table_type FROM "
+                    f"`{p}`.`{ds['phys_prod']}`.INFORMATION_SCHEMA.TABLES")
+        return {r["table_name"]: r["table_type"] for r in rows}
+
+    sb.cli("x2 build staging b1 (CI location)", "build", "--env", "staging", "--release", "b1")
+    fp1 = dict(sb.fingerprints())
+    ci = sb.objects("physical") or {}
+    sb.check("b1 built in the CI location only",
+             f"events__{fp1['events']}" in ci and sb.objects("phys_prod") is None,
+             (sorted(ci), sb.objects("phys_prod")))
+    sb.cli("x2 promote b1 (target prod, clone across locations)", "promote", "--target", "prod",
+           "--from", "staging", "--to", "prod", "--release", "b1")
+    tabs = phys_prod_tables()
+    sb.check("b1 tables cloned into the prod location (table_type CLONE)",
+             all(tabs.get(f"{m}__{fp1[m]}") == "CLONE" for m in ("events", "orders")), tabs)
+    sb.check("prod views point at the clones, not at the CI location",
+             all(f"{ds['phys_prod']}`.`{m}__{fp1[m]}" in sb.view_target("prod", m)
+                 and ds["physical"] not in sb.view_target("prod", m) for m in ("events", "orders")),
+             sb.view_target("prod", "orders"))
+    body = sb.routine_body("prod", "big_orders")
+    sb.check("prod TVF reads the prod env dataset",
+             f"{ds['prod']}`.`orders`" in body and ds["staging"] not in body, body)
+    pointers = {r["model_name"] for r in sb.q(
+        f"SELECT model_name FROM `{p}`.`{ds['phys_prod']}`._environments WHERE environment = 'prod'")}
+    rel = sb.q(f"SELECT DISTINCT status, source_environment FROM `{p}`.`{ds['phys_prod']}`._releases "
+               "WHERE release_id = 'b1'")
+    sb.check("prod registry holds the pointers and the release (source = staging)",
+             pointers == {"events", "orders", "big_orders"}
+             and rel == [{"status": "promoted", "source_environment": "staging"}], (pointers, rel))
+    sb.check("prod rows via views",
+             [r["id"] for r in sb.q(f"SELECT id FROM {sb.fq('prod', 'orders')} ORDER BY id")] == [1, 2, 3])
+    sb.check("prod TVF works", tvf_ids(sb, "prod", 20) == [2, 3], tvf_ids(sb, "prod", 20))
+    sb.cli("x2 promote b1 again (idempotent)", "promote", "--target", "prod", "--from", "staging",
+           "--to", "prod", "--release", "b1")
+    sb.check("idempotent: release rows not duplicated", sb.q(
+        f"SELECT COUNT(*) AS n FROM `{p}`.`{ds['phys_prod']}`._releases WHERE release_id = 'b1'"
+    )[0]["n"] == 3)
+
+    # The source goes away: the clones are independent of it.
+    for key in ("physical", "staging"):
+        sb.client.delete_dataset(f"{p}.{ds[key]}", delete_contents=True, not_found_ok=True)
+    sb.check("CI location and staging dataset dropped",
+             sb.objects("physical") is None and sb.objects("staging") is None)
+    sb.check("prod views still work after the source was dropped",
+             [r["id"] for r in sb.q(f"SELECT id FROM {sb.fq('prod', 'events')} ORDER BY id")] == [1, 2, 3]
+             and tvf_ids(sb, "prod", 20) == [2, 3])
+
+    # CI seeds an incremental model from the prod location (clone prod -> CI), then promotes again.
+    sb.write_models({"events": EVENTS_V2})
+    sb.cli("x2 build staging b2 (seed from the prod location)", "build", "--env", "staging",
+           "--release", "b2")
+    fp2 = dict(sb.fingerprints())
+    rows = [(r["id"], r["v"], r["amount"]) for r in sb.q(
+        f"SELECT id, v, amount FROM {sb.fq('physical', 'events__' + fp2['events'])} ORDER BY id")]
+    sb.check("CI events__<fp2> = clone of prod's table + delta only",
+             rows == [(1, "a", 10), (2, "b", 25), (3, "c", 40), (4, "D", 55)], rows)
+    # The gates compare the release (CI location) with prod (its own location).
+    res = sb.cli("x2 diff-data b2 vs prod (CI target)", "diff-data", "--from", "staging", "--to",
+                 "prod", "--release", "b2", "--format", "json", expect_ok=None)
+    dd = {mm["model"]: mm for mm in cli_json(res)["models"]} if res.returncode == 0 else {}  # type: ignore[attr-defined]
+    sb.check("diff-data across locations compares b2 with prod's tables (1 new row each)",
+             all(dd.get(n, {}).get("status") == "differs" and dd[n]["only_candidate"] == 1
+                 and dd[n]["only_target"] == 0 and dd[n]["changed"] == 0 for n in ("events", "orders")),
+             {n: (mm.get("status"), mm.get("only_candidate")) for n, mm in dd.items()})
+    res = sb.cli("x2 audit b2 vs prod (CI target)", "audit", "--from", "staging", "--to", "prod",
+                 "--release", "b2", expect_ok=None)
+    sb.check("audit across locations reads prod's row counts",
+             "audit [events]: OK (candidate=4 rows, prod=3 rows)" in res.output,  # type: ignore[attr-defined]
+             res.output[-500:])  # type: ignore[attr-defined]
+    res = sb.cli("x2 promote b2 --data-diff --max-mismatch-pct 0 (must fail)", "promote",
+                 "--target", "prod", "--from", "staging", "--to", "prod", "--release", "b2",
+                 "--data-diff", "--max-mismatch-pct", "0", expect_ok=None)
+    sb.check("promote --data-diff across locations really diffs (b2 differs from prod: refused)",
+             res.returncode != 0 and "data diff failed" in res.output,  # type: ignore[attr-defined]
+             (res.returncode, res.output[-500:]))  # type: ignore[attr-defined]
+    sb.check("a refused promote changed nothing: prod.events still -> fp1",
+             f"events__{fp1['events']}" in sb.view_target("prod", "events"))
+    sb.cli("x2 promote b2 (target prod)", "promote", "--target", "prod", "--from", "staging",
+           "--to", "prod", "--release", "b2")
+    sb.check("prod.events -> fp2 clone in the prod location",
+             f"{ds['phys_prod']}`.`events__{fp2['events']}" in sb.view_target("prod", "events")
+             and phys_prod_tables().get(f"events__{fp2['events']}") == "CLONE", phys_prod_tables())
+    sb.check("prod TVF sees the 4th row", tvf_ids(sb, "prod", 0) == [1, 2, 3, 4], tvf_ids(sb, "prod", 0))
+    sb.cli("x2 rollback prod", "rollback", "--target", "prod", "--env", "prod")
+    sb.check("rollback to b1 works across locations: prod.events -> fp1",
+             f"events__{fp1['events']}" in sb.view_target("prod", "events"), sb.view_target("prod", "events"))
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--project", default=os.environ.get("DBT_VIRTUAL_SBX_PROJECT"))
@@ -557,6 +1025,12 @@ def main() -> int:
     ap.add_argument("--dbt-bin-dir", default=None,
                     help="Directory with the dbt executable (default: this Python's).")
     ap.add_argument("--keep", action="store_true", help="Do not drop the sandbox datasets.")
+    ap.add_argument("--extended", action="store_true",
+                    help="Also run the opt-in checks of the newer features (see the module docstring).")
+    ap.add_argument("--only-extended", action="store_true",
+                    help="Run only the --extended checks, not the base lifecycle.")
+    ap.add_argument("--only-cross-location", action="store_true",
+                    help="Run only the cross-location extended project (implies --only-extended).")
     ns = ap.parse_args()
     if not ns.project:
         ap.error("--project or DBT_VIRTUAL_SBX_PROJECT is required")
@@ -566,25 +1040,36 @@ def main() -> int:
         raise SystemExit(f"datasets with prefix {sb.sbx} already exist; pick another --run-id")
     print(f"sandbox prefix: {sb.sbx}  workdir: {sb.root}")
     sb.write_project()
-    failed_step = None
+    step_failures: list[str] = []
+    steps = []
+    if not ns.only_extended:
+        steps.append(lifecycle)
+    if ns.only_cross_location:
+        steps = [extended_cross_location]
+    elif ns.extended or ns.only_extended:
+        steps += [extended_single_location, extended_cross_location]
     try:
-        lifecycle(sb)
-    except StepError as exc:
-        failed_step = str(exc)
-        print(f"\nSTEP FAILED: {exc}")
+        for step in steps:
+            try:
+                step(sb)
+            except StepError as exc:
+                step_failures.append(str(exc))
+                print(f"\nSTEP FAILED in {step.__name__}: {exc}")
     finally:
         if sb.keep:
             print(f"--keep: sandbox datasets left in place: {sb.sandbox_datasets()}")
         else:
             print(f"dropped sandbox datasets: {sb.cleanup()}")
             print(f"remaining with prefix {sb.sbx}: {sb.sandbox_datasets()}")
+    for line in sb.metrics:
+        print(line)
 
     failures = [r for r in sb.results if not r[1]]
     print(f"\n{len(sb.results) - len(failures)}/{len(sb.results)} checks passed"
-          + (f"; aborted at a step: {failed_step.splitlines()[0]}" if failed_step else ""))
+          + "".join(f"; aborted at a step: {f.splitlines()[0]}" for f in step_failures))
     for name, _, detail in failures:
         print(f"  FAIL {name}: {detail[:300]}")
-    return 1 if failures or failed_step else 0
+    return 1 if failures or step_failures else 0
 
 
 if __name__ == "__main__":

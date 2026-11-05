@@ -471,6 +471,11 @@
     acquired_at TIMESTAMP,
     expires_at TIMESTAMP
   );
+  {%- set locks_key_sql = dbt_virtual.locks_unique_index_sql(dbt_virtual.qualify_schema(database, physical_schema) ~ '._locks') | trim %}
+  {%- if locks_key_sql != '' %}
+
+  {{ locks_key_sql }};
+  {%- endif %}
 
   CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._intervals (
     model_name VARCHAR,
@@ -501,6 +506,101 @@
   ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
   ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
   ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS sealed_at TIMESTAMP
+{%- endmacro %}
+
+
+{% macro locks_unique_index_sql(locks_rel) -%}
+  {#- Unique index that makes `_locks(environment)` a key where the warehouse enforces it (DuckDB, PostgreSQL). -#}
+  {{ return(adapter.dispatch('locks_unique_index_sql', 'dbt_virtual')(locks_rel)) }}
+{%- endmacro %}
+
+{% macro default__locks_unique_index_sql(locks_rel) -%}
+{%- endmacro %}
+
+{% macro duckdb__locks_unique_index_sql(locks_rel) -%}
+  CREATE UNIQUE INDEX IF NOT EXISTS _locks_environment_uq ON {{ locks_rel }} (environment)
+{%- endmacro %}
+
+{% macro postgres__locks_unique_index_sql(locks_rel) -%}
+  CREATE UNIQUE INDEX IF NOT EXISTS _locks_environment_uq ON {{ locks_rel }} (environment)
+{%- endmacro %}
+
+
+{% macro locks_unique_index_exists_sql(phys_schema) -%}
+  {#- A query that returns a row when `_locks` has the unique index; empty text: no such index on this adapter. -#}
+  {{ return(adapter.dispatch('locks_unique_index_exists_sql', 'dbt_virtual')(phys_schema)) }}
+{%- endmacro %}
+
+{% macro default__locks_unique_index_exists_sql(phys_schema) -%}
+{%- endmacro %}
+
+{% macro duckdb__locks_unique_index_exists_sql(phys_schema) -%}
+  SELECT 1 FROM duckdb_indexes() WHERE index_name = '_locks_environment_uq' AND schema_name = '{{ phys_schema }}'
+{%- endmacro %}
+
+{% macro postgres__locks_unique_index_exists_sql(phys_schema) -%}
+  SELECT 1 FROM pg_indexes WHERE indexname = '_locks_environment_uq' AND schemaname = '{{ phys_schema }}'
+{%- endmacro %}
+
+
+{% macro ensure_locks_unique_key(phys_schema, locks_rel) -%}
+  {#- Upgrade of a registry created before the unique key (v0.1.0, v0.2.0): keep the latest lease per
+      environment, then create the unique index. Runs only while the index is missing, i.e. once; two
+      runners upgrading in the same instant may see one fail on the index DDL, and a retry succeeds. -#}
+  {%- set exists_sql = dbt_virtual.locks_unique_index_exists_sql(phys_schema) | trim -%}
+  {%- if exists_sql != '' -%}
+    {%- set found = run_query(exists_sql) -%}
+    {%- if not found or (found.rows | length) == 0 -%}
+      {%- do dbt_virtual.exec_sql_statement(
+        "DELETE FROM " ~ locks_rel ~ " WHERE EXISTS (SELECT 1 FROM " ~ locks_rel ~ " o WHERE o.environment = " ~ locks_rel ~ ".environment"
+        ~ " AND (o.acquired_at > " ~ locks_rel ~ ".acquired_at OR (o.acquired_at = " ~ locks_rel ~ ".acquired_at AND o.owner > " ~ locks_rel ~ ".owner)))"
+      ) -%}
+      {%- do dbt_virtual.exec_sql_statement(dbt_virtual.locks_unique_index_sql(locks_rel)) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro lock_upsert_sql(locks_rel, env, owner, ttl_minutes) -%}
+  {#- The single conditional statement of `virtual_acquire_lock`: writes (or refreshes) the lease of `owner`
+      unless another owner's lease on `env` is live; an expired lease is taken over. -#}
+  {{ return(adapter.dispatch('lock_upsert_sql', 'dbt_virtual')(locks_rel, env, owner, ttl_minutes)) }}
+{%- endmacro %}
+
+{% macro default__lock_upsert_sql(locks_rel, env, owner, ttl_minutes) -%}
+  INSERT INTO {{ locks_rel }} AS l (environment, owner, acquired_at, expires_at)
+  VALUES ('{{ env }}', '{{ owner }}', {{ dbt_virtual.current_timestamp_sql() }}, {{ dbt_virtual.timestamp_add_minutes_sql(ttl_minutes) }})
+  ON CONFLICT (environment) DO UPDATE
+    SET owner = EXCLUDED.owner, acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at
+    WHERE l.owner = EXCLUDED.owner OR l.expires_at <= EXCLUDED.acquired_at
+{%- endmacro %}
+
+{% macro lock_merge_sql(locks_rel, env, owner, ttl_minutes) -%}
+  MERGE INTO {{ locks_rel }} AS t
+  USING (
+    SELECT '{{ env }}' AS environment, '{{ owner }}' AS owner,
+           {{ dbt_virtual.current_timestamp_sql() }} AS acquired_at,
+           {{ dbt_virtual.timestamp_add_minutes_sql(ttl_minutes) }} AS expires_at
+  ) AS s
+  ON t.environment = s.environment
+  WHEN MATCHED AND (t.owner = s.owner OR t.expires_at <= s.acquired_at) THEN
+    UPDATE SET owner = s.owner, acquired_at = s.acquired_at, expires_at = s.expires_at
+  WHEN NOT MATCHED THEN
+    INSERT (environment, owner, acquired_at, expires_at)
+    VALUES (s.environment, s.owner, s.acquired_at, s.expires_at)
+{%- endmacro %}
+
+{% macro bigquery__lock_upsert_sql(locks_rel, env, owner, ttl_minutes) -%}
+  {{ return(dbt_virtual.lock_merge_sql(locks_rel, env, owner, ttl_minutes)) }}
+{%- endmacro %}
+
+{% macro snowflake__lock_upsert_sql(locks_rel, env, owner, ttl_minutes) -%}
+  {#- TECH_DEBT(snowflake_lock_not_constraint_enforced): no enforced key; relies on MERGE serialization. -#}
+  {{ return(dbt_virtual.lock_merge_sql(locks_rel, env, owner, ttl_minutes)) }}
+{%- endmacro %}
+
+{% macro databricks__lock_upsert_sql(locks_rel, env, owner, ttl_minutes) -%}
+  {{ return(dbt_virtual.lock_merge_sql(locks_rel, env, owner, ttl_minutes)) }}
 {%- endmacro %}
 
 

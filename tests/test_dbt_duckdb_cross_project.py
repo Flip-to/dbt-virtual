@@ -109,3 +109,33 @@ def test_ci_seeds_an_incremental_model_from_the_prod_location(tmp_path) -> None:
     assert rows == [(1, "a"), (2, "b"), (3, "c"), (4, "D")]
     # Prod is untouched.
     assert proj.query("SELECT count(*) FROM phys_prod._environments") == [(1,)]
+
+
+def test_gates_compare_with_prod_in_its_own_location(project: Project) -> None:
+    """`virtual_data_diff` and `virtual_audit` run from the CI target read prod's registry from the prod
+    location. Before the fix every model was `new` and `promote --data-diff` diffed nothing."""
+    import json
+
+    project.build("staging", "r1")
+    project.operation(
+        "virtual_promote", {"from_env": "staging", "to_env": "prod", "release_id": "r1", "lock": True}, env="prod"
+    )
+    project.write_models({"orders": _table_model("select 1 as id, 11 as amount")})
+    project.build("staging", "r2")
+
+    res = project.operation("virtual_data_diff", {"from_env": "staging", "to_env": "prod", "release_id": "r2"})
+    line = next(x for x in res.stdout.splitlines() if "DBT_VIRTUAL_DIFF_JSON:" in x)
+    model = json.loads(line.split("DBT_VIRTUAL_DIFF_JSON:", 1)[1])["models"][0]
+    assert model["status"] == "differs"
+
+    # The promote gate reads the not yet cloned release from the CI location and fails on the change.
+    bad = project.operation(
+        "virtual_promote",
+        {"from_env": "staging", "to_env": "prod", "release_id": "r2", "data_diff": True, "data_diff_max_mismatch_pct": 0},
+        env="prod",
+        expect_ok=False,
+    )
+    assert "data diff failed" in bad.stdout + bad.stderr
+
+    audit = project.operation("virtual_audit", {"from_env": "staging", "to_env": "prod", "release_id": "r2"})
+    assert "(new model" not in audit.stdout
