@@ -2,74 +2,93 @@
 
 `dbt-virtual` can be operated either through the **`dbt-virtual` Python CLI** (recommended) or directly via **`dbt run-operation`** macros.
 
+Every subcommand accepts the global flag `--project-dir <path>` (default: current directory) before the subcommand name, e.g. `dbt-virtual --project-dir ./analytics plan --env staging`.
+
+!!! note "`--env` is also the dbt target for `plan` and `build`"
+    `plan` and `build` pass `--target <env>` to every dbt command they run, so `profiles.yml` needs an output with the environment's name (`staging`, `prod`, `pr_42`, ...). The other subcommands run `dbt run-operation` with your profile's default target. For a PR environment, write an output named after it in the CI job's `profiles.yml`.
+
 ---
 
 ## 1. CLI Subcommands (`dbt-virtual`)
 
 ### `dbt-virtual plan`
-Computes Merkle-DAG fingerprints from `target/manifest.json`, writes `target/virtual_fingerprints.json`, and classifies each virtualized node (`REUSE`, `SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`).
+Runs `dbt compile --target <env>` (unless `--skip-compile`), computes Merkle-DAG fingerprints from `target/manifest.json`, writes `.dbt_virtual/fingerprints.json`, and classifies each virtualized node (`REUSE`, `SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`).
 
 ```bash
-dbt-virtual plan \
-  --env staging \
-  --base-env prod \
-  --manifest target/manifest.json \
-  --output target/virtual_fingerprints.json
+dbt-virtual status --env staging --base-env prod --output state.json
+dbt-virtual plan --env staging --state-file state.json
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--env` | `"staging"` | Target virtual environment name. |
-| `--base-env` | `"prod"` | Reference base environment for `SEED_INCREMENTAL` detection. |
-| `--manifest` | `target/manifest.json` | Path to compiled dbt manifest. |
-| `--state-file` | `None` | Optional JSON file from `dbt-virtual status --output state.json` with live warehouse pointers. |
-| `--schema` | `["analytics_staging", "analytics"]` | Repeatable flag for known environment schemas to strip during SQL normalization. |
-| `--format` | `"text"` | Output format: `"text"` (table) or `"json"`. |
+| `--env` | `"staging"` | Target virtual environment name (also used as the dbt `--target`). |
+| `--state-file` | `None` | JSON file from `dbt-virtual status --output state.json` with live warehouse pointers. Without it, nothing is classified `REUSE` or `SEED_INCREMENTAL`. A physical table is only `REUSE` when it exists **and** the registry points at it (`registered_physical_tables`), so a table left by a failed build is rebuilt. |
+| `--skip-compile` | `False` | Reuse the existing `target/manifest.json`. |
+| `--known-schema` | none | Repeatable. Extra schema names to strip from SQL before hashing. Rarely needed now that ref locations are stripped automatically; see [How It Works](how_it_works.md) for when it still is. |
+| `--format` | `"text"` | Output format: `"text"` or `"json"`. |
+
+The base environment for `SEED_INCREMENTAL` detection is the `base_env_state` of the state file (`status --base-env`); there is no `--base-env` flag on `plan`.
 
 ---
 
 ### `dbt-virtual build`
-Computes fingerprints, syncs views for `REUSE` models in **zero compute**, and invokes `dbt build` only for models that require `FULL_BUILD`, `SEED_INCREMENTAL`, or `ROUTINE_DEPLOY`.
+Computes fingerprints, syncs views for `REUSE` models in **zero compute**, seeds incremental clones, invokes `dbt build` only for models that require `FULL_BUILD`, `SEED_INCREMENTAL`, or `ROUTINE_DEPLOY`, and completes the release.
 
 ```bash
 dbt-virtual build \
   --env staging \
+  --state-file state.json \
   --release v2026.10.27 \
   --start 2026-10-01 \
   --end 2026-10-27
 ```
 
+What it runs, in order. Every dbt call gets `--target <env>` and the same `--vars` (`_dbt_virtual_fps`, `_dbt_virtual_env`, `_dbt_virtual_release`, and `_dbt_virtual_start` / `_dbt_virtual_end` when set), so node schemas and aliases match what dbt builds:
+
+1. `dbt compile` (unless `--skip-compile`), fingerprints, plan.
+2. `dbt run-operation virtual_sync_reused_views` for `REUSE` tables: re-points their environment views and pointers.
+3. `dbt run-operation virtual_seed_incremental_clones` for `SEED_INCREMENTAL` models: clones the base environment's table before dbt starts.
+4. `dbt build --select <models to build>` (or your `--select`).
+5. `dbt run-operation virtual_snapshot_release` when `--release` is set: adds every other virtual node's current pointer to the release, so the release describes the whole environment.
+
+If nothing needs building and no `--select` is given, step 4 is skipped (no unscoped `dbt build`).
+
 | Flag | Default | Description |
 |---|---|---|
-| `--env` | `"staging"` | Target virtual environment to build. |
-| `--base-env` | `"prod"` | Base environment for incremental clone seeding. |
+| `--env` | `"staging"` | Target virtual environment to build (also used as the dbt `--target`). |
 | `--release` | `""` | Release identifier recorded in `_releases` and `_environments`. |
-| `--start` | `""` | Optional interval start timestamp/date recorded in `_intervals`. |
-| `--end` | `""` | Optional interval end timestamp/date recorded in `_intervals`. |
-| `--select` | `""` | Optional dbt node selector override. |
-| `--dry-run` | `False` | Print the `dbt` commands that would run without executing them. |
+| `--state-file` | `None` | Warehouse state from `dbt-virtual status --output`, used to skip `REUSE` models. |
+| `--select` | `None` | dbt `--select` expression that overrides the planned selection. |
+| `--full-refresh` | `False` | Plan every table/incremental model as `FULL_BUILD` and pass `--full-refresh` to dbt. |
+| `--start` | `None` | Optional interval start timestamp/date recorded in `_intervals`. |
+| `--end` | `None` | Optional interval end timestamp/date recorded in `_intervals`. |
+| `--skip-compile` | `False` | Reuse the existing `target/manifest.json`. |
+| `--known-schema` | none | Same as on `plan`. |
+
+The clone source is `vars.dbt_virtual.base_environment`; `build` has no `--base-env` or `--dry-run` flag. Use `dbt-virtual plan` to preview.
 
 ---
 
 ### `dbt-virtual diff`
-Performs AST-level and manifest-level column schema diffing between a base `manifest.json` (e.g. `prod`) and candidate `manifest.json` (`staging`), classifying every change as:
-- **`NON_BREAKING`**: `COLUMN_ADDED`
-- **`TYPE_WIDENED`** *(Non-breaking)*: Compatible type widening (`INT64 -> NUMERIC / FLOAT64 / BIGNUMERIC`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`, or synonyms like `INT == INT64`)
-- **`BREAKING`**: removed models, `COLUMN_REMOVED`, or incompatible/narrowing `TYPE_CHANGED` (`FLOAT64 -> INT64`, `STRING -> INT64`)
+Performs AST-level and manifest-level column schema diffing between a base `manifest.json` (e.g. `prod`) and a candidate `manifest.json` (`staging`). Each column change is `ADDED`, `DROPPED`, `TYPE_WIDENED` (compatible widening such as `INT64 -> NUMERIC / FLOAT64 / BIGNUMERIC`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`; synonyms like `INT == INT64` are not changes) or `TYPE_CHANGED`. A model is **`BREAKING`** when it was removed or has a `DROPPED` / `TYPE_CHANGED` column, otherwise **`NON_BREAKING`**.
 
 ```bash
 dbt-virtual diff \
   --base-manifest prod_manifest.json \
-  --curr-manifest target/manifest.json \
+  --target-manifest target/manifest.json \
   --fail-on-breaking
 ```
+
+`--target-manifest` defaults to `target/manifest.json`; `--fail-on-breaking` exits with code `2` on breaking changes; `--format json` prints JSON.
 
 ---
 
 ### `dbt-virtual audit`
 Runs the pre-promotion warehouse quality gate (`virtual_audit` macro), verifying that:
 1. Every candidate physical table in the release is non-empty (unless `--allow-empty` is passed).
-2. No model's row count dropped by more than `--max-row-drop-pct` compared to `to_env` (`prod`).
+2. No model's row count dropped by more than `--max-row-drop-pct` compared to `--to` (`prod`).
+
+On BigQuery the row counts come from the dataset's `__TABLES__` metadata, because `COUNT(*)` fails on tables created with `require_partition_filter = true`; other adapters use `COUNT(*)`.
 
 ```bash
 dbt-virtual audit \
@@ -83,11 +102,12 @@ dbt-virtual audit \
 
 ### `dbt-virtual promote`
 Executes zero-rebuild promotion from `--from` (`staging`) to `--to` (`prod`):
-1. Optionally runs `virtual_audit` when `--audit` is passed.
-2. Verifies all physical tables exist in `physical_schema`.
-3. Skips re-executing DDL for models/routines whose fingerprint is already active in `--to` (partial promotion).
-4. Deploys updated objects in strict tier order (`Tier 1 UDFs -> Tier 2 Views -> Tier 3 TVFs -> Tier 4 Procedures`).
-5. Automatically **demotes** (`DROP VIEW IF EXISTS` / `DROP FUNCTION IF EXISTS`) any object previously in `--to` that was removed from the release.
+1. Takes the lease lock on `--to` in `_locks` (skip with `--no-lock`); it is released when the promote finishes.
+2. Optionally runs `virtual_audit` when `--audit` is passed.
+3. Verifies all physical tables of the release exist in `physical_schema`.
+4. Skips objects whose fingerprint is already active in `--to` (partial promotion).
+5. Deploys **environment views first**, then **routines in DAG order** (each after the views and routines it reads; at equal depth UDFs, then table functions, then procedures), each into the target environment's schema for its custom schema.
+6. **Demotes** (`DROP VIEW` / `DROP FUNCTION` / ...) objects active in `--to` that are not in the release **and** are no longer virtual nodes in the project.
 
 ```bash
 dbt-virtual promote \
@@ -98,10 +118,19 @@ dbt-virtual promote \
   --max-row-drop-pct 15.0
 ```
 
+| Flag | Default | Description |
+|---|---|---|
+| `--from` / `--to` | `staging` / `prod` | Source and target environments. |
+| `--release` | required | Release to promote. |
+| `--audit` | `False` | Run the `audit` gate first. |
+| `--max-row-drop-pct` | `100.0` | Row-drop threshold for `--audit`. |
+| `--no-lock` | `False` | Do not take the lease lock. |
+| `--lock-owner` | `dbt-virtual-cli:<user>@<host>` | Lease owner. The default is stable per user and machine, so a promote that failed while holding the lock can be retried right away; in CI pass the job's own lock owner if it already holds the lock. |
+
 ---
 
 ### `dbt-virtual rollback`
-Instantly repoints all views and redeploys all routines in `--env` (`prod`) to the target release (or the most recent prior promoted release if `--to-release` is omitted):
+Instantly repoints all views and redeploys all routines in `--env` (`prod`) to the target release (or the previous promoted release if `--to-release` is omitted). It takes the same lease lock as `promote` (`--no-lock`, `--lock-owner`) and first checks that every physical table of the target release still exists, failing before any change if `gc` dropped one. Undone releases are marked `rolled_back`, so running it again goes one more release back:
 
 ```bash
 # Roll back prod to the immediately preceding release
@@ -114,7 +143,7 @@ dbt-virtual rollback --env prod --to-release v2026.10.26
 ---
 
 ### `dbt-virtual status`
-Queries `_environments` and `INFORMATION_SCHEMA.TABLES` in the warehouse via `virtual_export_state` and outputs the live warehouse state as JSON or text. Can also save to `--output state.json` to feed into `dbt-virtual plan --state-file state.json`.
+Queries `_environments` and the physical schema's table list via `virtual_export_state` and prints the live warehouse state. `--output state.json` saves it for `plan --state-file` / `build --state-file`.
 
 ```bash
 dbt-virtual status --env staging --base-env prod --output state.json
@@ -123,20 +152,22 @@ dbt-virtual status --env staging --base-env prod --output state.json
 ---
 
 ### `dbt-virtual init-env` & `dbt-virtual drop-env`
-Bootstraps an ephemeral PR/developer environment in **0 compute** by copying view pointers from `prod`, and tears down the schema when the PR closes:
+Bootstraps an ephemeral PR/developer environment in **0 compute** by promoting `--from`'s active pointers (views and routines) into it, and tears it down when the PR closes:
 
 ```bash
 # Create analytics_pr_42 views pointing to prod's physical tables in 0 compute
 dbt-virtual init-env --env pr_42 --from prod
 
-# Drop analytics_pr_42 schema and clean up _environments rows
+# Drop the schema(s) of pr_42 and its _environments rows
 dbt-virtual drop-env --env pr_42
 ```
+
+`drop-env` drops every schema the environment used (one per custom schema for a mapped environment) with `CASCADE`, and refuses to run when the environment is `base_environment` or when one of those schemas is `physical_schema` or belongs to another environment listed in `env_schemas`. Physical tables are never dropped; `gc` handles them.
 
 ---
 
 ### `dbt-virtual gc`
-Janitor garbage collector that finds and drops orphaned `<model>__<fp>` physical tables in `physical_schema` that are not referenced by any active environment in `_environments`, not within the last `retention_releases` releases in `_releases`, and older than `retention_days`:
+Janitor garbage collector that finds and drops orphaned `<model>__<fp>` physical tables in `physical_schema` that are not referenced by any active environment in `_environments`, not within the last `retention_releases` releases **of any environment** in `_releases`, and older than `retention_days`:
 
 ```bash
 # Preview orphaned physical tables
@@ -148,13 +179,22 @@ dbt-virtual gc --retention-releases 5 --retention-days 7
 
 ---
 
+### `dbt-virtual adopt`
+Zero-compute migration of an existing deployment: runs `dbt compile`, computes fingerprints, and for every virtual `table` / `incremental` model clones `<env_schema>.<model>` into `<physical_schema>.<model>__<fp>`, replaces the table with a view (unless `--keep-existing-table`), and registers it. Routines are not adopted; the first `build` + `promote` registers them. See [Migrating an Existing Project](migrating_existing_project.md).
+
+```bash
+dbt-virtual adopt --env prod --release v_initial_adopt [--keep-existing-table] [--skip-compile] [--known-schema <schema>]
+```
+
+---
+
 ## 2. Direct `dbt run-operation` Macros
 
 Every lifecycle operation can also be called directly via `dbt run-operation` without the Python CLI:
 
 ```bash
-# Promote
-dbt run-operation virtual_promote --args '{from_env: staging, to_env: prod, release_id: v1, audit: true}'
+# Promote (the macro takes the lock only when asked: lock: true, lock_owner: <name>)
+dbt run-operation virtual_promote --args '{from_env: staging, to_env: prod, release_id: v1, audit: true, lock: true}'
 
 # Audit
 dbt run-operation virtual_audit --args '{from_env: staging, to_env: prod, release_id: v1, max_row_drop_pct: 10.0}'
@@ -172,4 +212,19 @@ dbt run-operation virtual_drop_env --args '{env: pr_42}'
 
 # Garbage Collection
 dbt run-operation virtual_gc --args '{dry_run: true, retention_releases: 5, retention_days: 7}'
+
+# Export state (prints a DBT_VIRTUAL_STATE_JSON:{...} log line)
+dbt run-operation virtual_export_state --args '{env: staging, base_env: prod}'
+```
+
+The steps `dbt-virtual build` runs around `dbt build` are macros too. When you call them yourself, pass the same `--target` and `--vars` as the `dbt build` they belong to:
+
+```bash
+# Before dbt build: clone base tables of changed incremental models
+dbt run-operation virtual_seed_incremental_clones --target staging \
+  --args '{model_names: [orders_metrics]}' --vars "$VARS"
+
+# After dbt build: complete the release with the environment's unchanged objects
+dbt run-operation virtual_snapshot_release --target staging \
+  --args '{env: staging, release_id: v1, models_json: {orders_metrics: {materialized: incremental}}}' --vars "$VARS"
 ```

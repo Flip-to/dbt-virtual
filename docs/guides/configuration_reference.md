@@ -6,7 +6,7 @@ This page documents every configuration parameter supported by `dbt-virtual`, bo
 
 ## 1. Complete `dbt_project.yml` Example
 
-Here is the standard `vars.dbt_virtual` block in `dbt_project.yml`:
+Here is the standard `vars.dbt_virtual` block in `dbt_project.yml`, for a project whose environments each expose their models in one schema:
 
 ```yaml
 vars:
@@ -15,13 +15,21 @@ vars:
     physical_schema: "analytics_physical"
     environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"
     base_environment: "prod"
-    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid'
+    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid', 'explicit'
     env_schemas:
       staging: "analytics_staging"
       prod: "analytics"
     retention_releases: 5
     retention_days: 7
+
+on-run-start:
+  # Clone the base environment's table for changed incremental models BEFORE dbt materializes them.
+  - "{{ dbt_virtual.seed_incremental_clones() }}"
 ```
+
+A project that publishes to **several datasets** in production (for example marts in `analytics` and `analytics_gold`, table functions in a dataset that applications query) maps each environment to a set of schemas instead; see [`env_schemas`](#env_schemas) below for the full BigQuery example.
+
+Always set the keys you rely on: `vars` are not deep-merged, so a `vars.dbt_virtual` block in your project replaces the package's own block as a whole, and any key you leave out takes the built-in default listed below (`macros/fingerprint/get_fingerprint.sql`, `get_config`).
 
 ---
 
@@ -33,35 +41,41 @@ vars:
 - **What it does**:
   Master kill-switch for `dbt-virtual`. When set to `true`, models with `virtual_env: true` are routed to `physical_schema` with content-addressed `<model>__<fp>` aliases and managed via virtual views.
 - **When to change it**:
-  Set `enabled: false` (or pass `--vars '{"dbt_virtual": {"enabled": false}}'`) if you ever want to temporarily bypass virtual environments and run standard in-place dbt builds.
+  Set `enabled: false` if you ever want to temporarily bypass virtual environments and run standard in-place dbt builds. Because `--vars` replaces the whole `dbt_virtual` mapping, pass the complete block with `enabled: false`, or set it in `dbt_project.yml`.
 
 ---
 
 ### `physical_schema`
 - **Type**: `string`
-- **Default**: `"analytics_physical"`
+- **Default when omitted**: `"dbt_virtual_physical"` (every example in these guides sets `"analytics_physical"`)
 - **What it does**:
-  Defines the shared warehouse dataset/schema where:
-  1. **Immutable physical tables** are materialized (`analytics_physical.<model>__<fingerprint>`).
+  Defines the one shared warehouse dataset/schema where:
+  1. **Immutable physical tables** of every `table` / `incremental` virtual model are materialized (`analytics_physical.<model>__<fingerprint>`), whatever the model's custom schema and whatever environment built it.
   2. **State registry tables** are stored:
-     - `analytics_physical._environments` (active model/routine pointers per environment)
+     - `analytics_physical._environments` (active model/routine pointers per environment, with the object's custom schema in `schema_key`)
      - `analytics_physical._releases` (immutable release history and routine DDL templates for promotion & rollback)
      - `analytics_physical._locks` (TTL-based concurrency leases per environment)
      - `analytics_physical._intervals` (processed `[start_ts, end_ts]` backfill intervals per fingerprint)
+  The registry is created the first time it is needed. A registry created before `schema_key` existed gets the column added (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS schema_key`) on the next run; rows without it mean "the environment's default schema".
 - **Best Practice**:
-  Grant write permissions on `analytics_physical` to your CI/CD service account, while BI tools (Looker, Tableau, Metabase, Hex) and end users only query the virtual environment schemas (`analytics` and `analytics_staging`).
+  Grant write permissions on `analytics_physical` to your CI/CD service account, while BI tools (Looker, Tableau, Metabase, Hex) and end users only query the environment schemas (`analytics`, `analytics_staging`, ...). `dbt-virtual drop-env` refuses to drop this schema.
 
 ---
 
 ### `environment`
-- **Type**: `string`
-- **Default**: `"{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"` (falls back to `target.name` if omitted)
+- **Type**: `string` (may contain Jinja)
+- **Default when omitted**: `target.name`
 - **What it does**:
-  Identifies the logical virtual environment currently being built or queried (for example: `staging`, `prod`, `pr_42`, `dev_alice`).
-- **How it works with `DBT_VIRTUAL_ENV`**:
-  By setting `environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"`, you can:
-  - Use your normal dbt profile target (`--target staging`) and automatically build into the `staging` virtual environment.
-  - Dynamically spin up ephemeral PR environments (`DBT_VIRTUAL_ENV=pr_123 dbt build` or `dbt-virtual build --env pr_123`) without adding a new target to `profiles.yml`!
+  Identifies the logical virtual environment currently being built or queried (for example: `staging`, `prod`, `pr_42`, `dev_alice`). It decides which `env_schemas` entry views and routines are written to and under which environment their pointers are recorded in `_environments`.
+- **Precedence**: `dbt-virtual build --env <name>` passes `--vars '{_dbt_virtual_env: <name>}'`, which wins over this setting (`get_current_env`). The setting matters for bare `dbt run` / `dbt build` and for `on-run-start` hooks.
+- **Jinja is rendered**: dbt only renders a `var` whose whole value is a string, so Jinja nested inside the `dbt_virtual` mapping arrives unrendered; `dbt-virtual` renders every string value itself. Covered by `tests/test_dbt_duckdb_regressions.py::test_bare_dbt_run_renders_nested_config_and_registers_physical_fingerprint` (with `"{{ var('_dbt_virtual_env', target.name) }}"`).
+- **Mapping several dbt targets to one environment**: if production runs under several profile targets (a scheduler service account, a backfill target, ...), map all of them to `prod` so they update the same environment:
+  ```yaml
+  vars:
+    dbt_virtual:
+      environment: "{{ 'prod' if target.name in ['prod', 'prod_scheduler', 'prod_backfill'] else env_var('DBT_VIRTUAL_ENV', target.name) }}"
+  ```
+- **Ephemeral environments**: with `environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"`, `DBT_VIRTUAL_ENV=pr_123 dbt build --target staging` builds into the `pr_123` environment without a new profile target. `dbt-virtual build --env pr_123` instead passes `--target pr_123` to dbt, so it needs an output named `pr_123` in `profiles.yml` (see [CLI reference](cli_and_operations.md)). Prefer `dbt-virtual build`: a bare `dbt build` cannot include upstream fingerprints in physical table names ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)).
 
 ---
 
@@ -69,10 +83,11 @@ vars:
 - **Type**: `string`
 - **Default**: `"prod"`
 - **What it does**:
-  Specifies the canonical production environment name. It serves three critical purposes:
+  Specifies the canonical production environment name. It serves four purposes:
   1. **Incremental Clone Source (`seed_incremental_clones`)**: When a model's SQL changes in `staging` or `pr_123`, `seed_incremental_clones()` (run by `dbt-virtual build` and by the `on-run-start` hook, before dbt materializes anything) looks up the active physical table for `base_environment` (`prod`) in `_environments` and clones it (`CREATE TABLE new_fp CLONE prod_fp`) so your incremental model starts with full production history.
-  2. **Planner Baseline (`dbt-virtual plan`)**: Used to determine whether a modified incremental model can be classified as `SEED_INCREMENTAL` (base table exists in `prod`) vs `FULL_BUILD` (brand-new model).
-  3. **Teardown Guardrail (`virtual_drop_env`)**: `dbt-virtual drop-env` refuses to drop `base_environment`, preventing accidental deletion of production views.
+  2. **Planner Baseline (`dbt-virtual plan`)**: `base_env_state` in the state file (`dbt-virtual status --base-env prod --output state.json`) decides whether a modified incremental model is `SEED_INCREMENTAL` (base table exists) or `FULL_BUILD`.
+  3. **Schema of unmapped environments**: an environment not listed in `env_schemas` gets `<base_environment default schema>_<env>` (see below).
+  4. **Teardown Guardrail (`virtual_drop_env`)**: `dbt-virtual drop-env` refuses to drop `base_environment`, `physical_schema`, or any schema that belongs to another environment listed in `env_schemas`.
 
 ---
 
@@ -80,32 +95,63 @@ vars:
 - **Type**: `string` (`"env_view"` | `"physical"` | `"hybrid"` | `"explicit"`)
 - **Default**: `"env_view"`
 - **What it does**:
-  Controls how `{{ ref('upstream_model') }}` resolves when compiling a downstream model.
+  Controls how `{{ ref('upstream_model') }}` resolves when compiling a downstream model (requires the `ref()` override shown in [Getting Started](getting_started.md)).
 
 | Mode | How `{{ ref('orders') }}` Compiles | Best For |
 |---|---|---|
-| **`"env_view"`** *(Default, Option A)* | `analytics_staging.orders` (the virtual environment view) | **Recommended for almost all projects**, especially BigQuery projects with Table Functions (`TVF`), views, or external BI queries. When `orders` is promoted or updated, downstream views and TVFs automatically read the new table through the environment view without needing to be recompiled. |
+| **`"env_view"`** *(Default, Option A)* | `analytics_staging.orders` (the virtual environment view, in the schema of `orders`' custom schema) | **Recommended for almost all projects**, especially BigQuery projects with Table Functions (`TVF`), views, or external BI queries. When `orders` is promoted or updated, downstream views and TVFs automatically read the new table through the environment view without needing to be recompiled. |
 | **`"physical"`** *(Option B)* | `analytics_physical.orders__58cce796d2a1` (the exact physical table) | Pure table/incremental pipelines with no TVFs where you want every compiled table query pinned directly to its upstream physical table identifier at compile time. |
-| **`"hybrid"`** *(Option C)* | Routes routine/view callers (`table_function`, `view`) to `analytics_staging.orders`, and table/incremental callers (`table`, `incremental`) to `analytics_physical.orders__58cce796d2a1` | Projects that mix incremental tables with BigQuery TVFs and want direct physical table reads during incremental builds while keeping TVFs bound to stable environment view names. |
-| **`"explicit"`** *(Option D)* | Standard `ref()` uses `"env_view"`, while callers can explicitly invoke `dbt_virtual.virtual_ref('orders')` | Gradual migration or advanced per-query overrides. |
+| **`"hybrid"`** *(Option C)* | Routes routine/view callers (`table_function`, `virtual_function`, `function`, `procedure`, `view`) to `analytics_staging.orders`, and table/incremental callers to `analytics_physical.orders__58cce796d2a1` | Projects that mix incremental tables with BigQuery TVFs and want direct physical table reads during incremental builds while keeping TVFs bound to stable environment view names. |
+| **`"explicit"`** *(Option D)* | `analytics_physical.orders__58cce796d2a1`: the current `virtual_ref` only rewrites relations in `env_view` and `hybrid` mode, so `explicit` behaves like `physical` | Intended for gradual migration with per-query `dbt_virtual.virtual_ref(...)` calls; today it gives no per-query control beyond `physical`. |
 
 ---
 
 ### `env_schemas`
-- **Type**: `dict[string, string]`
-- **Default**:
-  ```yaml
-  env_schemas:
-    staging: "analytics_staging"
-    prod: "analytics"
-  ```
+- **Type**: `dict[string, string | dict[string, string]]`
+- **Default when omitted**: `{"staging": "staging", "prod": "prod"}`
 - **What it does**:
-  Maps logical environment names (`staging`, `prod`, etc.) to the exact warehouse dataset/schema where virtual views and routines (`table_function`, `function`, `procedure`) are created.
-- **Automatic Fallback for Ephemeral Environments**:
-  If you run with an environment name that is **not** explicitly listed in `env_schemas` (for example, `pr_42` or `dev_yuri`), `dbt-virtual` automatically derives the schema name using `<prod_schema>_<env>`:
+  Maps each logical environment to the warehouse dataset(s)/schema(s) where its environment views and routines (`table_function`, `virtual_function`, `procedure`) are created. Physical tables never go here; they always go to `physical_schema`.
+
+Each environment entry takes one of two forms:
+
+| Form | Example | Where an object with `config(schema='<c>')` lands |
+|---|---|---|
+| **String** | `staging: "analytics_staging"` | Always in that one schema, whatever `<c>` is (every custom schema collapses into it). |
+| **Mapping** | `prod: {default: "analytics", spacetime: "spacetime"}` | Models without a custom schema go to `default`. A listed custom schema goes to its own entry. An unlisted custom schema `<c>` goes to `<default>_<c>`, the rule of dbt's default `generate_schema_name`. If `default` is missing, `target.schema` is used. |
+
+**Multi-dataset BigQuery example.** Production keeps the datasets consumers already query; staging and dev use one dataset each:
+
+```yaml
+vars:
+  dbt_virtual:
+    physical_schema: "analytics_physical"
+    environment: "{{ 'prod' if target.name in ['prod', 'prod_scheduler'] else env_var('DBT_VIRTUAL_ENV', target.name) }}"
+    base_environment: "prod"
+    env_schemas:
+      prod:
+        default: "analytics"        # models without config(schema=...)
+        spacetime: "spacetime"      # config(schema='spacetime'): table functions applications call
+        # config(schema='gold') is not listed, so it becomes "analytics_gold"
+      staging: "analytics_staging"  # one dataset for everything
+```
+
+With models `daily` (table, no custom schema), `orders` (table, `schema='gold'`) and `tvf_bookings` (`table_function`, `schema='spacetime'`):
+
+| Object | `prod` | `staging` | `pr_42` (not listed) |
+|---|---|---|---|
+| `daily` env view | `analytics.daily` | `analytics_staging.daily` | `analytics_pr_42.daily` |
+| `orders` env view | `analytics_gold.orders` | `analytics_staging.orders` | `analytics_pr_42.orders` |
+| `tvf_bookings` | `spacetime.tvf_bookings` | `analytics_staging.tvf_bookings` | `analytics_pr_42.tvf_bookings` |
+| Physical tables | `analytics_physical.daily__<fp>`, `analytics_physical.orders__<fp>` | same tables | same tables |
+
+The same layout, run on DuckDB, is covered by `tests/test_dbt_duckdb_multi_schema.py`. When `tvf_bookings` is promoted from staging to prod, its references to `analytics_staging.orders` are rewritten to `analytics_gold.orders`, because each referenced virtual object keeps its own placeholder in the stored DDL (see [Routines](routines_and_tvf_testing.md)).
+
+- **Automatic fallback for unlisted environments**:
+  An environment that is **not** listed in `env_schemas` (for example `pr_42` or `dev_yuri`) gets **one** schema, `<base_environment default schema>_<env>`, for every custom schema:
   - `pr_42` → `"analytics_pr_42"`
   - `dev_yuri` → `"analytics_dev_yuri"`
-  This means ephemeral CI pull request environments work out of the box with zero `dbt_project.yml` edits!
+  Characters other than letters, digits and `_` in the environment name become `_`. If `base_environment` itself is not listed, the prefix is `target.schema`. `sync_env_view` and `promote` create the schema when it does not exist, so ephemeral PR environments need no `dbt_project.yml` edit.
+- **Changing a mapping later**: the registry stores each object's custom schema (`schema_key`), not its full location, so promote, rollback, demotion and `drop-env` always use the current mapping (decision [`20261104_per_custom_schema_env_datasets`](../decisions/20261104_per_custom_schema_env_datasets.md)).
 
 ---
 
@@ -113,7 +159,7 @@ vars:
 - **Type**: `integer`
 - **Default**: `5`
 - **What it does**:
-  Used by `dbt-virtual gc` (`virtual_gc` macro). Protects all physical tables (`<model>__<fp>`) referenced by the **most recent `N` releases** in `analytics_physical._releases` (per environment), guaranteeing you can always roll back at least `N` releases.
+  Used by `dbt-virtual gc` (`virtual_gc` macro). Protects all physical tables (`<model>__<fp>`) referenced by the **most recent `N` releases of each environment** in `analytics_physical._releases` (candidate, promoted and rolled-back releases), so you can always roll back at least `N` releases, however many PR releases were built meanwhile.
 
 ---
 
@@ -122,6 +168,24 @@ vars:
 - **Default**: `7`
 - **What it does**:
   Used by `dbt-virtual gc` (`virtual_gc` macro). In addition to `retention_releases`, any physical table created or referenced within the last `retention_days` days is protected from garbage collection—even if it was created by an aborted or unpromoted staging/PR build.
+
+---
+
+### `require_cli_fingerprints`
+- **Type**: `boolean` (or a string that renders to `true` / `1` / `yes`, e.g. `"{{ env_var('DBT_VIRTUAL_STRICT', 'false') }}"`)
+- **Default**: `false`
+- **What it does**:
+  Refuses bare dbt runs that would name virtual tables without upstream fingerprints ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). When `true`, a `dbt run`, `dbt build` or `dbt retry` whose selection contains a virtual `table` or `incremental` model fails in `on-run-start`, before any model is built, unless `_dbt_virtual_fps` is set. `dbt-virtual build` always sets it, so the CLI is unaffected; so are `compile`, `parse`, `ls`, `docs` and `run-operation`, and selections with only views or routines.
+- **Requires** the package's `on-run-start` hook: either `"{{ dbt_virtual.seed_incremental_clones() }}"` or `"{{ dbt_virtual.on_run_start() }}"` (both run the check, then seed clones).
+- **Error you will see**: `dbt-virtual: require_cli_fingerprints is true but var('_dbt_virtual_fps') is not set, so N selected virtual table model(s) (...) would get physical names without upstream fingerprints ...`.
+
+---
+
+### `use_ctas_for_clone`
+- **Type**: `boolean`
+- **Default**: `false`
+- **What it does**:
+  On BigQuery, Snowflake and Databricks, seeds and adoptions use `CREATE TABLE ... AS SELECT *` instead of a zero-copy `CLONE`. Meant for emulators and engines without `CLONE`; a target named `emulator` gets the same behaviour (`macros/adapters/dispatch.sql`, `*__clone_table_sql`). DuckDB and PostgreSQL always copy with `CREATE TABLE ... AS SELECT *`.
 
 ---
 
@@ -139,7 +203,15 @@ You can configure these parameters either in `dbt_project.yml` under `models:` (
 - **What it does**:
   Enables `dbt-virtual` for the model or routine. Models without `virtual_env: true` are completely ignored by `dbt-virtual` and behave like standard dbt models.
 
-Virtual table and incremental models must keep dbt's alias equal to the model name. A custom `alias` (or a custom alias-generation macro) makes dbt `ref()` resolve to a different environment-view name than dbt-virtual creates; the planner and routing macro fail early with an error when they detect this configuration.
+Virtual table and incremental models must keep dbt's alias equal to the model name. A custom `alias` (or a custom alias-generation macro) makes dbt `ref()` resolve to a different environment-view name than dbt-virtual creates; the planner and routing macro fail early with an error when they detect this configuration. Virtual model names must also be unique across the project (the planner fails on duplicates), because pointers are keyed by name.
+
+---
+
+### `schema` (dbt's custom schema)
+- **Type**: `string`
+- **Default**: none
+- **What it does**:
+  For a virtual `table` / `incremental` model it decides where the **environment view** is created (the physical table always goes to `physical_schema`); for a routine it decides where the routine is created. The schema is looked up in [`env_schemas`](#env_schemas) for the current environment.
 
 ---
 
@@ -175,7 +247,7 @@ Virtual table and incremental models must keep dbt's alias equal to the model na
   {{ config(materialized='incremental', virtual_env=true, forward_only=true) }}
   ```
 - **What it does**:
-  Marks the model configuration as forward-only in fingerprint metadata, pairing with `physical_version` or `virtual_add_columns` when evolving large incremental tables without historical backfills.
+  Marks the model as forward-only, pairing with `physical_version` or `virtual_add_columns` when evolving large incremental tables without historical backfills. Like dbt's `on_schema_change`, it is metadata about how later runs treat the table, so it is **not** part of the fingerprint: setting or changing it does not create a new physical table.
 
 ---
 
@@ -204,7 +276,7 @@ Virtual table and incremental models must keep dbt's alias equal to the model na
 
 ---
 
-### Routine Materialization Parameters (`table_function`, `function`, `procedure`)
+### Routine Materialization Parameters (`table_function`, `virtual_function`, `procedure`)
 
 When virtualizing database routines:
 
@@ -217,27 +289,30 @@ When virtualizing database routines:
   )
 }}
 SELECT customer_id, orders
-FROM {{ tvf_test_ref('orders_metrics') }}
+FROM {{ dbt_virtual.tvf_test_ref('orders_metrics') }}
 WHERE orders >= min_orders
   AND order_date >= start_date
 ```
 
 | Parameter | Used By | Description |
 |---|---|---|
-| `materialized` | `table_function`, `function`, `procedure` | Selects the custom routine materialization provided by `dbt-virtual`. |
+| `materialized` | `table_function`, `virtual_function`, `procedure` | Selects the routine materialization provided by `dbt-virtual`. Use `virtual_function` for scalar UDFs: on dbt-core 1.11+ the built-in `function` materialization replaces the package's `function` (see [Routines](routines_and_tvf_testing.md)). |
 | `parameters` | All routines | Comma-separated SQL parameter signature (e.g. `"n INT64"` or `"min_o INT64"`). |
-| `returns` | `function` (and Snowflake/Postgres `table_function`) | Return type declaration (e.g. `"INT64"` or `"TABLE(customer_id VARCHAR, orders NUMBER)"`). Not required for BigQuery `table_function` (which infers output columns from the `AS (SELECT ...)` query). |
+| `returns` | `virtual_function` (and Snowflake/Postgres `table_function`) | Return type declaration (e.g. `"INT64"` or `"TABLE(customer_id VARCHAR, orders NUMBER)"`). Not required for BigQuery `table_function` (which infers output columns from the `AS (SELECT ...)` query). |
+
+Projects that keep their **own** routine materializations register them with [`register_routine_deployment`](routines_and_tvf_testing.md).
 
 ---
 
 ## 4. Runtime CLI / `dbt --vars` Variables
 
-These internal variables are automatically passed by the `dbt-virtual` CLI when invoking `dbt`, or can be passed manually via `dbt build --vars '{...}'`:
+These internal variables are passed by the `dbt-virtual` CLI when invoking `dbt`, or can be passed manually via `dbt build --vars '{...}'`:
 
 | Variable Name | Type | Description |
 |---|---|---|
-| `_dbt_virtual_fps` | `dict[str, str]` | Precomputed map of `{model_name: fingerprint}` from `target/virtual_fingerprints.json`. If omitted, `dbt-virtual` falls back to computing Merkle-DAG fingerprints in pure Jinja (`get_fingerprint.sql`). |
-| `_dbt_virtual_release` | `str` | Release identifier (e.g. `"v2026.10.27"` or git SHA) recorded in `analytics_physical._releases` and `analytics_physical._environments` by `sync_env_view()`. |
+| `_dbt_virtual_fps` | `dict[str, str]` | Map of `{model_name: fingerprint}` computed by `dbt-virtual plan` / `build` (also written to `.dbt_virtual/fingerprints.json`). If omitted (bare `dbt run`), the physical name comes from a pure-Jinja fallback that dbt evaluates at parse time, without upstream fingerprints and with a different hash than the CLI's ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). |
+| `_dbt_virtual_env` | `str` | Environment being built; set by `dbt-virtual build --env`. Wins over `vars.dbt_virtual.environment`. |
+| `_dbt_virtual_release` | `str` | Release identifier (e.g. `"v2026.10.27"` or git SHA) recorded in `analytics_physical._releases` and `analytics_physical._environments` by `sync_env_view()` and `register_routine_deployment()`. |
 | `_dbt_virtual_start` | `str` | Optional start timestamp/date of an incremental backfill window (`--start`), recorded in `analytics_physical._intervals`. |
 | `_dbt_virtual_end` | `str` | Optional end timestamp/date of an incremental backfill window (`--end`), recorded in `analytics_physical._intervals`. |
-| `tvf_test_fixtures` | `bool` | When `true`, `{{ tvf_test_ref('model') }}` resolves to `<model>__fixture` so BigQuery TVFs can be unit-tested with `ANY TABLE` synthetic CTE inputs. |
+| `tvf_test_fixtures` | `bool` | When `true`, `{{ dbt_virtual.tvf_test_ref('model') }}` resolves to `<model>__fixture` so BigQuery TVFs can be unit-tested with `ANY TABLE` synthetic CTE inputs. |
