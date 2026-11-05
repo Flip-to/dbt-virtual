@@ -457,6 +457,8 @@ def cmd_promote(ns: argparse.Namespace) -> int:
         "require_sealed": bool(ns.require_sealed),
         "check_coverage": not ns.no_coverage_check,
         "coverage_ignore_before": ns.coverage_ignore_before or "",
+        "data_diff": bool(getattr(ns, "data_diff", False)),
+        "data_diff_max_mismatch_pct": getattr(ns, "max_mismatch_pct", None),
     }
     if ns.skip_fingerprint_check:
         print(
@@ -495,6 +497,69 @@ def cmd_audit(ns: argparse.Namespace) -> int:
         ["run-operation", "virtual_audit", "--args", json.dumps(op_args)],
         project_dir,
     )
+
+
+DIFF_MARKER = "DBT_VIRTUAL_DIFF_JSON:"
+
+
+def _format_diff_text(summary: dict) -> str:
+    lines = [f"data diff {summary.get('from_env')} -> {summary.get('to_env')}"]
+    for m in summary.get("models", []):
+        lines.append(
+            f"  {m['model']}: {m['status']}  only_candidate={m.get('only_candidate', 0)} "
+            f"only_target={m.get('only_target', 0)} changed={m.get('changed', 0)} "
+            f"mismatch={m.get('mismatch_pct', 0)}%"
+        )
+        for col, n in (m.get("column_mismatches") or {}).items():
+            if n:
+                lines.append(f"      column {col}: {n} mismatches")
+        for leaf in m.get("leaf_segments") or []:
+            lines.append(
+                f"      segment {leaf['segment']}: +{leaf['only_candidate']} -{leaf['only_target']} ~{leaf['changed']}"
+            )
+    lines.append("PASSED" if summary.get("passed") else f"FAILED: {', '.join(summary.get('failed_models', []))}")
+    return "\n".join(lines)
+
+
+def cmd_diff_data(ns: argparse.Namespace) -> int:
+    """Row-level data diff (`virtual_data_diff`): checksum bisection, then a key join on small ranges."""
+    project_dir = Path(ns.project_dir).resolve()
+    models = None
+    if ns.select:
+        names = _selected_model_names(project_dir, ns.target or ns.from_env, ns.select)
+        if names is None:
+            return 1
+        models = sorted(names)
+    op_args = {
+        "from_env": ns.from_env,
+        "to_env": ns.to_env,
+        "release_id": ns.release or "",
+        "models": models,
+        "threshold": ns.threshold,
+        "branching": ns.branching,
+        "max_depth": ns.max_depth,
+        "sample_limit": ns.sample_limit,
+        "exclude_columns": ns.exclude_columns or None,
+        "where": ns.where or "",
+        "window_days": ns.window_days,
+        "max_mismatch_pct": ns.max_mismatch_pct,
+    }
+    cmd = ["dbt", "run-operation", "virtual_data_diff", "--args", json.dumps(op_args)]
+    if ns.target:
+        cmd.extend(["--target", ns.target])
+    result = subprocess.run(cmd, cwd=project_dir, check=False, capture_output=True, text=True)
+    summary = None
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        if DIFF_MARKER in line:
+            summary = json.loads(line.split(DIFF_MARKER, 1)[1].strip())
+            break
+    if summary is None:
+        print(result.stdout, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        print("dbt-virtual diff-data: dbt did not emit DBT_VIRTUAL_DIFF_JSON.", file=sys.stderr)
+        return result.returncode or 1
+    print(json.dumps(summary, indent=2) if ns.format == "json" else _format_diff_text(summary))
+    return result.returncode
 
 
 def _capture_state(
@@ -866,6 +931,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Lease owner name (default: dbt-virtual-cli:<user>@<host>).",
     )
+    p_promote.add_argument(
+        "--data-diff",
+        action="store_true",
+        help="Run the row-level virtual_data_diff against --to before promoting.",
+    )
+    p_promote.add_argument(
+        "--max-mismatch-pct",
+        type=float,
+        default=None,
+        help="With --data-diff: fail if more than this percentage of a model's rows differ (default: report only).",
+    )
     p_promote.set_defaults(func=cmd_promote)
 
     # audit
@@ -889,6 +965,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ignore partitions older than this date (e.g. 2026-01-01); default vars.dbt_virtual.coverage_ignore_before.",
     )
     p_audit.set_defaults(func=cmd_audit)
+
+    # diff-data
+    p_dd = sub.add_parser(
+        "diff-data",
+        help="Row-level data diff between two environments (checksum bisection, then key join).",
+    )
+    p_dd.add_argument("--from", dest="from_env", default="staging", help="Candidate environment.")
+    p_dd.add_argument("--to", dest="to_env", default="prod", help="Environment to compare against.")
+    p_dd.add_argument("--release", default="", help="Diff this release instead of --from.")
+    p_dd.add_argument("--select", default=None, help="dbt selector limiting the models diffed.")
+    p_dd.add_argument("--target", default=None, help="dbt profile target (default: dbt's default).")
+    p_dd.add_argument("--max-mismatch-pct", type=float, default=None, help="Fail above this mismatch percentage per model.")
+    p_dd.add_argument("--threshold", type=int, default=10000, help="Rows at or below which a range is joined, not split.")
+    p_dd.add_argument("--branching", type=int, default=16, help="Sub-ranges per split.")
+    p_dd.add_argument("--max-depth", type=int, default=8, help="Maximum bisection depth.")
+    p_dd.add_argument("--sample-limit", type=int, default=10, help="Sample rows reported per model.")
+    p_dd.add_argument("--exclude-columns", default="", help="Comma separated columns to ignore.")
+    p_dd.add_argument("--where", default="", help="SQL predicate bounding both sides.")
+    p_dd.add_argument("--window-days", type=int, default=None, help="Only compare the last N days of the partition column.")
+    p_dd.add_argument("--format", choices=["text", "json"], default="text")
+    p_dd.set_defaults(func=cmd_diff_data)
 
     # status
     p_status = sub.add_parser("status", help="Export live warehouse virtual environment state JSON.")

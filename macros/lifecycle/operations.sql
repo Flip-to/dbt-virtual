@@ -413,7 +413,7 @@
 {%- endmacro %}
 
 
-{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='') -%}
+{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='', data_diff=false, data_diff_max_mismatch_pct=none) -%}
   {#-
     Zero-rebuild promotion:
     0. Guards (guards.sql), checked before anything is changed; the macro raises listing every problem:
@@ -423,7 +423,8 @@
        - with `release_id`: the release must be sealed (`dbt-virtual build --release` seals it after a
          successful `dbt build`) unless `allow_unsealed=true`. Releases from before sealing existed carry
          no seal and no build_quality; they are refused only with `require_sealed=true` (the CLI default).
-    1. Optionally runs `virtual_audit` quality gate when `audit=true`.
+    1. Optionally runs `virtual_audit` quality gate when `audit=true`, and `virtual_data_diff`
+       (row-level, gated by `data_diff_max_mismatch_pct`) when `data_diff=true`.
     2. Verifies every physical table in `release_id` (or `from_env` active state) exists.
     3. Deploys objects in strict dependency tier order:
        - Environment views (`model`) -> `<physical_schema>.<model>__<fp>` first: they are
@@ -456,6 +457,11 @@
 
   {%- if audit -%}
     {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct, location=location, check_coverage=check_coverage, coverage_ignore_before=coverage_ignore_before) -%}
+  {%- endif -%}
+
+  {%- if data_diff -%}
+    {#- Row-level diff against `to_env`; fails above `data_diff_max_mismatch_pct` (report only when none). -#}
+    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct) -%}
   {%- endif -%}
 
   {%- if release_id != '' -%}

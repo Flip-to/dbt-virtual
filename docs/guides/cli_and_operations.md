@@ -100,6 +100,34 @@ dbt-virtual audit \
 
 ---
 
+### `dbt-virtual diff-data`
+Row-level diff of each model's candidate table (`--from`, or `--release`) against the table `--to` points at (`virtual_data_diff` macro). It reports rows only in the candidate, rows only in the target and changed rows, with per-column mismatch counts, the segments that were drilled and a sample of keys.
+
+```bash
+dbt-virtual diff-data --from staging --to prod --release v2026.11.05 \
+  --select orders+ --max-mismatch-pct 2.0 --format json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--from` / `--to` / `--release` | `staging` / `prod` / none | Candidate and baseline; `--release` diffs that release instead of `--from`. |
+| `--select` | all | dbt selector limiting the models. |
+| `--max-mismatch-pct` | none (report only) | Exit non-zero when a model's mismatch percentage is higher. |
+| `--threshold` | `10000` | A range with at most this many rows is joined instead of split. |
+| `--branching` / `--max-depth` | `16` / `8` | Sub-ranges per split and the maximum number of splits down one path. |
+| `--sample-limit` | `10` | Sample rows per model. |
+| `--exclude-columns` | none | Comma separated columns to ignore (load timestamps). Adds to each model's `diff_exclude_columns`. |
+| `--where` / `--window-days` | none | Bound both sides (`--window-days N` keeps the last N days of the partition column). |
+| `--format` | `text` | `json` prints the summary that the macro logs as `DBT_VIRTUAL_DIFF_JSON:{...}`. |
+
+Per-model config (in `config()` or `meta`): `unique_key` or `diff_key` (the key bisected on and joined on; ranges need a numeric key), `diff_exclude_columns`, `diff_where`, `diff_window_days`, and `diff_partition_by` (`{field, data_type}`) when `partition_by` is not set (BigQuery's `partition_by` is used otherwise). A model without a key is checksummed per segment only: it is reported as differing with an upper bound, without row detail.
+
+`promote --data-diff [--max-mismatch-pct X]` runs the same diff against `--to` after the audit and before repointing anything; above the threshold the promotion stops.
+
+Cost: see "Data diff" in [How it works](how_it_works.md).
+
+---
+
 ### `dbt-virtual promote`
 Executes zero-rebuild promotion from `--from` (`staging`) to `--to` (`prod`):
 1. Compiles the project for `--to` and passes the expected fingerprints to `virtual_promote` (see the guards below).
@@ -138,6 +166,8 @@ dbt-virtual promote \
 | `--compile-target` / `--skip-compile` / `--known-schema` | `--to` / `False` / none | How the expected fingerprints are computed. |
 | `--require-sealed` / `--no-require-sealed` | on | Also refuse releases that predate sealing. |
 | `--allow-unsealed` | `False` | **Dangerous**: promote a release whose build did not finish. |
+| `--data-diff` | `False` | Run the row-level `diff-data` against `--to` first. |
+| `--max-mismatch-pct` | none | With `--data-diff`: stop when a model's mismatch percentage is higher. |
 | `--no-lock` | `False` | Do not take the lease lock. |
 | `--lock-owner` | `dbt-virtual-cli:<user>@<host>` | Lease owner. The default is stable per user and machine, so a promote that failed while holding the lock can be retried right away; in CI pass the job's own lock owner if it already holds the lock. |
 
@@ -212,6 +242,9 @@ dbt run-operation virtual_promote --args '{from_env: staging, to_env: prod, rele
 
 # Audit
 dbt run-operation virtual_audit --args '{from_env: staging, to_env: prod, release_id: v1, max_row_drop_pct: 10.0}'
+
+# Row-level data diff (logs DBT_VIRTUAL_DIFF_JSON:{...}; fails above max_mismatch_pct)
+dbt run-operation virtual_data_diff --args '{from_env: staging, to_env: prod, models: [orders], threshold: 10000, max_mismatch_pct: 2.0}'
 
 # Rollback
 dbt run-operation virtual_rollback --args '{env: prod, to_release: v0}'
