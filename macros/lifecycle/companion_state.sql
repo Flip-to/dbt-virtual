@@ -187,8 +187,8 @@
     {%- do adapter.cache_added(rel) -%}
     {%- set found = rel -%}
   {%- endif -%}
-  {%- do dbt_virtual.companion_delete(entry, env, model_name) -%}
   {%- if (rows | length) == 0 -%}
+    {%- do dbt_virtual.companion_delete(entry, env, model_name) -%}
     {{ return(true) }}
   {%- endif -%}
   {%- set columns = adapter.get_columns_in_relation(found) -%}
@@ -209,7 +209,11 @@
     {%- endfor -%}
     {%- do tuples.append('(' ~ (cells | join(', ')) ~ ')') -%}
   {%- endfor -%}
-  {%- do dbt_virtual.exec_sql_statement("INSERT INTO " ~ found ~ " (" ~ (names | join(', ')) ~ ") VALUES " ~ (tuples | join(', '))) -%}
+  {#- Delete and insert commit together: a failed insert must not leave the model with no state. -#}
+  {%- do dbt_virtual.exec_atomic([
+    "DELETE FROM " ~ found ~ " WHERE " ~ entry['key_column'] ~ " = " ~ dbt_virtual.sql_string_literal(model_name),
+    "INSERT INTO " ~ found ~ " (" ~ (names | join(', ')) ~ ") VALUES " ~ (tuples | join(', '))
+  ]) -%}
   {{ return(true) }}
 {%- endmacro %}
 
@@ -217,18 +221,16 @@
 {% macro companion_snapshot_save(entry, model_name, fp, env, release_id, rows) -%}
   {%- set phys_schema = dbt_virtual.get_config().get('physical_schema') -%}
   {%- set snap_rel = dbt_virtual.registry_relation(phys_schema, '_companion_state') -%}
-  {%- do dbt_virtual.exec_sql_statement(
+  {%- do dbt_virtual.exec_atomic([
     "DELETE FROM " ~ snap_rel ~ " WHERE companion = " ~ dbt_virtual.sql_string_literal(entry['table'])
     ~ " AND model_name = " ~ dbt_virtual.sql_string_literal(model_name)
-    ~ " AND fingerprint = " ~ dbt_virtual.sql_string_literal(fp)
-  ) -%}
-  {%- do dbt_virtual.exec_sql_statement(
+    ~ " AND fingerprint = " ~ dbt_virtual.sql_string_literal(fp),
     "INSERT INTO " ~ snap_rel ~ " (companion, model_name, fingerprint, state_json, environment, release_id, recorded_at) VALUES ("
     ~ dbt_virtual.sql_string_literal(entry['table']) ~ ", " ~ dbt_virtual.sql_string_literal(model_name) ~ ", "
     ~ dbt_virtual.sql_string_literal(fp) ~ ", " ~ dbt_virtual.sql_string_literal(rows | tojson) ~ ", "
     ~ dbt_virtual.sql_nullable_literal(env) ~ ", " ~ dbt_virtual.sql_nullable_literal(release_id) ~ ", "
     ~ dbt_virtual.current_timestamp_sql() ~ ")"
-  ) -%}
+  ]) -%}
 {%- endmacro %}
 
 

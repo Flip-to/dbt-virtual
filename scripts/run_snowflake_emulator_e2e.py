@@ -29,6 +29,40 @@ from dbt_virtual.fingerprint import compute_node_fingerprint
 from tests.test_macros_execution import FakeRelation, FakeResult, MacroTestHarness
 
 
+def verify_pointer_upserts(harness: MacroTestHarness, run, fetch, label: str) -> None:
+    """Pointer upserts replace in place: one row per (environment, model), no duplicates.
+
+    Exercises `upsert_environment_pointer_sql` and the batched `upsert_environment_pointers_sql`
+    (MERGE on Snowflake, a single data-modifying-CTE statement on PostgreSQL) against the real warehouse.
+    Minimal repro if the Snowflake emulator rejects MERGE: `MERGE INTO t AS T USING (SELECT 'a' AS k, 1 AS v)
+    AS S ON T.k = S.k WHEN MATCHED THEN UPDATE SET v = S.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (S.k, S.v)`.
+    """
+    table = "analytics_physical._environments"
+    run(f"DELETE FROM {table} WHERE environment = 'upsert_probe'")
+    args = ("analytics_physical", "upsert_probe", "probe_a", "model")
+    try:
+        run(harness.call_macro("upsert_environment_pointer_sql", *args, "fp_a", "analytics_physical.probe_a__fp_a", "rel_a"))
+        run(harness.call_macro("upsert_environment_pointer_sql", *args, "fp_b", "analytics_physical.probe_a__fp_b", "rel_b", "marts"))
+    except RuntimeError as err:
+        raise RuntimeError(f"[{label}] registry upsert failed (see the repro in verify_pointer_upserts): {err}") from err
+    rows = fetch(f"SELECT model_name, fingerprint, release_id, schema_key FROM {table} WHERE environment = 'upsert_probe'")
+    assert [tuple(r) for r in rows] == [("probe_a", "fp_b", "rel_b", "marts")], rows
+
+    batch = [
+        {"name": name, "resource_type": "model", "fingerprint": f"fp_{name}", "physical_identifier": f"analytics_physical.{name}",
+         "release_id": "rel_c", "schema_key": None}
+        for name in ("probe_a", "probe_b", "probe_c")
+    ]
+    run(harness.call_macro("upsert_environment_pointers_sql", "analytics_physical", "upsert_probe", batch))
+    rows = fetch(
+        f"SELECT model_name, fingerprint, release_id, schema_key FROM {table} WHERE environment = 'upsert_probe' ORDER BY model_name"
+    )
+    expected = [(n, f"fp_{n}", "rel_c", None) for n in ("probe_a", "probe_b", "probe_c")]
+    assert [tuple(r) for r in rows] == expected, rows
+    run(f"DELETE FROM {table} WHERE environment = 'upsert_probe'")
+    print(f"[{label}] Registry pointer upserts replace in place (single + batched): verified")
+
+
 def run_snowflake_emulator_e2e(endpoint: str) -> None:
     import requests
 
@@ -91,6 +125,7 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     # 1. Initialize registry tables (`_environments`, `_releases`) via `snowflake__ensure_registry_tables_sql`
     reg_sql = harness.call_macro("ensure_registry_tables_sql", "analytics_physical")
     sf_exec(reg_sql)
+    verify_pointer_upserts(harness, sf_exec, sf_exec, "snowflake-emulator")
 
     # 2. Compute v1 fingerprint & build physical table with Snowflake-specific SQL (`IFF`, `NVL`)
     node_v1 = {
@@ -267,6 +302,12 @@ def run_postgres_e2e(dsn: str) -> None:
 
         # 1. Initialize registry tables
         pg_exec(harness.call_macro("ensure_registry_tables_sql", "analytics_physical"))
+
+        def pg_fetch(sql_text: str) -> list:
+            cur.execute(sql_text)
+            return cur.fetchall()
+
+        verify_pointer_upserts(harness, pg_exec, pg_fetch, "postgres")
 
         # 2. Build v1 in staging
         node_v1 = {
