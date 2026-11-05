@@ -1,8 +1,8 @@
 ---
-status: accepted
+status: implemented
 ticket: None
 bean: dbt-virtual-0024
-prs: []
+prs: [19]
 ---
 
 # Multi-dataset environments, virtual views, `run`, adopt and guards (update to the 20261027 architecture)

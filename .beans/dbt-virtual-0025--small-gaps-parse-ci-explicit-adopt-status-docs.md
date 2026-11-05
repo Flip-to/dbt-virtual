@@ -1,7 +1,7 @@
 ---
 # dbt-virtual-0025
 title: 'Small gaps: parse CI, explicit ref mode, adopt views/routines, status without registry, docs'
-status: in-progress
+status: completed
 type: task
 created_at: 2026-11-05T00:00:00Z
 updated_at: 2026-11-05T00:00:00Z
@@ -21,7 +21,7 @@ Stacked on dbt-virtual-0023.
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | Close five small gaps found in the production-readiness review | Coordinator request 2026-11-05 | 2026-11-05 |
 | Built | Agent: Claude (subagent of session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Items above | branch claude/dbt-virtual-small-gaps | 2026-11-05 |
-| Proven | CI | L3: tests named in the spec, each failing before its change (recorded in the commit messages) | pending: CI on the PR | |
-| Reviewed | Reviewer: pending | | pending | |
-| Shipped | Developer: Yuri Olive | | pending | |
-| Verified | Developer: Yuri Olive | | pending: real BigQuery sandbox run | |
+| Proven | CI | L3: tests named in the spec, each failing before its change | CI on PR #19 head 80b7a59, all 6 jobs green (unit 3.10/3.11/3.12, BigQuery emulator E2E strict with no skipped steps, Snowflake+Postgres E2E, dbt parse BigQuery/Snowflake) | 2026-11-05 |
+| Reviewed | Developer: Yuri Olive | Asked to merge after the coordinator review of every merged agent branch | Chat 2026-11-05 ("Resolva tudo por e de merge"); no line-by-line human review | 2026-11-05 |
+| Shipped | Developer: Yuri Olive | | PR #19 merged to main | 2026-11-05 |
+| Verified | Developer: Yuri Olive | | pending: real BigQuery run in the sandbox project (authorized views, view OPTIONS, cross-project CLONE, data diff SQL not yet run on BigQuery) | |

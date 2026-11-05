@@ -3,7 +3,7 @@ status: open
 area: fingerprinting
 impact: medium
 effort: m
-bean: dbt-virtual-0022
+bean: dbt-virtual-0026
 ---
 
 # Bare `dbt run` names physical tables without upstream fingerprints
