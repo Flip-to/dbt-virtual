@@ -50,6 +50,7 @@ Steps 11-25 (`run_feature_steps`) run the real rendered macros against the emula
    25. Shared-table write guard (`assert_shared_tables_safe`) and `DBT_VIRTUAL_FPS`.
    Steps 20-25 need the emulator changes of Flip-to/googlesqlite#36 and Flip-to/bigquery-emulator#32
    (`CREATE TABLE ... CLONE`, `DROP SCHEMA`, persisted `datasets.patch` with `access`, view OPTIONS as table metadata).
+   26. `virtual_data_diff` and `virtual_audit` run from a CI target read prod from its own `physical_locations` entry.
 Emulator limitations are listed in the final "Skipped" summary; the script is not re-runnable on one emulator
 instance (restart it between runs).
 """
@@ -84,7 +85,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     skipped: list[str] = []
     for dataset_id in (
         "e2e_reg", "e2e_old", "e2e_stg", "e2e_stg_fin", "e2e_prod", "e2e_prod_fin",
-        "e2e_cov", "e2e_gc", "e2e_cmp",
+        "e2e_cov", "e2e_gc", "e2e_cmp", "e2e_loc_ci", "e2e_loc_prod",
     ):
         requests.post(
             f"{endpoint}/bigquery/v2/projects/{project}/datasets",
@@ -412,6 +413,31 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     restored = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest` ORDER BY model")
     assert restored == [{"model": "inc_m", "d": "2026-11-01"}, {"model": "other", "d": "2026-01-01"}], restored
     print("[companion] state saved when the env left fp1, restored on return; other models' rows untouched.")
+    # 26. Gates across `physical_locations`: from the CI target, prod's registry and tables are in
+    # another dataset. Found on real BigQuery: both gates read prod from the CI registry and passed
+    # without comparing anything (docs/findings/20261105_bigquery_sandbox_verification.md).
+    for ds in ("e2e_loc_ci", "e2e_loc_prod"):
+        exec_script(h.call_macro("ensure_registry_tables_sql", ds))
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_loc_ci.orders__fp2` AS SELECT * FROM UNNEST([STRUCT(1 AS id, 10 AS amount), STRUCT(2, 20), STRUCT(3, 30), STRUCT(4, 40)])")
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_loc_prod.orders__fp1` AS SELECT * FROM UNNEST([STRUCT(1 AS id, 10 AS amount), STRUCT(2, 20), STRUCT(3, 31)])")
+    q(f"INSERT INTO `{project}.e2e_loc_ci._releases` (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at) "
+      f"VALUES ('r1', 'staging', NULL, 'orders', 'model', 2, 'fp2', 'e2e_loc_ci.orders__fp2', 'candidate', CURRENT_TIMESTAMP())")
+    q(f"INSERT INTO `{project}.e2e_loc_prod._environments` (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at) "
+      f"VALUES ('prod', 'orders', 'model', 'fp1', 'e2e_loc_prod.orders__fp1', 'r0', CURRENT_TIMESTAMP())")
+    loc_nodes = {"model.p.orders": {"name": "orders", "resource_type": "model", "config": {"unique_key": "id"}}}
+    hl = make_harness(
+        extra_cfg={"physical_schema": "e2e_loc_ci", "base_environment": "prod",
+                   "physical_locations": {"prod": {"database": project, "schema": "e2e_loc_prod"},
+                                          "default": {"database": project, "schema": "e2e_loc_ci"}}},
+        graph_nodes=loc_nodes,
+    )
+    hl.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="r1", check_coverage=False)
+    assert any("audit [orders]: OK (candidate=4 rows, prod=3 rows)" in m for m in hl.logs), hl.logs
+    hl.call_macro("virtual_data_diff", from_env="staging", to_env="prod", release_id="r1")
+    diff_line = next(m for m in hl.logs if m.startswith("DBT_VIRTUAL_DIFF_JSON:"))
+    diff = json.loads(diff_line.split(":", 1)[1])["models"][0]
+    assert (diff["status"], diff["only_candidate"], diff["changed"]) == ("differs", 1, 1), diff
+    print("[locations] audit and data diff from the CI target compared the release with prod's own location.")
 
     # Pilot finding: `promote` decided its default audit from the raw `base_environment`, so a Jinja
     # value never matched `--to`. `virtual_print_base_environment` renders it like the macros do

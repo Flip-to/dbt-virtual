@@ -192,9 +192,11 @@
     {{ return('') }}
   {%- endif -%}
 
+  {#- `to_env` is read from its own location (it differs from this run's under `physical_locations`). -#}
+  {%- set base_loc = dbt_virtual.registry_location_for(to_env, phys_schema) -%}
   {%- set base_query -%}
     SELECT model_name, physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    FROM {{ dbt_virtual.registry_relation(base_loc['schema'], '_environments', base_loc['database']) }}
     WHERE environment = '{{ to_env }}'
       AND resource_type = 'model'
   {%- endset -%}
@@ -217,7 +219,7 @@
     {%- set base_ident = base_map.get(model_name, '') -%}
     {%- if base_ident != '' -%}
       {%- set base_tbl = base_ident.split('.')[-1] -%}
-      {%- set base_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=base_tbl, type='table') -%}
+      {%- set base_rel = api.Relation.create(database=base_loc['database'], schema=base_loc['schema'], identifier=base_tbl, type='table') -%}
       {%- set base_cnt_res = run_query(dbt_virtual.row_count_sql(base_rel)) -%}
       {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
 
@@ -544,7 +546,7 @@
 
   {%- if data_diff -%}
     {#- Row-level diff against `to_env`; fails above `data_diff_max_mismatch_pct` (report only when none). -#}
-    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct) -%}
+    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct, source_database=(src_db if cross else ''), source_schema=(src_schema if cross else '')) -%}
   {%- endif -%}
 
   {%- if release_id != '' -%}
