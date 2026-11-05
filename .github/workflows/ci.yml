@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       # The emulator branch the image is built from.
-      BQEMU_BRANCH: flipto/main
+      BQEMU_BRANCH: claude/dbt-bigquery-support-proof
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
