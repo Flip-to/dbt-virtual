@@ -579,7 +579,8 @@
       {%- set target_phys_ident = phys_ident -%}
     {%- endif -%}
 
-    {%- if existing_fp_map.get(model_name, '') == fp and existing_ident_map.get(model_name, '') == target_phys_ident -%}
+    {%- set unchanged = existing_fp_map.get(model_name, '') == fp and existing_ident_map.get(model_name, '') == target_phys_ident -%}
+    {%- if unchanged -%}
       {{ log("dbt-virtual promote [" ~ to_env ~ "]: Skipping unchanged " ~ model_name ~ " (fp=" ~ fp ~ " already promoted)", info=True) }}
     {%- else -%}
       {%- if to_schema not in ensured_schemas -%}
@@ -612,6 +613,10 @@
       {%- endif -%}
     {%- endif -%}
 
+    {%- if resource_type == 'model' and not unchanged -%}
+      {#- Save the state the environment holds for the table it is leaving, before it is replaced. -#}
+      {%- do dbt_virtual.companion_depart(dbt_virtual.virtual_node_by_name(model_name), to_env, fp) -%}
+    {%- endif -%}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       to_env,
@@ -622,6 +627,11 @@
       release_id,
       schema_key
     )) -%}
+    {%- if resource_type == 'model' and not unchanged -%}
+      {#- The promoted table and the environment's companion state (e.g. an incremental manifest)
+          must describe the same data. -#}
+      {%- do dbt_virtual.restore_companion_state(model_name, fp, to_env, prefer_env=from_env) -%}
+    {%- endif -%}
   {%- endfor -%}
 
   {#- Phase 3: Demote removed objects that were previously in `to_env` but are no longer in the promoted set.
@@ -704,6 +714,7 @@
     {{ log("dbt-virtual reuse [" ~ env ~ "]: Pointing " ~ view_rel ~ " -> " ~ phys_rel ~ " (zero compute)", info=True) }}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
 
+    {%- set moving = dbt_virtual.companion_depart(dbt_virtual.virtual_node_by_name(model_name), env, fp) -%}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env,
@@ -714,6 +725,10 @@
       release_id,
       schema_key
     )) -%}
+    {%- if moving -%}
+      {#- A reused table keeps its data, so the environment's state must become the table's. -#}
+      {%- do dbt_virtual.restore_companion_state(model_name, fp, env, prefer_env=cfg.get('base_environment', 'prod')) -%}
+    {%- endif -%}
   {%- endfor -%}
 {%- endmacro %}
 
@@ -944,6 +959,9 @@
       {%- set phys_ident = env_schema ~ '.' ~ model_name -%}
     {%- endif -%}
 
+    {%- if resource_type == 'model' -%}
+      {%- do dbt_virtual.companion_depart(dbt_virtual.virtual_node_by_name(model_name), env, fp) -%}
+    {%- endif -%}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env,
@@ -954,6 +972,10 @@
       target_release,
       schema_key
     )) -%}
+    {%- if resource_type == 'model' -%}
+      {#- Back to the table's own state, so the next run does not skip what it never consumed. -#}
+      {%- do dbt_virtual.restore_companion_state(model_name, fp, env) -%}
+    {%- endif -%}
   {%- endfor -%}
 
   {#- Mark the releases being undone so the next default rollback walks further back instead of
