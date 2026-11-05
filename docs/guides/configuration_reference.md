@@ -228,9 +228,18 @@ The same layout, run on DuckDB, is covered by `tests/test_dbt_duckdb_multi_schem
 - **Type**: `boolean` (or a string that renders to `true` / `1` / `yes`, e.g. `"{{ env_var('DBT_VIRTUAL_STRICT', 'false') }}"`)
 - **Default**: `false`
 - **What it does**:
-  Refuses bare dbt runs that would name virtual tables without upstream fingerprints ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). When `true`, a `dbt run`, `dbt build` or `dbt retry` whose selection contains a virtual `table` or `incremental` model fails in `on-run-start`, before any model is built, unless `_dbt_virtual_fps` is set. `dbt-virtual build` always sets it, so the CLI is unaffected; so are `compile`, `parse`, `ls`, `docs` and `run-operation`, and selections with only views or routines.
+  Refuses bare dbt runs that would name virtual tables without upstream fingerprints ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). When `true`, a `dbt run`, `dbt build` or `dbt retry` whose selection contains a virtual `table` or `incremental` model fails in `on-run-start`, before any model is built, unless `_dbt_virtual_fps` or the `DBT_VIRTUAL_FPS` environment variable is set. `dbt-virtual build` and `dbt-virtual dbt` always set it, so the CLI is unaffected; so are `compile`, `parse`, `ls`, `docs` and `run-operation`, and selections with only views or routines.
 - **Requires** the package's `on-run-start` hook: either `"{{ dbt_virtual.seed_incremental_clones() }}"` or `"{{ dbt_virtual.on_run_start() }}"` (both run the check, then seed clones).
 - **Error you will see**: `dbt-virtual: require_cli_fingerprints is true but var('_dbt_virtual_fps') is not set, so N selected virtual table model(s) (...) would get physical names without upstream fingerprints ...`.
+
+---
+
+### `guard_shared_tables`
+- **Type**: `boolean` (or a string rendering to `false` / `0` / `no`)
+- **Default**: `true`
+- **What it does**:
+  A narrow write guard for runs without CLI fingerprints (no `_dbt_virtual_fps`, no `DBT_VIRTUAL_FPS`), see [tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md). In `on-run-start` (`on_run_start()` or `seed_incremental_clones()`), for each selected virtual `table` / `incremental` model it computes the run-time Merkle fingerprint from the graph. If the physical table the model would write is registered in `_environments` for another environment with a different fingerprint, the run fails before anything is built. A table only the current environment points at, or nobody, is never refused. Bare runs register the run-time fingerprint, so a rebuild with unchanged parents passes.
+- **Does not cover**: names. A bare run still names `down__<own hash>`; the guard only stops it from overwriting another environment's table. Use `dbt-virtual dbt ...` or `DBT_VIRTUAL_FPS` for correct names. Tables registered by a bare run before this guard existed carry the alias suffix as fingerprint and are refused once, until rebuilt via the CLI.
 
 ---
 

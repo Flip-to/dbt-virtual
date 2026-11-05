@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -181,6 +182,7 @@ class MacroTestHarness:
             "var": _var,
             "local_md5": _local_md5,
             "fromjson": json.loads,
+            "env_var": lambda name, default="": os.environ.get(name, default),
             "tojson": json.dumps,
             "log": lambda msg, info=False: self.logs.append(str(msg)) or "",
             "execute": self.execute,

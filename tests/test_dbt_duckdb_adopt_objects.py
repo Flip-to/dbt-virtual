@@ -9,10 +9,10 @@ from tests.test_dbt_duckdb_regressions import Project
 
 VIEW_MODEL = "{{ config(materialized='view') }}\nselect 7 as k\n"
 FUNCTION_MODEL = (
-    "{{ config(materialized='virtual_function', parameters='x INTEGER', returns='INTEGER') }}\nx + 1\n"
+    "{{ config(materialized='virtual_function', parameters='x', returns='INTEGER') }}\nx + 1\n"
 )
 TABLE_FUNCTION_MODEL = (
-    "{{ config(materialized='table_function', parameters='n INTEGER', returns='') }}\nselect n as v\n"
+    "{{ config(materialized='table_function', parameters='n', returns='') }}\nselect n as v\n"
 )
 
 

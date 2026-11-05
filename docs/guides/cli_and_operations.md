@@ -69,6 +69,29 @@ The clone source is `vars.dbt_virtual.base_environment`; `build` has no `--base-
 
 ---
 
+### `dbt-virtual dbt <dbt args...>` (passthrough)
+
+Runs any dbt command with the Merkle fingerprints computed in Python, so a plain `build` / `run` / `test` / `ls` / `seed` / `snapshot` / `compile` / `run-operation` names physical tables exactly like `dbt-virtual build` does. dbt generates aliases while parsing (`execute` is False), where Jinja cannot see parents, so only fingerprints passed in from outside can put them in a name ([tech debt](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)).
+
+```bash
+dbt-virtual dbt build --target staging --select state:modified+ --vars '{start_date: 2026-01-01}'
+dbt-virtual dbt --env pr_42 run --target ci          # --env sets _dbt_virtual_env
+```
+
+- It compiles once with the same `--target` / `--vars` / `--profiles-dir` (never your selection), computes the fingerprints, and runs dbt with `_dbt_virtual_fps` merged into your `--vars` (your vars are kept; dbt-virtual's win on a clash). `--env NAME` and `--no-cache` go right after `dbt`; everything after is passed to dbt untouched.
+- `.dbt_virtual/fingerprints.json` is reused (no compile) while the project files, target, vars, profiles, `DBT_*` environment and the manifest checksum are unchanged. `--no-cache` forces a compile. Status lines go to stderr, so `dbt ls --output json` stays parseable on stdout.
+- `deps`, `clean`, `init`, `debug` and `parse` run as-is. dbt's exit code is returned unchanged.
+- Docker / CI entrypoint: `ENTRYPOINT ["dbt-virtual", "dbt"]`, then `docker run image build --target prod`. Without the CLI, use the environment variable below.
+
+### Plain `dbt run` through an environment variable
+
+```bash
+export DBT_VIRTUAL_FPS=$(dbt-virtual plan --env staging --print-fps)   # compact JSON {model: fingerprint}
+dbt run --target staging
+```
+
+`--print-fps` prints only the JSON on stdout (dbt's compile output stays off it). `get_fingerprint` reads `DBT_VIRTUAL_FPS` when `_dbt_virtual_fps` is not set, and `env_var` is allowed while dbt parses, so aliases include parent fingerprints. `require_cli_fingerprints` accepts this source. Recompute it whenever a model changes: a stale value names tables from the old fingerprints.
+
 ### `dbt-virtual diff`
 Performs AST-level and manifest-level column schema diffing between a base `manifest.json` (e.g. `prod`) and a candidate `manifest.json` (`staging`). Each column change is `ADDED`, `DROPPED`, `TYPE_WIDENED` (compatible widening such as `INT64 -> NUMERIC / FLOAT64 / BIGNUMERIC`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`; synonyms like `INT == INT64` are not changes) or `TYPE_CHANGED`. A model is **`BREAKING`** when it was removed or has a `DROPPED` / `TYPE_CHANGED` column, otherwise **`NON_BREAKING`**.
 
