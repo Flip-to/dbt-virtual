@@ -92,7 +92,8 @@ def run_e2e() -> int:
           fingerprint STRING,
           physical_identifier STRING,
           release_id STRING,
-          updated_at TIMESTAMP
+          updated_at TIMESTAMP,
+          schema_key STRING
         )
         """
     )
@@ -111,7 +112,8 @@ def run_e2e() -> int:
           status STRING,
           created_at TIMESTAMP,
           promoted_at TIMESTAMP,
-          rolled_back_at TIMESTAMP
+          rolled_back_at TIMESTAMP,
+          schema_key STRING
         )
         """
     )
