@@ -36,7 +36,7 @@ jobs:
       - name: Lint with ruff
         run: uv run --python ${{ matrix.python-version }} ruff check src tests scripts
       - name: Run unit tests
-        run: uv run --python ${{ matrix.python-version }} pytest -v
+        run: uv run --python ${{ matrix.python-version }} pytest -v -n auto --dist loadfile --durations=15
 
   dbt-parse-warehouses:
     name: dbt parse with the package on BigQuery & Snowflake (fake credentials)

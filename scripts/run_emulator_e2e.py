@@ -427,6 +427,18 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     diff = json.loads(diff_line.split(":", 1)[1])["models"][0]
     assert (diff["status"], diff["only_candidate"], diff["changed"]) == ("differs", 1, 1), diff
     print("[locations] audit and data diff from the CI target compared the release with prod's own location.")
+
+    # Pilot finding: `promote` decided its default audit from the raw `base_environment`, so a Jinja
+    # value never matched `--to`. `virtual_print_base_environment` renders it like the macros do
+    # (the CLI parses this line); it must follow the target. `dbt` itself cannot run on the emulator,
+    # so the CLI half (`--select` vs REUSE, `DBT_EMPTY` on compile) is covered by
+    # tests/test_pilot_fixes_bigquery.py and tests/test_dbt_duckdb_pilot_fixes.py.
+    jinja_base = "{{ 'e2e_stg' if target.name == 'staging' else 'e2e_prod' }}"
+    for target_name, expected_base in (("staging", "e2e_stg"), ("prod", "e2e_prod")):
+        hb = make_harness(extra_cfg={"base_environment": jinja_base}, target_name=target_name)
+        hb.call_macro("virtual_print_base_environment")
+        assert f"DBT_VIRTUAL_BASE_ENV:{expected_base}" in hb.logs, hb.logs
+    print("[base_environment] a Jinja base_environment is rendered per target.")
     return skipped
 
 
