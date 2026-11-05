@@ -42,6 +42,8 @@ Because BigQuery is our primary production warehouse, `dbt-virtual` handles seve
    `dbt-virtual diff` recognizes BigQuery's widening rules (`INT64 -> NUMERIC / BIGNUMERIC / FLOAT64`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`, and aliases `INT == INT64`, `DECIMAL == NUMERIC`) as `TYPE_WIDENED` (non-breaking).
 8. **Isolated TVF Unit Testing (`tvf_test_ref`)**:
    Enables zero-I/O unit testing of BigQuery Table Functions using `ANY TABLE` parameters and `TABLE <cte_name>` arguments.
+9. **Several locations (EU and US datasets)**:
+   A view cannot read a table in another location and `CLONE` needs the same location, so `physical_schemas_by_location` gives each location its own physical schema and registry, models choose one with `+virtual_location` (or the profile's `location`), and `promote` / `rollback` / `gc` / `status` run once per location. Datasets the package creates get `OPTIONS (location = ...)`. See [Configuration Reference](configuration_reference.md#physical_schemas_by_location-multi-region-bigquery). Verified on DuckDB with two physical schemas; not yet on real BigQuery.
 
 ---
 
