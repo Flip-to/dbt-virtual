@@ -580,7 +580,7 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
         "analytics_physical.orders__fp123",
         "rel_1",
     )
-    assert "DELETE FROM analytics_physical._environments" in upsert_sql
+    assert "WITH replaced AS" in upsert_sql and "DELETE FROM analytics_physical._environments" in upsert_sql
     assert "INSERT INTO analytics_physical._environments" in upsert_sql
 
     # Snowflake dispatch: CLONE, UDF/TVF/Procedure DDL, and orphan table query
