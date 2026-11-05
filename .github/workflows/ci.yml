@@ -121,21 +121,7 @@ jobs:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_concurrency_upgrade_e2e.py
-      - name: Probe the emulator for what real dbt-bigquery needs
-        id: dbt_bq_probe
-        env:
-          BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
-          BIGQUERY_EMULATOR_PROJECT: "test-project"
-        run: uv run --python 3.11 python scripts/probe_bq_emulator_dbt_support.py
-      - name: "GATED: real dbt-bigquery E2E skipped, the emulator is missing fixes"
-        if: steps.dbt_bq_probe.outputs.supported != 'true'
-        # Not silently skipped: a warning annotation names what is missing. Remove this step, the
-        # probe step and scripts/probe_bq_emulator_dbt_support.py when the emulator PRs listed in
-        # .beans/dbt-virtual-0031--real-dbt-bigquery-on-emulator.md are merged.
-        run: |
-          echo "::warning title=Real dbt-bigquery E2E skipped::flipto/main lacks: ${{ steps.dbt_bq_probe.outputs.missing }}. See .beans/dbt-virtual-0031--real-dbt-bigquery-on-emulator.md"
       - name: Real dbt-core + dbt-bigquery E2E (dbt-virtual lifecycle on the emulator)
-        if: steps.dbt_bq_probe.outputs.supported == 'true'
         env:
           DBT_VIRTUAL_BQ_EMULATOR: "http://127.0.0.1:9050"
           DBT_VIRTUAL_BQ_EMULATOR_PROJECT: "test-project"
