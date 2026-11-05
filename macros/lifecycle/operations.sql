@@ -126,14 +126,14 @@
     {%- set cand_ident = row[1] -%}
     {%- set cand_tbl = cand_ident.split('.')[-1] -%}
     {%- set cand_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=cand_tbl, type='table') -%}
-    {%- set cand_cnt_res = run_query("SELECT COUNT(*) FROM " ~ cand_rel) -%}
+    {%- set cand_cnt_res = run_query(dbt_virtual.row_count_sql(cand_rel)) -%}
     {%- set cand_cnt = cand_cnt_res.rows[0][0] | int if (cand_cnt_res and (cand_cnt_res.rows | length) > 0) else 0 -%}
 
     {%- set base_ident = base_map.get(model_name, '') -%}
     {%- if base_ident != '' -%}
       {%- set base_tbl = base_ident.split('.')[-1] -%}
       {%- set base_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=base_tbl, type='table') -%}
-      {%- set base_cnt_res = run_query("SELECT COUNT(*) FROM " ~ base_rel) -%}
+      {%- set base_cnt_res = run_query(dbt_virtual.row_count_sql(base_rel)) -%}
       {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
 
       {%- if cand_cnt == 0 and base_cnt > 0 and not allow_empty -%}
@@ -250,20 +250,29 @@
     {%- endset -%}
   {%- else -%}
     {%- set query -%}
+      {#- Routines need their DDL template to be deployed into `to_env` (e.g. `init-env`); take it
+          from any release that recorded the same routine fingerprint. `CAST(NULL AS STRING)` also
+          failed on PostgreSQL. -#}
       SELECT
-        model_name,
-        resource_type,
-        fingerprint,
-        physical_identifier,
-        CAST(NULL AS STRING) AS routine_ddl_template,
-        CASE resource_type
+        e.model_name,
+        e.resource_type,
+        e.fingerprint,
+        e.physical_identifier,
+        (
+          SELECT MAX(r.routine_ddl_template)
+          FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} AS r
+          WHERE r.model_name = e.model_name
+            AND r.resource_type = e.resource_type
+            AND r.fingerprint = e.fingerprint
+        ) AS routine_ddl_template,
+        CASE e.resource_type
           WHEN 'function' THEN 1
           WHEN 'model' THEN 2
           WHEN 'table_function' THEN 3
           ELSE 4
         END AS dependency_tier
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
-      WHERE environment = '{{ from_env }}'
+      FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} AS e
+      WHERE e.environment = '{{ from_env }}'
       ORDER BY dependency_tier ASC, model_name ASC
     {%- endset -%}
   {%- endif -%}
@@ -358,9 +367,21 @@
     )) -%}
   {%- endfor -%}
 
-  {#- Phase 3: Demote removed objects that were previously in `to_env` but are no longer in the promoted set -#}
+  {#- Phase 3: Demote removed objects that were previously in `to_env` but are no longer in the promoted set.
+      A model that is still a virtual node in this project is never demoted: a release written by a
+      partial build (REUSE models, `--select`) does not list it, and demoting it dropped live views. -#}
+  {%- set project_virtual_names = [] -%}
+  {%- if graph is defined and graph.nodes is defined -%}
+    {%- for node in graph.nodes.values() -%}
+      {%- if dbt_virtual.is_virtual_node(node) -%}
+        {%- do project_virtual_names.append(dbt_virtual.node_attr(node, 'name', '')) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
   {%- for old_name, old_type in existing_type_map.items() -%}
-    {%- if old_name not in promoted_names -%}
+    {%- if old_name not in promoted_names and old_name in project_virtual_names -%}
+      {{ log("dbt-virtual promote [" ~ to_env ~ "]: Keeping " ~ old_type ~ " " ~ old_name ~ " (not in release " ~ release_id ~ " but still a virtual model in this project)", info=True) }}
+    {%- elif old_name not in promoted_names -%}
       {%- set demote_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=old_name, type='view') -%}
       {{ log("dbt-virtual demote [" ~ to_env ~ "]: Removing demoted " ~ old_type ~ " " ~ demote_rel, info=True) }}
       {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(demote_rel, old_type)) -%}
@@ -436,6 +457,16 @@
   {%- endif -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set env_schema = dbt_virtual.get_env_schema(env) -%}
+  {#- Never drop a schema that holds shared physical tables or belongs to another environment. -#}
+  {%- set protected = {(phys_schema | lower): 'physical_schema', (dbt_virtual.get_env_schema(base_env) | lower): 'base_environment ' ~ base_env} -%}
+  {%- for other_env, other_schema in (cfg.get('env_schemas', {}) or {}).items() -%}
+    {%- if other_env != env -%}
+      {%- do protected.update({(other_schema | lower): 'environment ' ~ other_env}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if (env_schema | lower) in protected -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual drop-env: Refusing to drop schema '" ~ env_schema ~ "' of env '" ~ env ~ "': it is the schema of " ~ protected[env_schema | lower] ~ ".") }}
+  {%- endif -%}
 
   {{ log("dbt-virtual drop-env: Dropping schema " ~ env_schema ~ " and cleaning _environments for env=" ~ env, info=True) }}
   {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_schema_cascade_sql(env_schema)) -%}
@@ -522,6 +553,8 @@
       {%- set rendered_ddl = routine_ddl | replace('__DBT_VIRTUAL_ENV_SCHEMA__', env_schema) -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying routine " ~ env_schema ~ "." ~ model_name, info=True) }}
       {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
+      {#- Same identifier `virtual_promote` records for a deployed routine. -#}
+      {%- set phys_ident = env_schema ~ '.' ~ model_name -%}
     {%- endif -%}
 
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
@@ -534,6 +567,21 @@
       target_release
     )) -%}
   {%- endfor -%}
+
+  {#- Mark the releases being undone so the next default rollback walks further back instead of
+      returning to the same "previous" release, then make the target the active release. -#}
+  {%- set releases_rel = dbt_virtual.registry_relation(phys_schema, '_releases') -%}
+  {%- do dbt_virtual.exec_ddl_dml(
+    "UPDATE " ~ releases_rel
+    ~ " SET status = 'rolled_back', rolled_back_at = " ~ dbt_virtual.current_timestamp_sql()
+    ~ " WHERE target_environment = '" ~ env ~ "' AND status = 'promoted' AND release_id != '" ~ target_release ~ "'"
+    ~ " AND promoted_at > (SELECT MAX(t.promoted_at) FROM " ~ releases_rel ~ " AS t WHERE t.release_id = '" ~ target_release ~ "')"
+  ) -%}
+  {%- do dbt_virtual.exec_ddl_dml(
+    "UPDATE " ~ releases_rel
+    ~ " SET status = 'promoted', target_environment = '" ~ env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql()
+    ~ ", rolled_back_at = NULL WHERE release_id = '" ~ target_release ~ "'"
+  ) -%}
 
   {#- Remove objects introduced after the selected release and clear their active pointers. -#}
   {%- for removed_name, removed_type in current_env_types.items() -%}
@@ -602,9 +650,8 @@
 
   {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_schema_if_not_exists_sql(phys_schema)) -%}
   {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_schema_if_not_exists_sql(env_schema)) -%}
-  {%- for stmt in dbt_virtual.ensure_registry_tables_sql(phys_schema) -%}
-    {%- do dbt_virtual.exec_ddl_dml(stmt) -%}
-  {%- endfor -%}
+  {#- `ensure_registry_tables_sql` returns one SQL string; iterating it ran one statement per character. -#}
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.ensure_registry_tables_sql(phys_schema)) -%}
 
   {%- set nodes_dict = graph.get('nodes', {}) if graph is mapping else {} -%}
   {%- for unique_id, node in nodes_dict.items() -%}
@@ -619,8 +666,12 @@
         {%- set phys_ident = phys_schema ~ '.' ~ phys_table -%}
         {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
         {%- set existing_rel = adapter.get_relation(database=target.database, schema=env_schema, identifier=model_name) -%}
+        {%- set phys_exists = adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) is not none -%}
 
-        {%- if existing_rel is not none -%}
+        {%- if existing_rel is not none and existing_rel.type is defined and existing_rel.type == 'view' -%}
+          {#- Already a view (adopted before, or a view model): a view cannot be cloned. -#}
+          {{ log("dbt-virtual adopt [" ~ env ~ "]: " ~ existing_rel ~ " is already a view; not cloning.", info=True) }}
+        {%- elif existing_rel is not none -%}
           {{ log("dbt-virtual adopt [" ~ env ~ "]: Cloning existing table " ~ existing_rel ~ " -> " ~ phys_rel ~ " (0 compute)", info=True) }}
           {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.clone_table_sql(existing_rel, phys_rel)) -%}
           {%- if drop_existing_table -%}
@@ -631,10 +682,16 @@
             {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
             {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
           {%- endif -%}
+          {%- set phys_exists = true -%}
         {%- else -%}
           {{ log("dbt-virtual adopt [" ~ env ~ "]: Existing relation " ~ env_schema ~ "." ~ model_name ~ " not found; skipping clone.", info=True) }}
         {%- endif -%}
 
+        {%- if not phys_exists -%}
+          {#- Registering a pointer to a table that does not exist made `plan` report REUSE and
+              `promote` fail its pre-flight. -#}
+          {{ log("dbt-virtual adopt [" ~ env ~ "]: " ~ phys_rel ~ " does not exist; not registering " ~ model_name ~ ".", info=True) }}
+        {%- else -%}
         {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
           phys_schema,
           env,
@@ -676,7 +733,106 @@
           )
         {%- endset -%}
         {%- do dbt_virtual.exec_ddl_dml(ins_rel_sql) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro virtual_seed_incremental_clones(model_names=[]) -%}
+  {#- run-operation entry point for `seed_incremental_clones` (called by `dbt-virtual build`). -#}
+  {%- do dbt_virtual.seed_incremental_clones(model_names=(model_names or [])) -%}
+{%- endmacro %}
+
+
+{% macro virtual_snapshot_release(env='staging', release_id='', models_json='{}') -%}
+  {#-
+    Completes `release_id` so it describes the whole environment, not only what this build ran.
+    Hooks register a release row only for models dbt built; REUSE tables, unchanged routines and
+    unselected models were missing, so promoting or rolling back to that release demoted them.
+
+    For every current virtual node in `models_json` (`{name: {"materialized": ...}}`) that has no
+    row in the release yet, copies the environment's active pointer (and, for routines, the latest
+    recorded DDL template for that fingerprint) into `_releases`.
+  -#}
+  {%- if release_id == '' -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual snapshot-release: release_id is required.") }}
+  {%- endif -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set releases_rel = dbt_virtual.registry_relation(phys_schema, '_releases') -%}
+  {%- set models_map = fromjson(models_json) if models_json is string else models_json -%}
+  {%- do dbt_virtual.ensure_registry() -%}
+
+  {%- set in_release = [] -%}
+  {%- set rel_rows = run_query("SELECT model_name FROM " ~ releases_rel ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
+  {%- if rel_rows -%}
+    {%- for row in rel_rows.rows -%}
+      {%- do in_release.append(row[0]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set env_query -%}
+    SELECT model_name, resource_type, fingerprint, physical_identifier
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment = '{{ env }}'
+  {%- endset -%}
+  {%- set env_rows = run_query(env_query) -%}
+  {%- set env_ptrs = {} -%}
+  {%- if env_rows -%}
+    {%- for row in env_rows.rows -%}
+      {%- do env_ptrs.update({row[0]: {'resource_type': row[1], 'fingerprint': row[2], 'physical_identifier': row[3]}}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set template_query -%}
+    SELECT model_name, fingerprint, routine_ddl_template
+    FROM {{ releases_rel }}
+    WHERE resource_type != 'model'
+      AND routine_ddl_template IS NOT NULL
+    ORDER BY created_at ASC
+  {%- endset -%}
+  {%- set template_rows = run_query(template_query) -%}
+  {%- set templates = {} -%}
+  {%- if template_rows -%}
+    {%- for row in template_rows.rows -%}
+      {%- do templates.update({row[0] ~ '|' ~ row[1]: row[2]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set values = [] -%}
+  {%- for model_name, info in models_map.items() | sort -%}
+    {%- set mat = (info or {}).get('materialized', '') if info is mapping else '' -%}
+    {%- set ptr = env_ptrs.get(model_name) -%}
+    {%- if model_name in in_release or mat not in ['table', 'incremental', 'table_function', 'function', 'procedure'] -%}
+    {%- elif ptr is none -%}
+      {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: " ~ model_name ~ " has no pointer in env=" ~ env ~ "; it is not part of the release.", info=True) }}
+    {%- else -%}
+      {%- set rtype = ptr['resource_type'] -%}
+      {%- set tier = {'function': 1, 'model': 2, 'table_function': 3}.get(rtype, 4) -%}
+      {%- set template = templates.get(model_name ~ '|' ~ ptr['fingerprint']) if rtype != 'model' else none -%}
+      {%- if (info or {}).get('fingerprint') and info.get('fingerprint') != ptr['fingerprint'] -%}
+        {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: " ~ model_name ~ " in env=" ~ env ~ " is at " ~ ptr['fingerprint'] ~ ", not the planned " ~ info.get('fingerprint') ~ "; recording the environment's version.", info=True) }}
+      {%- endif -%}
+      {%- do values.append(
+        "('" ~ release_id ~ "', '" ~ env ~ "', NULL, '" ~ model_name ~ "', '" ~ rtype ~ "', " ~ tier ~ ", '"
+        ~ ptr['fingerprint'] ~ "', '" ~ ptr['physical_identifier'] ~ "', "
+        ~ (dbt_virtual.sql_string_literal(template) if template is not none else 'NULL')
+        ~ ", 'candidate', " ~ dbt_virtual.current_timestamp_sql() ~ ", NULL, NULL)"
+      ) -%}
+    {%- endif -%}
+  {%- endfor -%}
+
+  {%- for batch in values | batch(200) -%}
+    {%- set insert_sql -%}
+      INSERT INTO {{ releases_rel }} (
+        release_id, source_environment, target_environment, model_name, resource_type, dependency_tier,
+        fingerprint, physical_identifier, routine_ddl_template, status, created_at, promoted_at, rolled_back_at
+      ) VALUES
+      {{ batch | join(',\n') }}
+    {%- endset -%}
+    {%- do dbt_virtual.exec_sql_statement(insert_sql) -%}
+  {%- endfor -%}
+  {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: added " ~ (values | length) ~ " unchanged object(s) from env=" ~ env ~ ".", info=True) }}
 {%- endmacro %}

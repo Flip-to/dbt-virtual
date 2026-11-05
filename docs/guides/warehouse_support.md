@@ -26,7 +26,7 @@ Because BigQuery is our primary production warehouse, `dbt-virtual` handles seve
 1. **`table_type = 'CLONE'` and `'SNAPSHOT'` Discovery**:
    In BigQuery `INFORMATION_SCHEMA.TABLES`, tables created via `CREATE TABLE ... CLONE ...` report `table_type = 'CLONE'` rather than `'BASE TABLE'`. Both `bigquery__find_orphan_tables_sql` and `bigquery__list_physical_tables_sql` explicitly include `('BASE TABLE', 'CLONE', 'SNAPSHOT')`.
 2. **Post-Clone `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`**:
-   When an incremental model adds new columns (`virtual_add_columns`), `clone_if_new_fp` clones the `prod` table and immediately adds the new columns before dbt's `insert_overwrite` or `merge` runs.
+   When an incremental model adds new columns (`virtual_add_columns`), `seed_incremental_clones` clones the `prod` table and immediately adds the new columns before dbt's `insert_overwrite` or `merge` runs.
 3. **Compatible Type Widening**:
    `dbt-virtual diff` recognizes BigQuery's widening rules (`INT64 -> NUMERIC / BIGNUMERIC / FLOAT64`, `DATE -> DATETIME / TIMESTAMP`, `STRING(n) -> STRING`, and aliases `INT == INT64`, `DECIMAL == NUMERIC`) as `TYPE_WIDENED` (non-breaking).
 4. **Isolated TVF Unit Testing (`tvf_test_ref`)**:

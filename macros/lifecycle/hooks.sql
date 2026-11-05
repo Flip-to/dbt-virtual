@@ -9,122 +9,134 @@
 {%- endmacro %}
 
 
-{% macro clone_if_new_fp() -%}
+{% macro seed_incremental_clones(model_names=none) -%}
   {#-
-    Pre-hook for virtualized incremental models:
-    If the fingerprinted physical table `<physical_schema>.<model>__<fp>` does not exist yet
-    and `--full-refresh` is not active, seeds it via zero-copy `CLONE` from `base_environment` ('prod').
+    Seeds new fingerprint tables of virtualized incremental models from `base_environment` ('prod')
+    via zero-copy `CLONE`, BEFORE dbt materializes them.
+
+    Run it from `on-run-start` (`"{{ dbt_virtual.seed_incremental_clones() }}"`, scoped to the
+    selected resources) or as `dbt run-operation virtual_seed_incremental_clones` (the CLI does
+    this for SEED_INCREMENTAL plan actions).
+
+    It cannot be a model pre-hook: dbt's incremental materializations (dbt-core and dbt-bigquery
+    1.12) load `existing_relation` before `run_hooks(pre_hooks)`, so a clone made in a pre-hook is
+    ignored and then replaced (`create or replace table` on BigQuery, "already exists" elsewhere).
   -#}
-  {%- if not execute or not dbt_virtual.is_virtual_node(model) -%}
+  {%- if not execute or flags.FULL_REFRESH -%}
     {{ return('') }}
   {%- endif -%}
-
-  {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
-  {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', '') -%}
-  {%- if mat != 'incremental' or flags.FULL_REFRESH -%}
+  {#- `dbt compile` (and `dbt-virtual plan`) also run on-run-start hooks; only clone for runs that build. -#}
+  {%- if model_names is none and flags.WHICH is defined and flags.WHICH not in ['run', 'build', 'retry'] -%}
     {{ return('') }}
   {%- endif -%}
+  {%- set selected = none -%}
+  {%- if model_names is none and selected_resources is defined -%}
+    {%- set selected = selected_resources -%}
+  {%- endif -%}
 
-  {%- set existing_target = adapter.get_relation(
-    database=this.database,
-    schema=this.schema,
-    identifier=this.identifier
-  ) -%}
-  {%- if existing_target is not none -%}
-    {#- Fingerprint table already exists; normal incremental run in place -#}
+  {%- set candidates = [] -%}
+  {%- set nodes_dict = graph.nodes if (graph is defined and graph.nodes is defined) else {} -%}
+  {%- for node in nodes_dict.values() -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- set node_name = dbt_virtual.node_attr(node, 'name', '') -%}
+    {%- if dbt_virtual.is_virtual_node(node) and dbt_virtual.node_attr(node_cfg, 'materialized', '') == 'incremental' -%}
+      {%- if model_names is not none -%}
+        {%- if node_name in model_names -%}
+          {%- do candidates.append(node) -%}
+        {%- endif -%}
+      {%- elif selected is none or dbt_virtual.node_attr(node, 'unique_id', '') in selected -%}
+        {%- do candidates.append(node) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if (candidates | length) == 0 -%}
     {{ return('') }}
   {%- endif -%}
 
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
-
   {%- do dbt_virtual.ensure_registry() -%}
 
-  {%- set lookup_query -%}
-    SELECT physical_identifier
+  {%- set base_query -%}
+    SELECT model_name, physical_identifier
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment = '{{ base_env }}'
-      AND model_name = '{{ model.name }}'
       AND resource_type = 'model'
-    LIMIT 1
   {%- endset -%}
-
-  {%- set results = run_query(lookup_query) -%}
-  {%- if results and (results.rows | length) > 0 -%}
-    {%- set base_phys_ident = results.rows[0][0] -%}
-    {%- set base_table_name = base_phys_ident.split('.')[-1] -%}
-    {%- set source_rel = api.Relation.create(
-      database=this.database,
-      schema=phys_schema,
-      identifier=base_table_name,
-      type='table'
-    ) -%}
-    {%- set source_exists = adapter.get_relation(
-      database=source_rel.database,
-      schema=source_rel.schema,
-      identifier=source_rel.identifier
-    ) -%}
-    {%- if source_exists is not none -%}
-      {{ log("dbt-virtual: Seeding " ~ this ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
-      {#- Prime dbt's relation cache so subsequent is_incremental() checks during model execution return True -#}
-      {%- do adapter.cache_added(this) -%}
-      {%- set clone_sql = dbt_virtual.clone_table_sql(source_rel, this) -%}
-      {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
-      {%- set add_cols = dbt_virtual.node_attr(node_cfg, 'virtual_add_columns', []) or [] -%}
-      {%- set alter_stmts = [clone_sql] -%}
-      {%- for col_spec in add_cols -%}
-        {%- do alter_stmts.append("ALTER TABLE " ~ this ~ " ADD COLUMN IF NOT EXISTS " ~ col_spec) -%}
-      {%- endfor -%}
-      {{ return(alter_stmts | join(';\n')) }}
-    {%- endif -%}
+  {%- set base_rows = run_query(base_query) -%}
+  {%- set base_map = {} -%}
+  {%- if base_rows -%}
+    {%- for row in base_rows.rows -%}
+      {%- do base_map.update({row[0]: row[1]}) -%}
+    {%- endfor -%}
   {%- endif -%}
 
+  {%- for node in candidates -%}
+    {%- set node_name = dbt_virtual.node_attr(node, 'name', '') -%}
+    {%- set node_db = dbt_virtual.node_attr(node, 'database', target.database) -%}
+    {%- set target_rel = api.Relation.create(
+      database=node_db,
+      schema=dbt_virtual.node_attr(node, 'schema', phys_schema),
+      identifier=dbt_virtual.node_attr(node, 'alias', node_name),
+      type='table'
+    ) -%}
+    {%- set base_ident = base_map.get(node_name, '') -%}
+    {%- set base_table_name = base_ident.split('.')[-1] if base_ident else '' -%}
+    {%- if base_table_name != '' and base_table_name != target_rel.identifier
+          and adapter.get_relation(database=target_rel.database, schema=target_rel.schema, identifier=target_rel.identifier) is none -%}
+      {%- set source_rel = api.Relation.create(database=node_db, schema=phys_schema, identifier=base_table_name, type='table') -%}
+      {%- if adapter.get_relation(database=source_rel.database, schema=source_rel.schema, identifier=source_rel.identifier) is not none -%}
+        {{ log("dbt-virtual: Seeding " ~ target_rel ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
+        {%- do dbt_virtual.exec_sql_statement(dbt_virtual.clone_table_sql(source_rel, target_rel)) -%}
+        {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+        {%- for col_spec in (dbt_virtual.node_attr(node_cfg, 'virtual_add_columns', []) or []) -%}
+          {%- do dbt_virtual.exec_sql_statement("ALTER TABLE " ~ target_rel ~ " ADD COLUMN IF NOT EXISTS " ~ col_spec) -%}
+        {%- endfor -%}
+        {#- dbt has already cached the schema listing; register the clone so the materialization
+            and `is_incremental()` see it as an existing table. -#}
+        {%- do adapter.cache_added(target_rel) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ return('') }}
+{%- endmacro %}
+
+
+{% macro clone_if_new_fp() -%}
+  {#-
+    Deprecated pre-hook kept so existing `+pre-hook` configs keep working. Seeding moved to
+    `seed_incremental_clones()` (on-run-start / CLI), because a clone made here is ignored by the
+    incremental materialization. When the table is still missing at this point, dbt does a full
+    build, which is correct but not zero-copy; say so.
+  -#}
+  {%- if not execute or not dbt_virtual.is_virtual_node(model) -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
+  {%- if dbt_virtual.node_attr(node_cfg, 'materialized', '') != 'incremental' or flags.FULL_REFRESH -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- if adapter.get_relation(database=this.database, schema=this.schema, identifier=this.identifier) is none -%}
+    {{ log("dbt-virtual: " ~ this ~ " was not seeded before the run; dbt will fully build it. Add `{{ dbt_virtual.seed_incremental_clones() }}` to on-run-start or use `dbt-virtual build` to clone from the base environment.", info=True) }}
+  {%- endif -%}
   {{ return('') }}
 {%- endmacro %}
 
 
 {% macro is_incremental() -%}
   {#-
-    Virtual-environment-aware `is_incremental()` helper:
-    Returns True if standard `builtins.is_incremental()` is True OR if `clone_if_new_fp` will seed
-    `<this>` from `base_environment` (`prod`) in its pre-hook.
+    Kept for backward compatibility. Once `seed_incremental_clones()` has cloned the base table
+    before the run, dbt's own `is_incremental()` is already True. Returning True for a table that
+    does not exist yet made BigQuery's `create or replace table` keep only the incremental delta.
   -#}
-  {%- if builtins.is_incremental() -%}
-    {{ return(true) }}
-  {%- endif -%}
-  {%- if not execute or not dbt_virtual.is_virtual_node(model) -%}
-    {{ return(false) }}
-  {%- endif -%}
-  {%- set mat = model.get('config', {}).get('materialized', '') -%}
-  {%- if mat != 'incremental' or flags.FULL_REFRESH -%}
-    {{ return(false) }}
-  {%- endif -%}
-  {%- set cfg = dbt_virtual.get_config() -%}
-  {%- set phys_schema = cfg.get('physical_schema') -%}
-  {%- set base_env = cfg.get('base_environment', 'prod') -%}
-  {%- set lookup_query -%}
-    SELECT physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
-    WHERE environment = '{{ base_env }}'
-      AND model_name = '{{ model.name }}'
-      AND resource_type = 'model'
-    LIMIT 1
-  {%- endset -%}
-  {%- set results = run_query(lookup_query) -%}
-  {%- if results and (results.rows | length) > 0 -%}
-    {%- set base_phys_ident = results.rows[0][0] -%}
-    {%- set base_table_name = base_phys_ident.split('.')[-1] -%}
-    {%- set base_relation = adapter.get_relation(
-      database=target.database,
-      schema=phys_schema,
-      identifier=base_table_name
-    ) -%}
-    {%- if base_relation is not none -%}
-      {{ return(true) }}
-    {%- endif -%}
-  {%- endif -%}
-  {{ return(false) }}
+  {{ return(builtins.is_incremental()) }}
+{%- endmacro %}
+
+
+{% macro virtual_is_incremental() -%}
+  {#- Name used in docs/guides/getting_started.md. -#}
+  {{ return(dbt_virtual.is_incremental()) }}
 {%- endmacro %}
 
 
@@ -149,12 +161,24 @@
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set env_name = dbt_virtual.get_current_env() -%}
   {%- set env_schema = dbt_virtual.get_env_schema(env_name) -%}
-  {%- set fp = dbt_virtual.get_fingerprint(model) -%}
+  {#- Register the fingerprint that is actually in the physical name. Without CLI-precomputed
+      fingerprints, the alias is generated at parse time (`execute` is False, so no parent walk)
+      while `get_fingerprint` at run time walks parents; the two differ for any model with parents. -#}
+  {%- set fp_prefix = model.name ~ '__' -%}
+  {%- if this.identifier.startswith(fp_prefix) -%}
+    {%- set fp = this.identifier[(fp_prefix | length):] -%}
+  {%- else -%}
+    {%- set fp = dbt_virtual.get_fingerprint(model) -%}
+  {%- endif -%}
   {%- set release_id = var('_dbt_virtual_release', '') -%}
 
   {%- do dbt_virtual.ensure_registry() -%}
 
   {%- set existing_env_rel = adapter.get_relation(database=this.database, schema=env_schema, identifier=model.name) -%}
+  {%- if existing_env_rel is none and adapter.check_schema_exists is defined and not adapter.check_schema_exists(this.database, env_schema) -%}
+    {#- Unmapped environments (`pr_42` -> `<base_schema>_pr_42`) may not have a schema yet. -#}
+    {%- do adapter.create_schema(api.Relation.create(database=this.database, schema=env_schema)) -%}
+  {%- endif -%}
   {%- set drop_legacy_tbl_stmt = '' -%}
   {%- if existing_env_rel is not none and existing_env_rel.type is defined and existing_env_rel.type == 'table' -%}
     {%- set drop_legacy_tbl_stmt = dbt_virtual.drop_object_if_exists_sql(existing_env_rel, 'table') ~ ';\n' -%}
@@ -267,7 +291,7 @@
       body_sql
     ) -%}
 
-    {%- set ddl_template = full_ddl | replace(env_schema, '__DBT_VIRTUAL_ENV_SCHEMA__') -%}
+    {%- set ddl_template = dbt_virtual.env_schema_placeholder_sql(full_ddl, env_schema) -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}
       {{ dbt_virtual.upsert_environment_pointer_sql(
@@ -304,7 +328,7 @@
         {{ dep_tier }},
         '{{ fp }}',
         '{{ target_relation.schema }}.{{ target_relation.identifier }}',
-        {{ dbt.string_literal(ddl_template) }},
+        {{ dbt_virtual.sql_string_literal(ddl_template) }},
         'candidate',
         {{ dbt_virtual.current_timestamp_sql() }},
         NULL,

@@ -130,29 +130,6 @@ def cmd_build(ns: argparse.Namespace) -> int:
     )
     models_to_build, reused_models = compute_dbt_select_for_build(actions)
 
-    # 1. Zero-compute view pointer sync for REUSE models
-    if reused_models:
-        sync_args = {
-            "env": ns.env,
-            "release_id": ns.release or "",
-            "models_json": json.dumps(reused_models),
-        }
-        rc = _run_dbt(
-            ["run-operation", "virtual_sync_reused_views", "--args", json.dumps(sync_args)],
-            project_dir,
-        )
-        if rc != 0:
-            return rc
-
-    # If the plan has nothing to build and no explicit selector overrides it, do not
-    # fall through to an unscoped `dbt build` (which would build the whole project).
-    if not models_to_build and not ns.select:
-        if reused_models:
-            print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
-        else:
-            print("dbt-virtual build: No planned models require a build.")
-        return 0
-
     by_name = {fp.name: fp.fingerprint for fp in fps.values()}
     dbt_vars: dict[str, object] = {
         "_dbt_virtual_fps": by_name,
@@ -163,6 +140,64 @@ def cmd_build(ns: argparse.Namespace) -> int:
         dbt_vars["_dbt_virtual_start"] = ns.start
     if ns.end:
         dbt_vars["_dbt_virtual_end"] = ns.end
+
+    def _run_operation(name: str, op_args: dict[str, object]) -> int:
+        # Same target and vars as the build, so node schemas/aliases match what dbt builds.
+        return _run_dbt(
+            [
+                "run-operation",
+                name,
+                "--target",
+                ns.env,
+                "--args",
+                json.dumps(op_args),
+                "--vars",
+                json.dumps(dbt_vars),
+            ],
+            project_dir,
+        )
+
+    def _snapshot_release() -> int:
+        # Record every current virtual node in the release, not only what dbt built, so that
+        # promote/rollback of this release do not demote REUSE models and unchanged routines.
+        if not ns.release:
+            return 0
+        current = {
+            fp.name: {"fingerprint": fp.fingerprint, "materialized": fp.materialized}
+            for fp in fps.values()
+        }
+        return _run_operation(
+            "virtual_snapshot_release",
+            {"env": ns.env, "release_id": ns.release, "models_json": json.dumps(current)},
+        )
+
+    # 1. Zero-compute view pointer sync for REUSE models
+    if reused_models:
+        sync_args = {
+            "env": ns.env,
+            "release_id": ns.release or "",
+            "models_json": json.dumps(reused_models),
+        }
+        rc = _run_operation("virtual_sync_reused_views", sync_args)
+        if rc != 0:
+            return rc
+
+    # If the plan has nothing to build and no explicit selector overrides it, do not
+    # fall through to an unscoped `dbt build` (which would build the whole project).
+    if not models_to_build and not ns.select:
+        if reused_models:
+            print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
+        else:
+            print("dbt-virtual build: No planned models require a build.")
+        return _snapshot_release()
+
+    # 2. Clone base tables for SEED_INCREMENTAL models before dbt starts: dbt's incremental
+    # materialization decides "new table" before model pre-hooks run.
+    seed_names = sorted(a.name for a in actions.values() if a.action == "SEED_INCREMENTAL")
+    if seed_names:
+        rc = _run_operation("virtual_seed_incremental_clones", {"model_names": seed_names})
+        if rc != 0:
+            return rc
 
     build_args = [
         "build",
@@ -177,7 +212,10 @@ def cmd_build(ns: argparse.Namespace) -> int:
         build_args.extend(["--select", " ".join(models_to_build)])
     if ns.full_refresh:
         build_args.append("--full-refresh")
-    return _run_dbt(build_args, project_dir)
+    rc = _run_dbt(build_args, project_dir)
+    if rc != 0:
+        return rc
+    return _snapshot_release()
 
 
 def cmd_promote(ns: argparse.Namespace) -> int:

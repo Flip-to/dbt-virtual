@@ -49,6 +49,10 @@ You can migrate your existing dbt project either **gradually (one folder or mode
        retention_releases: 5
        retention_days: 7
 
+   on-run-start:
+     # Clone the base environment's table for changed incremental models BEFORE dbt materializes them.
+     - "{{ dbt_virtual.seed_incremental_clones() }}"
+
    models:
      my_existing_project:
        # Start with one folder (e.g. metrics) or enable across your marts:

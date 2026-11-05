@@ -12,9 +12,30 @@
     'retention_releases': 5,
     'retention_days': 7
   } -%}
-  {%- set user_cfg = var('dbt_virtual', {}) -%}
-  {%- do defaults.update(user_cfg) -%}
+  {%- set user_cfg = var('dbt_virtual', {}) or {} -%}
+  {#- dbt renders a var only when its whole value is a string, so Jinja nested inside the
+      `dbt_virtual` mapping (e.g. `environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"`)
+      arrives here unrendered. Render string values ourselves. -#}
+  {%- for key, value in user_cfg.items() -%}
+    {%- if value is mapping -%}
+      {%- set rendered_map = {} -%}
+      {%- for sub_key, sub_value in value.items() -%}
+        {%- do rendered_map.update({sub_key: dbt_virtual.render_config_value(sub_value)}) -%}
+      {%- endfor -%}
+      {%- do defaults.update({key: rendered_map}) -%}
+    {%- else -%}
+      {%- do defaults.update({key: dbt_virtual.render_config_value(value)}) -%}
+    {%- endif -%}
+  {%- endfor -%}
   {{ return(defaults) }}
+{%- endmacro %}
+
+
+{% macro render_config_value(value) -%}
+  {%- if value is string and ('{{' in value or '{%' in value) and render is defined -%}
+    {{ return(render(value) | trim) }}
+  {%- endif -%}
+  {{ return(value) }}
 {%- endmacro %}
 
 
@@ -46,6 +67,10 @@
   {%- if node is none or node is undefined -%}
     {{ return(false) }}
   {%- endif -%}
+  {#- on-run-start/on-run-end hooks inherit `+virtual_env` from `models:` config but are not deployable. -#}
+  {%- if dbt_virtual.node_attr(node, 'resource_type', 'model') == 'operation' -%}
+    {{ return(false) }}
+  {%- endif -%}
   {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
   {%- if dbt_virtual.node_attr(node_cfg, 'virtual_env', false) == true -%}
     {{ return(true) }}
@@ -71,8 +96,17 @@
 {% macro get_env_schema(env_name=none) -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set active_env = env_name if env_name is not none else dbt_virtual.get_current_env() -%}
-  {%- set env_schemas = cfg.get('env_schemas', {}) -%}
-  {{ return(env_schemas.get(active_env, target.schema)) }}
+  {%- set env_schemas = cfg.get('env_schemas', {}) or {} -%}
+  {%- if active_env in env_schemas -%}
+    {{ return(env_schemas[active_env]) }}
+  {%- endif -%}
+  {#- Unmapped environments (e.g. `pr_42`) get `<base_env_schema>_<env>`, as documented in
+      docs/guides/configuration_reference.md. Falling back to `target.schema` made
+      `drop-env --env pr_42` drop the caller's target schema. -#}
+  {%- set base_env = cfg.get('base_environment', 'prod') -%}
+  {%- set base_schema = env_schemas.get(base_env, target.schema) -%}
+  {%- set env_suffix = modules.re.sub('[^0-9A-Za-z_]', '_', active_env | string) if modules is defined else (active_env | string) -%}
+  {{ return(base_schema ~ '_' ~ env_suffix) }}
 {%- endmacro %}
 
 

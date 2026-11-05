@@ -96,6 +96,10 @@ vars:
     retention_releases: 5
     retention_days: 7
 
+on-run-start:
+  # Clone the base environment's table for changed incremental models BEFORE dbt materializes them.
+  - "{{ dbt_virtual.seed_incremental_clones() }}"
+
 models:
   my_project:
     metrics:
