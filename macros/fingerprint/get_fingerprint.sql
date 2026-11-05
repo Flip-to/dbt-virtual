@@ -10,7 +10,9 @@
       'prod': 'prod'
     },
     'retention_releases': 5,
-    'retention_days': 7
+    'retention_days': 7,
+    'authorize_env_views': false,
+    'expire_env_days': none
   } -%}
   {%- set user_cfg = var('dbt_virtual', {}) or {} -%}
   {#- dbt renders a var only when its whole value is a string, so Jinja nested inside the

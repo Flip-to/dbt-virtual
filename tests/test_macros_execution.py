@@ -69,6 +69,8 @@ class MacroTestHarness:
         self.model: dict[str, Any] = {}
         self.this: FakeRelation | None = None
         self.ref_relations: dict[str, FakeRelation] = {}
+        self.grant_calls: list[tuple[Any, ...]] = []
+        self.column_updates: list[tuple[str, dict[str, Any]]] = []
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -206,6 +208,14 @@ class MacroTestHarness:
                     "get_relation": staticmethod(_get_relation),
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
+                    "grant_access_to": staticmethod(
+                        lambda entity, entity_type, role, target: self.grant_calls.append(
+                            (entity, entity_type, role, target)
+                        )
+                    ),
+                    "update_columns": staticmethod(
+                        lambda rel, cols: self.column_updates.append((str(rel), cols))
+                    ),
                 },
             )(),
             "builtins": type(

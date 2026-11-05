@@ -204,9 +204,14 @@
     type='view'
   ) -%}
 
-  {%- set sql_statements -%}
-    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }};
+  {#- Create the view now (not in the returned hook SQL): its column descriptions are set through
+      the adapter, which needs the view to exist. -#}
+  {%- if existing_env_rel is not none and existing_env_rel.type is defined and existing_env_rel.type == 'table' -%}
+    {%- do dbt_virtual.exec_sql_statement(dbt_virtual.drop_object_if_exists_sql(existing_env_rel, 'table')) -%}
+  {%- endif -%}
+  {%- do dbt_virtual.create_env_view(view_rel, this, model, phys_schema, []) -%}
 
+  {%- set sql_statements -%}
     {{ dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env_name,
