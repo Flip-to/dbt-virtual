@@ -6,8 +6,9 @@
     {%- if mat in ['table', 'incremental'] -%}
       {{ return(cfg.get('physical_schema')) }}
     {%- else -%}
-      {#- Routines (table_function, function, procedure) and views deploy to the environment schema -#}
-      {{ return(dbt_virtual.get_env_schema()) }}
+      {#- Routines (table_function, function, procedure) and views deploy to the environment
+          schema of their custom schema (see `env_schema_for`). -#}
+      {{ return(dbt_virtual.env_schema_for(none, custom_schema_name)) }}
     {%- endif -%}
   {%- endif -%}
 
@@ -95,20 +96,21 @@
   {%- endif -%}
   {%- if raw_rel.schema == phys_schema and virtual_relation.valid -%}
     {%- set logical_name = virtual_relation.logical_name -%}
+    {%- set ref_env_schema = dbt_virtual.env_schema_for(none, dbt_virtual.node_schema_key(dbt_virtual.virtual_node_by_name(logical_name))) -%}
     {%- if mode == 'env_view' -%}
       {{ return(api.Relation.create(
         database=raw_rel.database,
-        schema=dbt_virtual.get_env_schema(),
+        schema=ref_env_schema,
         identifier=logical_name,
         type='view'
       )) }}
     {%- elif mode == 'hybrid' -%}
       {%- set caller_cfg = dbt_virtual.node_attr(model, 'config', {}) if model is defined else {} -%}
       {%- set caller_mat = dbt_virtual.node_attr(caller_cfg, 'materialized', 'view') -%}
-      {%- if caller_mat in ['table_function', 'function', 'procedure', 'view'] -%}
+      {%- if caller_mat in ['table_function', 'function', 'virtual_function', 'procedure', 'view'] -%}
         {{ return(api.Relation.create(
           database=raw_rel.database,
-          schema=dbt_virtual.get_env_schema(),
+          schema=ref_env_schema,
           identifier=logical_name,
           type='view'
         )) }}

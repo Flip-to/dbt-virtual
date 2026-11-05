@@ -15,9 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from dbt_virtual.fingerprint import NodeFingerprint, extract_sql_output_columns
+from dbt_virtual.fingerprint import (
+    ROUTINE_MATERIALIZATIONS,
+    NodeFingerprint,
+    extract_sql_output_columns,
+)
 
-ROUTINE_TYPES = {"table_function", "function", "procedure"}
+ROUTINE_TYPES = set(ROUTINE_MATERIALIZATIONS)
 
 
 @dataclass(frozen=True)

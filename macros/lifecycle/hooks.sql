@@ -1,10 +1,22 @@
 {% macro ensure_registry() -%}
+  {#- Runs DDL only when the registry is missing or predates `schema_key`. It used to run the
+      four-table DDL script for every model, i.e. one extra BigQuery job per model per run. -#}
   {%- if execute -%}
     {%- set cfg = dbt_virtual.get_config() -%}
     {%- set phys_schema = cfg.get('physical_schema') -%}
-    {%- call statement('ensure_registry', fetch_result=False) -%}
-      {{ dbt_virtual.ensure_registry_tables_sql(phys_schema) }}
-    {%- endcall -%}
+    {%- set releases_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') -%}
+    {%- if releases_rel is none -%}
+      {%- call statement('ensure_registry', fetch_result=False) -%}
+        {{ dbt_virtual.ensure_registry_tables_sql(phys_schema) }}
+      {%- endcall -%}
+    {%- elif adapter.get_columns_in_relation is defined -%}
+      {%- set column_names = adapter.get_columns_in_relation(releases_rel) | map(attribute='name') | map('lower') | list -%}
+      {%- if 'schema_key' not in column_names -%}
+        {%- call statement('migrate_registry', fetch_result=False) -%}
+          {{ dbt_virtual.registry_migrations_sql(phys_schema) }}
+        {%- endcall -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- endif -%}
 {%- endmacro %}
 
@@ -160,7 +172,8 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set env_name = dbt_virtual.get_current_env() -%}
-  {%- set env_schema = dbt_virtual.get_env_schema(env_name) -%}
+  {%- set schema_key = dbt_virtual.node_schema_key(model) -%}
+  {%- set env_schema = dbt_virtual.env_schema_for(env_name, schema_key) -%}
   {#- Register the fingerprint that is actually in the physical name. Without CLI-precomputed
       fingerprints, the alias is generated at parse time (`execute` is False, so no parent walk)
       while `get_fingerprint` at run time walks parents; the two differ for any model with parents. -#}
@@ -201,7 +214,8 @@
       'model',
       fp,
       phys_schema ~ '.' ~ this.identifier,
-      release_id
+      release_id,
+      schema_key
     ) }};
 
     {%- if release_id != '' %}
@@ -218,7 +232,8 @@
       status,
       created_at,
       promoted_at,
-      rolled_back_at
+      rolled_back_at,
+      schema_key
     ) VALUES (
       '{{ release_id }}',
       '{{ env_name }}',
@@ -232,7 +247,8 @@
       'candidate',
       {{ dbt_virtual.current_timestamp_sql() }},
       NULL,
-      NULL
+      NULL,
+      {{ dbt_virtual.sql_nullable_literal(schema_key) }}
     );
     {%- endif %}
 
@@ -261,12 +277,20 @@
 {%- endmacro %}
 
 
-{% macro register_routine_deployment(node, target_relation, routine_type, body_sql) -%}
-  {%- if execute -%}
+{% macro register_routine_deployment(node, target_relation, routine_type, body_sql, ddl=none) -%}
+  {#-
+    Records a deployed routine in `_environments` (and `_releases` when a release is being built)
+    with a DDL template that `virtual_promote` / `virtual_rollback` replay in other environments.
+
+    Public API for projects with their own routine materializations: call it after the CREATE
+    statement, passing the executed statement as `ddl` when it differs from what
+    `create_routine_ddl_sql` would generate (e.g. a minified body). No-op for non-virtual nodes.
+  -#}
+  {%- if execute and dbt_virtual.is_virtual_node(node) -%}
     {%- set cfg = dbt_virtual.get_config() -%}
     {%- set phys_schema = cfg.get('physical_schema') -%}
     {%- set env_name = dbt_virtual.get_current_env() -%}
-    {%- set env_schema = dbt_virtual.get_env_schema(env_name) -%}
+    {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
     {%- set fp = dbt_virtual.get_fingerprint(node) -%}
     {%- set release_id = var('_dbt_virtual_release', '') -%}
     {%- do dbt_virtual.ensure_registry() -%}
@@ -283,15 +307,19 @@
       {%- set dep_tier = 4 -%}
     {%- endif -%}
 
-    {%- set full_ddl = dbt_virtual.create_routine_ddl_sql(
-      routine_type,
-      target_relation | string,
-      params_sig,
-      returns_sig,
-      body_sql
-    ) -%}
+    {%- if ddl is not none and (ddl | trim) != '' -%}
+      {%- set full_ddl = ddl | trim -%}
+    {%- else -%}
+      {%- set full_ddl = dbt_virtual.create_routine_ddl_sql(
+        routine_type,
+        target_relation | string,
+        params_sig,
+        returns_sig,
+        body_sql
+      ) -%}
+    {%- endif -%}
 
-    {%- set ddl_template = dbt_virtual.env_schema_placeholder_sql(full_ddl, env_schema) -%}
+    {%- set ddl_template = dbt_virtual.env_placeholders_sql(full_ddl, env_name) -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}
       {{ dbt_virtual.upsert_environment_pointer_sql(
@@ -301,7 +329,8 @@
         routine_type,
         fp,
         target_relation.schema ~ '.' ~ target_relation.identifier,
-        release_id
+        release_id,
+        schema_key
       ) }};
 
       {%- if release_id != '' %}
@@ -318,7 +347,8 @@
         status,
         created_at,
         promoted_at,
-        rolled_back_at
+        rolled_back_at,
+        schema_key
       ) VALUES (
         '{{ release_id }}',
         '{{ env_name }}',
@@ -332,7 +362,8 @@
         'candidate',
         {{ dbt_virtual.current_timestamp_sql() }},
         NULL,
-        NULL
+        NULL,
+        {{ dbt_virtual.sql_nullable_literal(schema_key) }}
       );
       {%- endif %}
     {%- endcall -%}

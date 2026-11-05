@@ -96,14 +96,11 @@ class MacroTestHarness:
 
     def call_macro(self, macro_name: str, *args: Any, **kwargs: Any) -> str:
         """Render a macro call with the current harness context."""
-        # In dbt, `{{ return(x) }}` short-circuits the macro and returns `x`.
-        # We emulate `return` by recording the first `return(...)` value if called, else returning rendered text.
-        returned: list[Any] = []
-
+        # In dbt, `{{ return(x) }}` short-circuits the macro and returns `x` (dbt raises
+        # MacroReturn). Raise too: recording the value and rendering on ran the rest of the macro,
+        # where nested macro calls then returned rendered text instead of their values.
         def _ret(val: Any) -> str:
-            if not returned:
-                returned.append(val)
-            return ""
+            raise _MacroReturn(val)
 
         def _var(key: str, default: Any = None) -> Any:
             return self.vars_dict.get(key, default)
@@ -152,12 +149,10 @@ class MacroTestHarness:
                 fn = getattr(mod_ref[0], item)
 
                 def _wrapped(*a: Any, **kw: Any) -> Any:
-                    prev_len = len(returned)
-                    rendered = fn(*a, **kw)
-                    if len(returned) > prev_len:
-                        val = returned.pop()
-                        return val
-                    return rendered
+                    try:
+                        return fn(*a, **kw)
+                    except _MacroReturn as macro_return:
+                        return macro_return.value
 
                 return _wrapped
 

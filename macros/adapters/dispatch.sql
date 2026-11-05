@@ -135,7 +135,8 @@
     fingerprint STRING NOT NULL,
     physical_identifier STRING NOT NULL,
     release_id STRING,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL,
+    schema_key STRING
   )
   CLUSTER BY environment, model_name;
 
@@ -152,7 +153,8 @@
     status STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key STRING
   )
   PARTITION BY DATE(created_at)
   CLUSTER BY release_id, status;
@@ -185,7 +187,8 @@
     fingerprint VARCHAR NOT NULL,
     physical_identifier VARCHAR NOT NULL,
     release_id VARCHAR,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL,
+    schema_key VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
@@ -201,7 +204,8 @@
     status VARCHAR NOT NULL,
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
@@ -231,7 +235,8 @@
     fingerprint VARCHAR,
     physical_identifier VARCHAR,
     release_id VARCHAR,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP,
+    schema_key VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
@@ -247,7 +252,8 @@
     status VARCHAR,
     created_at TIMESTAMP,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key VARCHAR
   );
 
   CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
@@ -268,11 +274,34 @@
 {%- endmacro %}
 
 
-{% macro upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
-  {{ return(adapter.dispatch('upsert_environment_pointer_sql', 'dbt_virtual')(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id)) }}
+{% macro registry_migrations_sql(physical_schema) -%}
+  {{ return(adapter.dispatch('registry_migrations_sql', 'dbt_virtual')(physical_schema)) }}
 {%- endmacro %}
 
-{% macro bigquery__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
+{% macro bigquery__registry_migrations_sql(physical_schema) -%}
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS schema_key STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key STRING
+{%- endmacro %}
+
+{% macro default__registry_migrations_sql(physical_schema) -%}
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases') }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR
+{%- endmacro %}
+
+
+{% macro sql_nullable_literal(value) -%}
+  {%- if value is none or value == '' -%}
+    {{ return('NULL') }}
+  {%- endif -%}
+  {{ return(dbt_virtual.sql_string_literal(value)) }}
+{%- endmacro %}
+
+
+{% macro upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none) -%}
+  {{ return(adapter.dispatch('upsert_environment_pointer_sql', 'dbt_virtual')(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key)) }}
+{%- endmacro %}
+
+{% macro bigquery__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none) -%}
   MERGE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} AS T
   USING (
     SELECT
@@ -282,34 +311,38 @@
       '{{ fingerprint }}' AS fingerprint,
       '{{ physical_identifier }}' AS physical_identifier,
       '{{ release_id }}' AS release_id,
-      CURRENT_TIMESTAMP() AS updated_at
+      CURRENT_TIMESTAMP() AS updated_at,
+      CAST({{ dbt_virtual.sql_nullable_literal(schema_key) }} AS STRING) AS schema_key
   ) AS S
   ON T.environment = S.environment AND T.model_name = S.model_name
   WHEN MATCHED THEN UPDATE SET
+    resource_type = S.resource_type,
     fingerprint = S.fingerprint,
     physical_identifier = S.physical_identifier,
     release_id = S.release_id,
-    updated_at = S.updated_at
-  WHEN NOT MATCHED THEN INSERT ROW
+    updated_at = S.updated_at,
+    schema_key = S.schema_key
+  WHEN NOT MATCHED THEN INSERT (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key)
+    VALUES (S.environment, S.model_name, S.resource_type, S.fingerprint, S.physical_identifier, S.release_id, S.updated_at, S.schema_key)
 {%- endmacro %}
 
-{% macro snowflake__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
+{% macro snowflake__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none) -%}
   DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
   WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
   INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
-    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
   ) VALUES (
-    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
+    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(schema_key) }}
   )
 {%- endmacro %}
 
-{% macro default__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
+{% macro default__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none) -%}
   DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
   WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
   INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
-    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
   ) VALUES (
-    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
+    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(schema_key) }}
   )
 {%- endmacro %}
 
@@ -655,6 +688,45 @@ $$
       literals that merely contain the env schema name (`staging_flag`, `raw_staging.events`). -#}
   {%- set pattern = '(?<![0-9A-Za-z_$])' ~ modules.re.escape(env_schema) ~ '(?=[`"]?\\.)' -%}
   {{ return(modules.re.sub(pattern, '__DBT_VIRTUAL_ENV_SCHEMA__', sql_text)) }}
+{%- endmacro %}
+
+
+{% macro env_placeholder_token(schema_key=none) -%}
+  {%- if schema_key is none or schema_key == '' or schema_key == 'default' -%}
+    {{ return('__DBT_VIRTUAL_ENV_SCHEMA__') }}
+  {%- endif -%}
+  {{ return('__DBT_VIRTUAL_ENV_SCHEMA_' ~ schema_key ~ '__') }}
+{%- endmacro %}
+
+
+{% macro env_placeholders_sql(sql_text, env_name=none) -%}
+  {#- Replace references to virtual objects in `env_name`'s schemas with a placeholder naming the
+      object's custom schema, so promotion can point each reference at the right schema of the
+      target environment. Several custom schemas may share one schema in `env_name` (e.g. a
+      single-dataset staging), so this goes object by object, not schema by schema. -#}
+  {%- set result = namespace(sql=sql_text) -%}
+  {%- if graph is defined and graph.nodes is defined -%}
+    {%- for node in graph.nodes.values() -%}
+      {%- if dbt_virtual.is_virtual_node(node) -%}
+        {%- set key = dbt_virtual.node_schema_key(node) -%}
+        {%- set schema = dbt_virtual.env_schema_for(env_name, key) -%}
+        {%- set ident = dbt_virtual.env_object_identifier(node) -%}
+        {%- set pattern = '(?<![0-9A-Za-z_$])' ~ modules.re.escape(schema) ~ '(?=[`"]?\\.[`"]?' ~ modules.re.escape(ident) ~ '(?![0-9A-Za-z_$]))' -%}
+        {%- set result.sql = modules.re.sub(pattern, dbt_virtual.env_placeholder_token(key), result.sql) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {#- Other references qualified with the environment's default schema: previous behaviour. -#}
+  {{ return(dbt_virtual.env_schema_placeholder_sql(result.sql, dbt_virtual.env_schema_for(env_name, none))) }}
+{%- endmacro %}
+
+
+{% macro resolve_env_placeholders_sql(sql_text, env_name) -%}
+  {%- set result = namespace(sql=sql_text) -%}
+  {%- for key in modules.re.findall('__DBT_VIRTUAL_ENV_SCHEMA_([0-9A-Za-z_]+?)__(?![0-9A-Za-z])', sql_text) | unique -%}
+    {%- set result.sql = result.sql | replace(dbt_virtual.env_placeholder_token(key), dbt_virtual.env_schema_for(env_name, key)) -%}
+  {%- endfor -%}
+  {{ return(result.sql | replace('__DBT_VIRTUAL_ENV_SCHEMA__', dbt_virtual.env_schema_for(env_name, none))) }}
 {%- endmacro %}
 
 

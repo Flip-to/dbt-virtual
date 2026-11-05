@@ -16,6 +16,8 @@ from sqlglot.errors import SqlglotError
 
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
+# `virtual_function` is the scalar UDF materialization on dbt-core 1.11+ (core owns `function`).
+ROUTINE_MATERIALIZATIONS = frozenset({"table_function", "function", "virtual_function", "procedure"})
 
 _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
@@ -391,7 +393,7 @@ def compute_node_fingerprint(
     if config_subset.get("physical_version"):
         digest = str(config_subset["physical_version"])
 
-    is_routine = materialized in {"table_function", "function", "procedure"}
+    is_routine = materialized in ROUTINE_MATERIALIZATIONS
     physical_identifier = name if is_routine else f"{name}__{digest}"
 
     return NodeFingerprint(

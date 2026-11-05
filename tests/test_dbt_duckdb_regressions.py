@@ -83,7 +83,7 @@ def _table_model(sql: str) -> str:
 class Project:
     """A throwaway dbt project wired to the local dbt_virtual macros and a DuckDB file."""
 
-    def __init__(self, root: Path, models: dict[str, str]) -> None:
+    def __init__(self, root: Path, models: dict[str, str], project_yml: str = PROJECT_YML) -> None:
         self.dir = root / "proj"
         self.db_path = (root / "warehouse.duckdb").as_posix()
         (self.dir / "models").mkdir(parents=True)
@@ -96,7 +96,7 @@ class Project:
         (self.dir / "packages.yml").write_text(
             f'packages:\n  - local: "{pkg_dir.as_posix()}"\n', encoding="utf-8"
         )
-        (self.dir / "dbt_project.yml").write_text(PROJECT_YML, encoding="utf-8")
+        (self.dir / "dbt_project.yml").write_text(project_yml, encoding="utf-8")
         (self.dir / "macros" / "routing.sql").write_text(ROUTING_SHIM, encoding="utf-8")
         outputs = "".join(
             f'    {name}:\n      type: duckdb\n      path: "{self.db_path}"\n'
