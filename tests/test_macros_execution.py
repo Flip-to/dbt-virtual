@@ -69,6 +69,8 @@ class MacroTestHarness:
         self.model: dict[str, Any] = {}
         self.this: FakeRelation | None = None
         self.ref_relations: dict[str, FakeRelation] = {}
+        # Extra adapter methods for one test (e.g. BigQuery-only `is_replaceable`).
+        self.adapter_extras: dict[str, Any] = {}
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -215,6 +217,7 @@ class MacroTestHarness:
                     "get_relation": staticmethod(_get_relation),
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
+                    **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
                 },
             )(),
             "builtins": type(

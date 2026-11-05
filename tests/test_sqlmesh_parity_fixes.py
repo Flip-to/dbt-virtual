@@ -187,3 +187,46 @@ def test_promote_fails_when_routine_is_missing_after_deploy() -> None:
         assert "was not found after deployment" in str(exc)
     else:
         raise AssertionError("promote must fail when the routine does not exist after deployment")
+
+
+def _seed_harness(**adapter_extras: object) -> MacroTestHarness:
+    harness = MacroTestHarness(
+        vars_dict={"dbt_virtual": {"physical_schema": "analytics_physical", "base_environment": "prod"}}
+    )
+    harness.adapter_extras.update(adapter_extras)
+    harness.graph = {
+        "nodes": {
+            "model.p.events": {
+                "unique_id": "model.p.events",
+                "name": "events",
+                "resource_type": "model",
+                "database": "test_proj",
+                "schema": "analytics_physical",
+                "alias": "events__new000000001",
+                "config": {
+                    "materialized": "incremental",
+                    "virtual_env": True,
+                    "partition_by": {"field": "d", "data_type": "date"},
+                    "require_partition_filter": True,
+                },
+            }
+        }
+    }
+    harness.existing_relations.add(("test_proj", "analytics_physical", "events__old000000001"))
+    harness.query_responses.append(FakeResult([("events", "analytics_physical.events__old000000001")]))
+    return harness
+
+
+def test_seeding_skips_clone_when_partitioning_or_clustering_changed() -> None:
+    """A CLONE keeps the base table's layout; a changed partition/cluster spec needs a full build."""
+    harness = _seed_harness(is_replaceable=lambda rel, partition, cluster: False, parse_partition_by=lambda raw: raw)
+    harness.call_macro("seed_incremental_clones")
+    assert not any("CLONE" in q for q in harness.executed_queries)
+    assert harness.cache_added_relations == []
+
+    same_shape = _seed_harness(is_replaceable=lambda rel, partition, cluster: True, parse_partition_by=lambda raw: raw)
+    same_shape.call_macro("seed_incremental_clones")
+    executed = "\n".join(same_shape.executed_queries)
+    assert "CLONE `test_proj`.`analytics_physical`.`events__old000000001`" in executed
+    # Table options the model sets are applied to the clone.
+    assert "SET OPTIONS (require_partition_filter=true)" in executed

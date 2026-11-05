@@ -154,27 +154,76 @@
     {%- endfor -%}
   {%- endif -%}
 
+  {#- Physical tables some environment or release points at, i.e. written by a build that finished. -#}
+  {%- set registered_query -%}
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} WHERE resource_type = 'model'
+    {{ 'UNION DISTINCT' if target.type == 'bigquery' else 'UNION' }}
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
+  {%- endset -%}
+  {%- set registered_rows = run_query(registered_query) -%}
+  {%- set registered = [] -%}
+  {%- if registered_rows -%}
+    {%- for row in registered_rows.rows -%}
+      {%- do registered.append(row[0].split('.')[-1]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
   {%- for node in candidates -%}
     {%- set node_name = dbt_virtual.node_attr(node, 'name', '') -%}
     {%- set node_db = dbt_virtual.node_attr(node, 'database', target.database) -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
     {%- set target_rel = api.Relation.create(
       database=node_db,
       schema=dbt_virtual.node_attr(node, 'schema', phys_schema),
       identifier=dbt_virtual.node_attr(node, 'alias', node_name),
       type='table'
     ) -%}
+    {%- set existing_target = adapter.get_relation(database=target_rel.database, schema=target_rel.schema, identifier=target_rel.identifier) -%}
+    {%- if existing_target is not none and target_rel.identifier not in registered -%}
+      {#- A table nobody points at is a leftover of a run that failed after seeding (only a
+          finished build registers its table): it holds base data without this version's delta. -#}
+      {{ log("dbt-virtual: " ~ target_rel ~ " exists but was never registered (a previous run failed after seeding); re-seeding it.", info=True) }}
+      {%- do dbt_virtual.exec_sql_statement(dbt_virtual.drop_object_if_exists_sql(existing_target, 'table')) -%}
+      {%- if adapter.cache_dropped is defined -%}
+        {%- do adapter.cache_dropped(existing_target) -%}
+      {%- endif -%}
+      {%- set existing_target = none -%}
+    {%- endif -%}
     {%- set base_ident = base_map.get(node_name, '') -%}
     {%- set base_table_name = base_ident.split('.')[-1] if base_ident else '' -%}
-    {%- if base_table_name != '' and base_table_name != target_rel.identifier
-          and adapter.get_relation(database=target_rel.database, schema=target_rel.schema, identifier=target_rel.identifier) is none -%}
+    {%- if base_table_name != '' and base_table_name != target_rel.identifier and existing_target is none -%}
       {%- set source_rel = api.Relation.create(database=node_db, schema=phys_schema, identifier=base_table_name, type='table') -%}
-      {%- if adapter.get_relation(database=source_rel.database, schema=source_rel.schema, identifier=source_rel.identifier) is not none -%}
+      {%- set shape_matches = true -%}
+      {%- if adapter.is_replaceable is defined and adapter.parse_partition_by is defined -%}
+        {#- A CLONE keeps the base table's partitioning and clustering; when the model changed
+            them, clone + incremental would leave the old layout under the new fingerprint. -#}
+        {%- set shape_matches = adapter.is_replaceable(
+          source_rel,
+          adapter.parse_partition_by(dbt_virtual.node_attr(node_cfg, 'partition_by', none)),
+          dbt_virtual.node_attr(node_cfg, 'cluster_by', none)
+        ) -%}
+      {%- endif -%}
+      {%- if not shape_matches -%}
+        {{ log("dbt-virtual: not seeding " ~ target_rel ~ " from " ~ source_rel ~ ": partitioning or clustering changed, dbt will build it in full.", info=True) }}
+      {%- elif adapter.get_relation(database=source_rel.database, schema=source_rel.schema, identifier=source_rel.identifier) is not none -%}
         {{ log("dbt-virtual: Seeding " ~ target_rel ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
         {%- do dbt_virtual.exec_sql_statement(dbt_virtual.clone_table_sql(source_rel, target_rel)) -%}
-        {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
         {%- for col_spec in (dbt_virtual.node_attr(node_cfg, 'virtual_add_columns', []) or []) -%}
           {%- do dbt_virtual.exec_sql_statement("ALTER TABLE " ~ target_rel ~ " ADD COLUMN IF NOT EXISTS " ~ col_spec) -%}
         {%- endfor -%}
+        {%- if target.type == 'bigquery' -%}
+          {#- Table options the model sets are not carried over from the base table by CLONE. -#}
+          {%- set table_options = [] -%}
+          {%- if dbt_virtual.node_attr(node_cfg, 'require_partition_filter', none) is not none -%}
+            {%- do table_options.append('require_partition_filter=' ~ (dbt_virtual.node_attr(node_cfg, 'require_partition_filter', false) | string | lower)) -%}
+          {%- endif -%}
+          {%- if dbt_virtual.node_attr(node_cfg, 'partition_expiration_days', none) is not none -%}
+            {%- do table_options.append('partition_expiration_days=' ~ dbt_virtual.node_attr(node_cfg, 'partition_expiration_days', none)) -%}
+          {%- endif -%}
+          {%- if (table_options | length) > 0 -%}
+            {%- do dbt_virtual.exec_sql_statement("ALTER TABLE " ~ target_rel ~ " SET OPTIONS (" ~ (table_options | join(', ')) ~ ")") -%}
+          {%- endif -%}
+        {%- endif -%}
         {#- dbt has already cached the schema listing; register the clone so the materialization
             and `is_incremental()` see it as an existing table. -#}
         {%- do adapter.cache_added(target_rel) -%}
@@ -390,6 +439,14 @@
     {%- endif -%}
 
     {%- set ddl_template = dbt_virtual.env_placeholders_sql(full_ddl, env_name) -%}
+    {%- if graph is defined and graph.nodes is defined -%}
+      {%- for parent_uid in (dbt_virtual.node_attr(dbt_virtual.node_attr(node, 'depends_on', {}), 'nodes', []) or []) -%}
+        {%- set parent = graph.nodes.get(parent_uid) -%}
+        {%- if parent is not none and dbt_virtual.node_attr(parent, 'resource_type', '') == 'model' and not dbt_virtual.is_virtual_node(parent) -%}
+          {{ log("dbt-virtual WARNING: routine " ~ node.name ~ " reads non-virtual model " ~ dbt_virtual.node_attr(parent, 'name', parent_uid) ~ "; after promotion it still reads the copy built in env " ~ env_name ~ ". Virtualize its dependencies.", info=True) }}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}
       {{ dbt_virtual.upsert_environment_pointer_sql(
