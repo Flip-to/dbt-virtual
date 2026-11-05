@@ -765,10 +765,15 @@
       release_id,
       schema_key
     )) -%}
-    {%- if resource_type == 'model' and not unchanged and not cross -%}
+    {%- if resource_type == 'model' and not unchanged -%}
       {#- The promoted table and the environment's companion state (e.g. an incremental manifest)
-          must describe the same data. -#}
-      {%- do dbt_virtual.restore_companion_state(model_name, fp, to_env, prefer_env=from_env) -%}
+          must describe the same data. A cross-location release is registered in the source
+          registry, where its holders and saved rows are looked up. -#}
+      {%- if cross -%}
+        {%- do dbt_virtual.restore_companion_state(model_name, fp, to_env, prefer_env=from_env, source_database=src_db, source_schema=src_schema) -%}
+      {%- else -%}
+        {%- do dbt_virtual.restore_companion_state(model_name, fp, to_env, prefer_env=from_env) -%}
+      {%- endif -%}
     {%- endif -%}
     {%- if cross -%}
       {%- do cross_release_values.append(dbt_virtual.promoted_release_values_sql(
@@ -1302,8 +1307,10 @@
     {{ return('') }}
   {%- endif -%}
 
+  {%- set orphan_names = [] -%}
   {%- for row in orphans.rows -%}
     {%- set tbl = row[0] -%}
+    {%- do orphan_names.append(tbl) -%}
     {%- set drop_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=tbl, type='table') -%}
     {%- if dry_run -%}
       {{ log("dbt-virtual gc [DRY-RUN]: Would drop " ~ drop_rel, info=True) }}
@@ -1312,6 +1319,8 @@
       {%- do dbt_virtual.exec_ddl_dml("DROP TABLE IF EXISTS " ~ drop_rel) -%}
     {%- endif -%}
   {%- endfor -%}
+  {#- The state saved for a table (`_companion_state`) goes with the table. -#}
+  {%- do dbt_virtual.companion_forget_tables(phys_schema, orphan_names, dry_run) -%}
 {%- endmacro %}
 
 

@@ -264,7 +264,12 @@
   {%- if flags.WHICH is defined and flags.WHICH not in ['run', 'build', 'retry'] -%}
     {{ return('') }}
   {%- endif -%}
-  {%- if dbt_virtual.registry_write_mode() != 'batch' or not dbt_virtual.get_config().get('enabled', true) -%}
+  {%- if not dbt_virtual.get_config().get('enabled', true) -%}
+    {{ return('') }}
+  {%- endif -%}
+  {#- Companion state is repaired in both registry write modes. -#}
+  {%- do dbt_virtual.companion_repair_failed(results, dbt_virtual.get_current_env()) -%}
+  {%- if dbt_virtual.registry_write_mode() != 'batch' -%}
     {{ return('') }}
   {%- endif -%}
 

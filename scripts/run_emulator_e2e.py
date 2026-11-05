@@ -51,6 +51,8 @@ Steps 11-25 (`run_feature_steps`) run the real rendered macros against the emula
    Steps 20-25 need the emulator changes of Flip-to/googlesqlite#36 and Flip-to/bigquery-emulator#32
    (`CREATE TABLE ... CLONE`, `DROP SCHEMA`, persisted `datasets.patch` with `access`, view OPTIONS as table metadata).
    26. `virtual_data_diff` and `virtual_audit` run from a CI target read prod from its own `physical_locations` entry.
+   27. A failed build puts the environment's companion state back (`companion_repair_failed`); gc deletes saved state with the dropped table (in 18).
+   28. Cross-location promote writes the promoted table's companion state (source live rows, rows saved in the source registry).
 Emulator limitations are listed in the final "Skipped" summary; the script is not re-runnable on one emulator
 instance (restart it between runs).
 """
@@ -85,7 +87,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     skipped: list[str] = []
     for dataset_id in (
         "e2e_reg", "e2e_old", "e2e_stg", "e2e_stg_fin", "e2e_prod", "e2e_prod_fin",
-        "e2e_cov", "e2e_gc", "e2e_cmp", "e2e_loc_ci", "e2e_loc_prod",
+        "e2e_cov", "e2e_gc", "e2e_cmp", "e2e_loc_ci", "e2e_loc_prod", "e2e_xsrc", "e2e_xdst", "e2e_xprod",
     ):
         requests.post(
             f"{endpoint}/bigquery/v2/projects/{project}/datasets",
@@ -382,7 +384,14 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     orphan_sql = hg.call_macro("find_orphan_tables_sql", "e2e_gc", 1, 0)
     orphans = [r["table_name"] for r in q(orphan_sql)]
     assert orphans == ["m__2222222222bb", "m__4444444444dd"], orphans
+    # The state saved for a table goes with it: rows of the dropped orphan are collected, the kept one stays.
+    exec_script(hg.call_macro("companion_registry_sql", "e2e_gc"))
+    q(f"INSERT INTO `{project}.e2e_gc._companion_state` (companion, model_name, fingerprint, state_json, environment, release_id, recorded_at) VALUES "
+      f"('e2e_cmp.manifest', 'm', '2222222222bb', '[]', 'prod', '', CURRENT_TIMESTAMP()), "
+      f"('e2e_cmp.manifest', 'm', '1111111111aa', '[]', 'prod', '', CURRENT_TIMESTAMP())")
     hg.call_macro("virtual_gc", dry_run=False, retention_releases=1, retention_days=0)
+    kept_state = [r["fingerprint"] for r in q(f"SELECT fingerprint FROM `{project}.e2e_gc._companion_state` ORDER BY 1")]
+    assert kept_state == ["1111111111aa"], kept_state
     left = sorted(t.table_id for t in client.list_tables(f"{project}.e2e_gc") if "__" in t.table_id)
     assert left == ["m__0123456789ab", "m__1111111111aa", "n__3333333333cc"], left
     print("[gc] per-environment retention: orphans", orphans, "dropped; pr_7's only release and prod's newest kept.")
@@ -450,6 +459,79 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         hb.call_macro("virtual_print_base_environment")
         assert f"DBT_VIRTUAL_BASE_ENV:{expected_base}" in hb.logs, hb.logs
     print("[base_environment] a Jinja base_environment is rendered per target.")
+
+
+    # 27. A failed build puts the environment's state back (`companion_repair_failed`, run by `flush_registry`)
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_cmp.manifest_fail` (model STRING, last_success TIMESTAMP)")
+    q(f"INSERT INTO `{project}.e2e_cmp.manifest_fail` (model, last_success) VALUES ('inc_f', TIMESTAMP '2026-11-04 00:00:00')")
+    fail_node = {**inc_node, "unique_id": "model.p.inc_f", "name": "inc_f", "alias": "inc_f__fp2fp2fp2fp2"}
+    hf = make_harness(
+        extra_cfg={"companion_state": [{"table": "e2e_cmp.manifest_fail", "key_column": "model"}]},
+        graph_nodes={"model.p.inc_f": fail_node},
+    )
+    exec_script(hf.call_macro(
+        "upsert_environment_pointer_sql", "e2e_reg", "staging", "inc_f", "model", "fp1fp1fp1fp1", "e2e_reg.inc_f__fp1fp1fp1fp1", "", None
+    ))
+    # What `seed_incremental_clones` does for a new table: save the rows of the table staging leaves,
+    # then overwrite them with the seed's (the base environment's older row).
+    assert hf.call_macro("companion_depart", fail_node, "staging", "fp2fp2fp2fp2") is True
+    q(f"DELETE FROM `{project}.e2e_cmp.manifest_fail` WHERE model = 'inc_f'")
+    q(f"INSERT INTO `{project}.e2e_cmp.manifest_fail` (model, last_success) VALUES ('inc_f', TIMESTAMP '2026-11-01 00:00:00')")
+    from types import SimpleNamespace
+
+    hf.call_macro("companion_repair_failed", [SimpleNamespace(node=fail_node, status="success")], "staging")
+    seeded = q(f"SELECT FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest_fail`")
+    assert seeded == [{"d": "2026-11-01"}], seeded  # a build that succeeded is not touched
+    hf.call_macro("companion_repair_failed", [SimpleNamespace(node=fail_node, status="error")], "staging")
+    repaired = q(f"SELECT FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest_fail`")
+    assert repaired == [{"d": "2026-11-04"}], repaired
+    print("[companion] failed build: staging's manifest row went back to the table it still points at.")
+
+    # 28. Cross-location promote writes the promoted table's state: live rows of the source environment
+    # (model xm) and rows saved in the source registry (model xs, no environment holds its table).
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_cmp.xmanifest_ci` (model STRING, last_success TIMESTAMP)")
+    q(f"INSERT INTO `{project}.e2e_cmp.xmanifest_ci` (model, last_success) VALUES ('xm', TIMESTAMP '2026-11-03 00:00:00')")
+    for ident in ("xm__fpxfpxfpxfp", "xs__fpyfpyfpyfp"):
+        q(f"CREATE OR REPLACE TABLE `{project}.e2e_xsrc.{ident}` AS SELECT 1 AS x")
+    x_nodes = {
+        f"model.p.{name}": {
+            "unique_id": f"model.p.{name}", "name": name, "resource_type": "model", "alias": f"{name}__fp",
+            "database": project, "schema": "e2e_xdst", "tags": [],
+            "config": {"materialized": "incremental", "virtual_env": True}, "depends_on": {"nodes": []},
+        }
+        for name in ("xm", "xs")
+    }
+    hx = make_harness(
+        target_name="prod",
+        extra_cfg={
+            "physical_schema": "e2e_xdst",
+            "env_schemas": {"prod": "e2e_xprod", "ci": "e2e_xprod_ci"},
+            "physical_locations": {
+                "prod": {"database": project, "schema": "e2e_xdst"},
+                "default": {"database": project, "schema": "e2e_xsrc"},
+            },
+            "companion_state": [{
+                "table": "e2e_cmp.xmanifest",
+                "key_column": "model",
+                "env_tables": {"ci": f"{project}.e2e_cmp.xmanifest_ci", "prod": f"{project}.e2e_cmp.xmanifest_prod"},
+            }],
+        },
+        graph_nodes=x_nodes,
+    )
+    exec_script(hx.call_macro("ensure_registry_tables_sql", "e2e_xsrc"))
+    exec_script(hx.call_macro("ensure_registry_tables_sql", "e2e_xdst"))
+    exec_script(hx.call_macro("companion_registry_sql", "e2e_xsrc"))
+    q(f"INSERT INTO `{project}.e2e_xsrc._environments` (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at) "
+      f"VALUES ('ci', 'xm', 'model', 'fpxfpxfpxfp', 'e2e_xsrc.xm__fpxfpxfpxfp', 'rx', CURRENT_TIMESTAMP())")
+    q(f"INSERT INTO `{project}.e2e_xsrc._releases` (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at) VALUES "
+      f"('rx', 'ci', 'ci', 'xm', 'model', 2, 'fpxfpxfpxfp', 'e2e_xsrc.xm__fpxfpxfpxfp', 'built', CURRENT_TIMESTAMP()), "
+      f"('rx', 'ci', 'ci', 'xs', 'model', 2, 'fpyfpyfpyfp', 'e2e_xsrc.xs__fpyfpyfpyfp', 'built', CURRENT_TIMESTAMP())")
+    q(f"INSERT INTO `{project}.e2e_xsrc._companion_state` (companion, model_name, fingerprint, state_json, environment, release_id, recorded_at) VALUES "
+      f"('e2e_cmp.xmanifest', 'xs', 'fpyfpyfpyfp', '[{{\"model\": \"xs\", \"last_success\": \"2026-11-02 00:00:00+00:00\"}}]', 'ci', '', CURRENT_TIMESTAMP())")
+    hx.call_macro("virtual_promote", from_env="ci", to_env="prod", release_id="rx", allow_unsealed=True)
+    promoted = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.xmanifest_prod` ORDER BY model")
+    assert promoted == [{"model": "xm", "d": "2026-11-03"}, {"model": "xs", "d": "2026-11-02"}], promoted
+    print("[companion] cross-location promote: prod's manifest got the source environment's live rows and the rows saved in the source registry.")
 
     run_bigquery_gap_steps(client, q, project, requests, endpoint)
     return skipped
