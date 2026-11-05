@@ -89,6 +89,7 @@ class MacroTestHarness:
             REPO / "macros" / "routing" / "virtual_routing.sql",
             REPO / "macros" / "adapters" / "dispatch.sql",
             REPO / "macros" / "lifecycle" / "hooks.sql",
+            REPO / "macros" / "lifecycle" / "registry_batch.sql",
             REPO / "macros" / "lifecycle" / "operations.sql",
             REPO / "macros" / "testing" / "tvf_test_ref.sql",
         ]

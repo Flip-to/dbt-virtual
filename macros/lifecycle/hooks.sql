@@ -310,8 +310,12 @@
     {%- set fp = dbt_virtual.get_fingerprint(model) -%}
   {%- endif -%}
   {%- set release_id = var('_dbt_virtual_release', '') -%}
+  {#- `batch` mode: only the view is created here; `flush_registry` (on-run-end) writes the rows. -#}
+  {%- set batched = dbt_virtual.use_batched_registry() -%}
 
-  {%- do dbt_virtual.ensure_registry() -%}
+  {%- if not batched -%}
+    {%- do dbt_virtual.ensure_registry() -%}
+  {%- endif -%}
 
   {%- set existing_env_rel = adapter.get_relation(database=this.database, schema=env_schema, identifier=model.name) -%}
   {%- if existing_env_rel is none and adapter.check_schema_exists is defined and not adapter.check_schema_exists(this.database, env_schema) -%}
@@ -331,7 +335,8 @@
   ) -%}
 
   {%- set sql_statements -%}
-    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }};
+    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }}
+    {%- if not batched %};
 
     {{ dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
@@ -397,6 +402,7 @@
       {{ dbt_virtual.current_timestamp_sql() }}
     );
     {%- endif %}
+    {%- endif %}
   {%- endset -%}
 
   {{ return(sql_statements) }}
@@ -453,6 +459,12 @@
           {{ log("dbt-virtual WARNING: routine " ~ node.name ~ " reads non-virtual model " ~ dbt_virtual.node_attr(parent, 'name', parent_uid) ~ "; after promotion it still reads the copy built in env " ~ env_name ~ ". Virtualize its dependencies.", info=True) }}
         {%- endif -%}
       {%- endfor -%}
+    {%- endif -%}
+
+    {#- Batch mode: `flush_registry` recomputes this DDL from the node. An explicit `ddl` cannot be
+        recomputed there, so it is still written here. -#}
+    {%- if (ddl is none or (ddl | trim) == '') and dbt_virtual.use_batched_registry() -%}
+      {{ return('') }}
     {%- endif -%}
 
     {%- call statement('register_routine_env', fetch_result=False) -%}

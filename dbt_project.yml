@@ -13,6 +13,14 @@ clean-targets:
   - ".dbt_virtual"
   - "tests"
 
+# Run by dbt for every project that installs this package (verified with dbt-core 1.12.6: package
+# hooks run for run/build/compile). Both are no-ops unless the run built virtualized nodes
+# (`flush_registry`) or `dbt-virtual build` passed its plan vars (`run_start`).
+on-run-start:
+  - "{{ dbt_virtual.run_start() }}"
+on-run-end:
+  - "{{ dbt_virtual.flush_registry(results) }}"
+
 vars:
   dbt_virtual:
     enabled: true

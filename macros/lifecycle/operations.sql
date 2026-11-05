@@ -526,7 +526,7 @@
   -#}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
-  {%- set models_map = fromjson(models_json) -%}
+  {%- set models_map = fromjson(models_json) if models_json is string else models_json -%}
   {%- set ensured_schemas = [] -%}
 
   {%- do dbt_virtual.ensure_registry() -%}
