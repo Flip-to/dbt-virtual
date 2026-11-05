@@ -180,11 +180,33 @@ def extract_sql_output_columns(sql: str, dialect: str = "bigquery") -> dict[str,
         return {}
 
 
+def _strip_dependency_qualifiers(sql: str, identifiers: set[str]) -> str:
+    """Replace `database.schema.<dependency>` references with `__DBT_VIRTUAL_REF__.<dependency>`.
+
+    dbt renders every `ref()` as a three-part name whose database and schema depend on the target
+    (a dev or PR dataset vs prod datasets). The dependency's own fingerprint is already part of the
+    Merkle payload, so its location only made fingerprints differ between environments. Only
+    three-part names are rewritten: two-part names may be `alias.column`.
+    """
+    for ident in sorted(identifiers, key=len, reverse=True):
+        e = re.escape(ident)
+        patterns = (
+            rf"`[^`\n]+`\.`[^`\n]+`\.`{e}`",  # `project`.`dataset`.`ident`
+            rf"`[^`.\n]+\.[^`.\n]+\.{e}`",  # `project.dataset.ident`
+            rf'"[^"\n]+"\."[^"\n]+"\."{e}"',  # "database"."schema"."ident"
+            rf"(?<![\w.$`\"])[A-Za-z_][\w$-]*\.[A-Za-z_][\w$-]*\.{e}(?![\w$])",  # db.schema.ident
+        )
+        for pattern in patterns:
+            sql = re.sub(pattern, f"__DBT_VIRTUAL_REF__.{ident}", sql, flags=re.IGNORECASE)
+    return sql
+
+
 def normalize_sql(
     sql: str,
     *,
     self_identifier: str | None = None,
     known_schemas: list[str] | None = None,
+    dependency_identifiers: set[str] | None = None,
     use_ast: bool = True,
     dialect: str = "bigquery",
 ) -> str:
@@ -196,6 +218,9 @@ def normalize_sql(
         sql.replace("\r\n", "\n").replace("\r", "\n"),
         dialect=dialect,
     )
+
+    if dependency_identifiers:
+        normalized = _strip_dependency_qualifiers(normalized, dependency_identifiers)
 
     # Replace known environment / physical schemas with a canonical schema token
     if known_schemas:
@@ -295,6 +320,7 @@ def compute_node_fingerprint(
     *,
     upstream_fingerprints: dict[str, str] | None = None,
     known_schemas: list[str] | None = None,
+    dependency_identifiers: set[str] | None = None,
     fp_length: int = DEFAULT_FINGERPRINT_LENGTH,
     dialect: str = "bigquery",
 ) -> NodeFingerprint:
@@ -334,6 +360,7 @@ def compute_node_fingerprint(
         compiled_sql,
         self_identifier=node.get("alias") or name,
         known_schemas=schemas_to_strip,
+        dependency_identifiers=dependency_identifiers,
         dialect=dialect,
     )
     norm_raw = normalize_sql(
@@ -355,6 +382,9 @@ def compute_node_fingerprint(
         "normalized_raw_sql": norm_raw,
         "upstream_fingerprints": sorted_upstreams,
     }
+    if resource_type == "seed":
+        # A seed's data lives in its CSV, which only the manifest checksum reflects.
+        payload["seed_checksum"] = (node.get("checksum") or {}).get("checksum")
 
     canonical_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(canonical_bytes).hexdigest()[:fp_length]
@@ -398,10 +428,12 @@ def compute_manifest_fingerprints(
                 "because environment state and physical identifiers are keyed by model name."
             )
         virtual_name_uids[name] = uid
+    # Every ref()-able node contributes to its children's fingerprints: models (virtual or not),
+    # seeds (CSV checksum) and snapshots.
     dependency_nodes = {
         uid: n
         for uid, n in nodes.items()
-        if is_virtual_node(n) or n.get("resource_type") == "model"
+        if is_virtual_node(n) or n.get("resource_type") in {"model", "seed", "snapshot"}
     }
 
     computed: dict[str, NodeFingerprint] = {}
@@ -417,15 +449,21 @@ def compute_manifest_fingerprints(
         node = dependency_nodes[uid]
         depends_on = (node.get("depends_on") or {}).get("nodes") or []
         upstream_fps: dict[str, str] = {}
+        parent_identifiers: set[str] = set()
         for parent_uid in depends_on:
             if parent_uid in dependency_nodes:
                 parent_fp = _resolve(parent_uid)
                 upstream_fps[parent_uid] = parent_fp.fingerprint
+                parent = dependency_nodes[parent_uid]
+                parent_identifiers.update(
+                    str(v) for v in (parent.get("name"), parent.get("alias")) if v
+                )
 
         fp_obj = compute_node_fingerprint(
             node,
             upstream_fingerprints=upstream_fps,
             known_schemas=known_schemas,
+            dependency_identifiers=parent_identifiers,
             fp_length=fp_length,
             dialect=sql_dialect,
         )
