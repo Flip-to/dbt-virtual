@@ -37,8 +37,29 @@ Options, not decided: make bare runs refuse to rebuild a physical table that ano
 points at when the run-time Merkle fingerprint differs from the one recorded for it; or require
 `_dbt_virtual_fps` for virtual table models and fail fast without it.
 
+The second option now exists as an opt-in flag, `vars.dbt_virtual.require_cli_fingerprints`
+(default `false`), checked by `assert_cli_fingerprints()` in `macros/lifecycle/hooks.sql`. It
+does not pay this item: with the default, a bare `dbt run` still behaves as described above.
+Paying it means either turning the flag on by default or the first option.
+
 ## Workaround meanwhile
 
 Build virtual models only through `dbt-virtual build` (it passes `_dbt_virtual_fps`, so the alias
 includes upstream fingerprints). For a bare `dbt run`, bump `config(virtual_env_epoch=...)` on
 downstream models of a changed model.
+
+To enforce this, set `require_cli_fingerprints: true` under `vars.dbt_virtual` and use the
+`"{{ dbt_virtual.on_run_start() }}"` on-run-start hook (`seed_incremental_clones()` as the hook
+runs the same check). A `dbt run` / `dbt build` / `dbt retry` whose selection includes a virtual
+table or incremental model then fails in on-run-start, before anything is built, unless
+`_dbt_virtual_fps` is set. `dbt compile`, `parse`, `ls`, `docs generate` and `run-operation` are
+not affected. Evidence (dbt-core 1.12.6 + dbt-duckdb 1.11.1, run 2026-11-04), in
+`tests/test_require_cli_fingerprints.py`:
+
+- `test_bare_dbt_run_fails_before_building` (both hooks) and `test_bare_dbt_build_fails_too`:
+  non-zero exit, the error names the flag and `dbt-virtual build`, no physical table and no env
+  view exist. Against the code before the guard (commit `b390217`) the bare run exited 0.
+- `test_commands_that_do_not_build_are_not_guarded`: `compile`, `parse`, `ls`, `docs generate`.
+- `test_bare_run_of_only_non_table_virtual_models_is_allowed`: selecting only a virtual view.
+- `test_build_with_cli_fingerprints_succeeds`: `dbt build` with `_dbt_virtual_fps` builds.
+- `test_flag_off_keeps_bare_dbt_run_working`: the default keeps today's behaviour.

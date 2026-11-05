@@ -21,19 +21,89 @@
 {%- endmacro %}
 
 
+{% macro on_run_start() -%}
+  {#- The package's on-run-start hook: `on-run-start: ["{{ dbt_virtual.on_run_start() }}"]`.
+      Checks `require_cli_fingerprints`, then seeds incremental clones for the selected models. -#}
+  {%- do dbt_virtual.assert_cli_fingerprints() -%}
+  {{ return(dbt_virtual.seed_incremental_clones()) }}
+{%- endmacro %}
+
+
+{% macro assert_cli_fingerprints() -%}
+  {#-
+    Guard for TECH_DEBT(bare_dbt_run_parse_time_fingerprint): without `_dbt_virtual_fps`, the
+    physical name `<model>__<fp>` of a virtual table is generated at parse time and omits upstream
+    fingerprints, so a bare `dbt run` after an upstream change rebuilds a downstream physical table
+    in place, possibly one another environment's view points at.
+
+    With `vars.dbt_virtual.require_cli_fingerprints: true`, a `run` / `build` / `retry` whose
+    selection contains a virtual table or incremental model fails here, in on-run-start, before
+    any model is built, unless `_dbt_virtual_fps` is set (`dbt-virtual build` always sets it).
+    `compile`, `parse`, `ls`, `docs` and `run-operation` are not affected (`dbt-virtual plan`
+    runs `dbt compile` without vars).
+  -#}
+  {%- if not execute -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- if flags.WHICH is not defined or flags.WHICH not in ['run', 'build', 'retry'] -%}
+    {{ return('') }}
+  {%- endif -%}
+  {#- The flag may be a rendered string, e.g. `"{{ env_var('DBT_VIRTUAL_STRICT', 'false') }}"`. -#}
+  {%- set required = dbt_virtual.get_config().get('require_cli_fingerprints', false) -%}
+  {%- if (required | string | trim | lower) not in ['true', '1', 'yes'] -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- if var('_dbt_virtual_fps', none) -%}
+    {{ return('') }}
+  {%- endif -%}
+
+  {%- set selected = selected_resources if selected_resources is defined else none -%}
+  {%- set unguarded = [] -%}
+  {%- set nodes_dict = graph.nodes if (graph is defined and graph.nodes is defined) else {} -%}
+  {%- for node in nodes_dict.values() -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- if dbt_virtual.node_attr(node_cfg, 'materialized', '') in ['table', 'incremental']
+          and (selected is none or dbt_virtual.node_attr(node, 'unique_id', '') in selected)
+          and dbt_virtual.is_virtual_node(node) -%}
+      {%- do unguarded.append(dbt_virtual.node_attr(node, 'name', '')) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if (unguarded | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+
+  {%- set names = unguarded | sort -%}
+  {%- set shown = (names[:5] | join(', ')) ~ (', ...' if (names | length) > 5 else '') -%}
+  {{ exceptions.raise_compiler_error(
+    "dbt-virtual: require_cli_fingerprints is true but var('_dbt_virtual_fps') is not set, so "
+    ~ (names | length) ~ " selected virtual table model(s) (" ~ shown ~ ") would get physical "
+    ~ "names without upstream fingerprints and could rebuild a table another environment points "
+    ~ "at. Run `dbt-virtual build` (it passes _dbt_virtual_fps), or set "
+    ~ "vars.dbt_virtual.require_cli_fingerprints to false."
+  ) }}
+{%- endmacro %}
+
+
 {% macro seed_incremental_clones(model_names=none) -%}
   {#-
     Seeds new fingerprint tables of virtualized incremental models from `base_environment` ('prod')
     via zero-copy `CLONE`, BEFORE dbt materializes them.
 
-    Run it from `on-run-start` (`"{{ dbt_virtual.seed_incremental_clones() }}"`, scoped to the
-    selected resources) or as `dbt run-operation virtual_seed_incremental_clones` (the CLI does
-    this for SEED_INCREMENTAL plan actions).
+    Run it from `on-run-start` (`"{{ dbt_virtual.on_run_start() }}"` or
+    `"{{ dbt_virtual.seed_incremental_clones() }}"`, scoped to the selected resources) or as
+    `dbt run-operation virtual_seed_incremental_clones` (the CLI does this for SEED_INCREMENTAL
+    plan actions).
 
     It cannot be a model pre-hook: dbt's incremental materializations (dbt-core and dbt-bigquery
     1.12) load `existing_relation` before `run_hooks(pre_hooks)`, so a clone made in a pre-hook is
     ignored and then replaced (`create or replace table` on BigQuery, "already exists" elsewhere).
   -#}
+  {#- As an on-run-start hook (no `model_names`), also enforce `require_cli_fingerprints`, so
+      projects configured with this hook before `on_run_start()` existed are protected too. The
+      CLI's run-operation passes `model_names` and its own `_dbt_virtual_fps`. -#}
+  {%- if model_names is none -%}
+    {%- do dbt_virtual.assert_cli_fingerprints() -%}
+  {%- endif -%}
   {%- if not execute or flags.FULL_REFRESH -%}
     {{ return('') }}
   {%- endif -%}
