@@ -29,12 +29,12 @@ macros in a Python harness. This bean makes real dbt-core + dbt-bigquery run aga
 |---|---|---|
 | Flip-to/googlesqlite | #37 | `DROP PROCEDURE [IF EXISTS]` no-op; `TableSpec.ClusterBy` and `TableSpec.Partitioning()` |
 | Flip-to/bigquery-emulator | #33 | `tables.get` reports `timePartitioning` / `rangePartitioning` / `clustering` of SQL-created tables; go.mod bump |
-| Flip-to/googlesqlite | #36 and Flip-to/bigquery-emulator#32 (another agent) | `CREATE TABLE ... CLONE`, needed by incremental seeding. A clone must also copy `ClusterBy` (one line, noted on #37) |
+| Flip-to/googlesqlite#36, Flip-to/bigquery-emulator#32 | merged | `CREATE TABLE ... CLONE` (needed by incremental seeding). #37 and #33 are merged with flipto/main and add `CLONE` keeps `CLUSTER BY` |
 
 ## Gated until those merge
 
 The CI step "Real dbt-core + dbt-bigquery E2E" runs only when `scripts/probe_bq_emulator_dbt_support.py`
-finds the four behaviours above in the emulator built from `flipto/main`; otherwise a warning
+finds the behaviours above (CLONE is already on flipto/main; the table layout and DROP PROCEDURE are not) in the emulator built from `flipto/main`; otherwise a warning
 annotation names what is missing. To remove the gate: delete the probe step, the `GATED` step and the
 script, and drop the `if:` of the E2E step.
 
