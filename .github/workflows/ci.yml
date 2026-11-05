@@ -24,6 +24,8 @@ jobs:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the upgrade tests read the v0.1.0 tag
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -61,6 +63,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the upgrade tests read the v0.1.0 tag
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -109,6 +113,11 @@ jobs:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_e2e.py
+      - name: Run concurrency and v0.1.0 upgrade checks (same emulator, fresh datasets)
+        env:
+          BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
+          BIGQUERY_EMULATOR_PROJECT: "test-project"
+        run: uv run --python 3.11 python scripts/run_emulator_concurrency_upgrade_e2e.py
 
   snowflake-and-postgres-e2e:
     name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E
