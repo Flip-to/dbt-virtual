@@ -34,8 +34,9 @@ class FakeRelation:
 
 
 class FakeResult:
-    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+    def __init__(self, rows: list[tuple[Any, ...]], column_names: list[str] | None = None) -> None:
         self.rows = rows
+        self.column_names = column_names or []
 
 
 class MacroTestHarness:
@@ -75,6 +76,11 @@ class MacroTestHarness:
         self.ref_relations: dict[str, FakeRelation] = {}
         # Extra adapter methods for one test (e.g. BigQuery-only `is_replaceable`).
         self.adapter_extras: dict[str, Any] = {}
+        # Optional live warehouse (e.g. the BigQuery emulator E2E): `query_executor(sql)` returns
+        # `(rows, column_names)` and replaces the canned `query_responses`; `relation_lookup(db,
+        # schema, identifier)` returns a FakeRelation or None and replaces `existing_relations`.
+        self.query_executor: Any = None
+        self.relation_lookup: Any = None
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -120,6 +126,8 @@ class MacroTestHarness:
             return hashlib.md5(s.encode("utf-8")).hexdigest()
 
         def _get_relation(database: str, schema: str, identifier: str) -> FakeRelation | None:
+            if self.relation_lookup is not None:
+                return self.relation_lookup(database, schema, identifier)
             if (database, schema, identifier) in self.existing_relations:
                 return FakeRelation(database, schema, identifier)
             return None
@@ -135,6 +143,9 @@ class MacroTestHarness:
 
         def _run_query(sql: str) -> FakeResult:
             self.executed_queries.append(sql.strip())
+            if self.query_executor is not None:
+                rows, column_names = self.query_executor(sql)
+                return FakeResult(rows, column_names)
             if self.query_responses:
                 return self.query_responses.pop(0)
             # Routine existence checks see routines whose CREATE statement already ran, like a warehouse.

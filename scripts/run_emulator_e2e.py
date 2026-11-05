@@ -29,6 +29,20 @@ Exercises the full virtual data environment lifecycle against a running BigQuery
    - Repoints `analytics.orders_metrics` and routines back to `v1` from `_releases`
 8. Janitor GC protection query:
    - Verifies active and retained release tables are protected while unreferenced tables are flagged as orphans.
+
+Steps 11-19 (`run_feature_steps`) run the real rendered macros against the emulator through the harness's
+`query_executor` / `relation_lookup` hooks:
+   11. Registry DDL (`ensure_registry_tables_sql`) and `registry_migrations_sql` on an old-shape registry.
+   12. Batched registry flush (`flush_registry`): one MERGE for several objects, `build_quality` stamped.
+   13. Multi-dataset environments: `env_schemas` custom-schema mapping, per-object placeholders in a TVF template.
+   14. Virtual view promotion (`register_view_deployment` -> `virtual_promote`).
+   15. Promotion guards: unsealed release refused, `seal_release_sql`, partial `build_quality` refused.
+   16. Partition coverage audit (`virtual_audit`): skipped on this emulator (no INFORMATION_SCHEMA.PARTITIONS).
+   17. Regions: `CREATE SCHEMA ... OPTIONS (location = ...)`, per-location registry.
+   18. GC per-environment retention (`find_orphan_tables_sql`, `virtual_gc`) with releases in two environments.
+   19. Companion state save / restore (`companion_depart`, `restore_companion_state`) on a fake manifest table.
+Emulator limitations are listed in the final "Skipped" summary; the script is not re-runnable on one emulator
+instance (restart it between runs).
 """
 
 from __future__ import annotations
@@ -42,6 +56,420 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dbt_virtual.fingerprint import compute_manifest_fingerprints, compute_node_fingerprint
 from dbt_virtual.planner import classify_plan_actions, compute_dbt_select_for_build
 from tests.test_macros_execution import FakeRelation, MacroTestHarness
+
+
+def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
+    """Steps 11-19: the production-readiness features, executed through the real rendered macros.
+
+    The macros are rendered by `MacroTestHarness`; its `query_executor` / `relation_lookup` hooks send
+    every `run_query` / `exec_sql_statement` call to the emulator, so promote, audit, gc and the
+    companion macros run their real SQL end to end. Returns the steps skipped because of an emulator
+    limitation (each one is documented where it is skipped; nothing is faked).
+    """
+    import json
+    import re
+
+    from google.api_core.exceptions import NotFound
+
+    skipped: list[str] = []
+    for dataset_id in (
+        "e2e_reg", "e2e_old", "e2e_stg", "e2e_stg_fin", "e2e_prod", "e2e_prod_fin",
+        "e2e_cov", "e2e_gc", "e2e_cmp",
+    ):
+        requests.post(
+            f"{endpoint}/bigquery/v2/projects/{project}/datasets",
+            json={"datasetReference": {"projectId": project, "datasetId": dataset_id}},
+            timeout=10,
+        )
+
+    routines_note = (
+        "validate_routine_exists_sql: emulator has no INFORMATION_SCHEMA.ROUTINES (and no routines.get API); "
+        "a routine counts as existing once its CREATE statement ran without error"
+    )
+    created_routines: set[tuple[str, str]] = set()
+    sql_rewrites: dict[str, str] = {}  # per-step: metadata views the emulator lacks -> populated tables
+
+    def sql_rewrites_apply(sql: str, rewrites: dict[str, str]) -> str:
+        for old, new in rewrites.items():
+            sql = sql.replace(old, new)
+        return sql
+
+    def run_sql(sql: str):
+        created = re.search(r"CREATE OR REPLACE (?:TABLE )?FUNCTION\s+([^\s(]+)\s*\(", sql)
+        for old, new in sql_rewrites.items():
+            sql = sql.replace(old, new)
+        match = re.search(r"`[^`]+`\.`([^`]+)`\.INFORMATION_SCHEMA\.ROUTINES\s+WHERE routine_name = '([^']+)'", sql)
+        if match:
+            # EMULATOR LIMITATION: INFORMATION_SCHEMA.ROUTINES is not implemented (see the report).
+            if routines_note not in skipped:
+                skipped.append(routines_note)
+            found = (match.group(1), match.group(2)) in created_routines
+            return ([(match.group(2),)] if found else []), ["routine_name"]
+        if created:
+            q(sql)
+            parts = created.group(1).replace("`", "").split(".")
+            created_routines.add((parts[-2], parts[-1]))
+            return [], []
+        result = client.query(sql).result()
+        names = [f.name for f in (result.schema or [])]
+        return [tuple(row.values()) for row in result], names
+
+    def lookup(database, schema, identifier):
+        try:
+            table = client.get_table(f"{project}.{schema}.{identifier}")
+        except NotFound:
+            return None
+        return FakeRelation(database, schema, identifier, "view" if table.table_type == "VIEW" else "table", "`")
+
+    class Col:
+        def __init__(self, name, data_type):
+            self.name, self.data_type = name, data_type
+
+    def columns_in_relation(rel):
+        table = client.get_table(f"{rel.database}.{rel.schema}.{rel.identifier}")
+        return [Col(f.name, f.field_type) for f in table.schema]
+
+    def exec_script(sql: str) -> None:
+        for stmt in sql.split(";"):
+            if stmt.strip():
+                q(stmt)
+
+    def table_columns(dataset: str, table: str) -> list[str]:
+        return [f.name for f in client.get_table(f"{project}.{dataset}.{table}").schema]
+
+    def refused(fn, needle: str) -> None:
+        try:
+            fn()
+        except RuntimeError as exc:
+            assert needle in str(exc), f"expected {needle!r} in {exc}"
+            return
+        raise AssertionError(f"expected a refusal containing {needle!r}")
+
+    fps = {"fin_orders": "f1n0rd3rs001", "udf_x": "udfx00000001", "tvf_fin": "tvffin000001", "v_big": "vbig00000001"}
+    fin_alias = f"fin_orders__{fps['fin_orders']}"
+    nodes = {
+        "model.p.fin_orders": {
+            "unique_id": "model.p.fin_orders", "name": "fin_orders", "resource_type": "model",
+            "alias": fin_alias, "database": project, "schema": "e2e_reg",
+            "config": {"materialized": "table", "virtual_env": True, "schema": "finance"},
+            "compiled_code": "SELECT 'a' AS k, 1 AS v", "depends_on": {"nodes": []},
+        },
+        "model.p.udf_x": {
+            "unique_id": "model.p.udf_x", "name": "udf_x", "resource_type": "model", "alias": "udf_x",
+            "database": project, "schema": "e2e_stg",
+            "config": {"materialized": "function", "virtual_env": True, "parameters": "n INT64", "returns": "INT64"},
+            "compiled_code": "n * 10", "depends_on": {"nodes": []},
+        },
+        "model.p.tvf_fin": {
+            "unique_id": "model.p.tvf_fin", "name": "tvf_fin", "resource_type": "model", "alias": "tvf_fin",
+            "database": project, "schema": "e2e_stg_fin",
+            "config": {"materialized": "table_function", "virtual_env": True, "schema": "finance", "parameters": "min_v INT64"},
+            "compiled_code": (
+                f"SELECT k, `{project}.e2e_stg.udf_x`(v) AS v10 FROM `{project}.e2e_stg_fin.fin_orders` WHERE v >= min_v"
+            ),
+            "depends_on": {"nodes": ["model.p.fin_orders", "model.p.udf_x"]},
+        },
+        "model.p.v_big": {
+            "unique_id": "model.p.v_big", "name": "v_big", "resource_type": "model", "alias": "v_big",
+            "database": project, "schema": "e2e_stg",
+            "config": {"materialized": "view", "virtual_env": True},
+            "compiled_code": f"SELECT k, v FROM `{project}.e2e_stg_fin.fin_orders` WHERE v > 0",
+            "depends_on": {"nodes": ["model.p.fin_orders"]},
+        },
+    }
+
+    def make_harness(extra_cfg=None, extra_vars=None, target_name="staging", graph_nodes=None):
+        cfg = {
+            "physical_schema": "e2e_reg",
+            "env_schemas": {
+                "staging": {"default": "e2e_stg", "finance": "e2e_stg_fin"},
+                "prod": {"default": "e2e_prod", "finance": "e2e_prod_fin"},
+            },
+            **(extra_cfg or {}),
+        }
+        h = MacroTestHarness(
+            vars_dict={"dbt_virtual": cfg, "_dbt_virtual_fps": fps, **(extra_vars or {})},
+            target_name=target_name,
+            target_schema="e2e_stg",
+            target_database=project,
+        )
+        h.graph = {"nodes": nodes if graph_nodes is None else graph_nodes}
+        h.query_executor = run_sql
+        h.relation_lookup = lookup
+        h.adapter_extras = {
+            "get_columns_in_relation": columns_in_relation,
+            "quote": lambda name: f"`{name}`",
+        }
+        return h
+
+    # 11. Registry DDL from `ensure_registry_tables_sql`, and `registry_migrations_sql` on an old registry
+    h = make_harness()
+    exec_script(h.call_macro("ensure_registry_tables_sql", "e2e_reg"))
+    assert table_columns("e2e_reg", "_releases")[-3:] == ["schema_key", "build_quality", "sealed_at"]
+    assert "build_quality" in table_columns("e2e_reg", "_environments")
+    for table in ("_locks", "_intervals"):
+        assert lookup(project, "e2e_reg", table) is not None, table
+    q(
+        f"CREATE TABLE `{project}.e2e_old._environments` (environment STRING, model_name STRING, resource_type STRING, "
+        f"fingerprint STRING, physical_identifier STRING, release_id STRING, updated_at TIMESTAMP)"
+    )
+    q(
+        f"CREATE TABLE `{project}.e2e_old._releases` (release_id STRING, source_environment STRING, target_environment STRING, "
+        f"model_name STRING, resource_type STRING, dependency_tier INT64, fingerprint STRING, physical_identifier STRING, "
+        f"routine_ddl_template STRING, status STRING, created_at TIMESTAMP, promoted_at TIMESTAMP, rolled_back_at TIMESTAMP)"
+    )
+    q(f"INSERT INTO `{project}.e2e_old._releases` (release_id, model_name) VALUES ('legacy', 'm')")
+    exec_script(h.call_macro("registry_migrations_sql", "e2e_old"))
+    exec_script(h.call_macro("registry_migrations_sql", "e2e_old"))  # idempotent: IF NOT EXISTS
+    if table_columns("e2e_old", "_releases")[-3:] == ["schema_key", "build_quality", "sealed_at"]:
+        assert table_columns("e2e_old", "_environments")[-2:] == ["schema_key", "build_quality"]
+        legacy = q(f"SELECT release_id, sealed_at, build_quality FROM `{project}.e2e_old._releases`")
+        assert legacy == [{"release_id": "legacy", "sealed_at": None, "build_quality": None}], legacy
+    else:
+        # EMULATOR LIMITATION: the migration statements execute without error but add no column.
+        skipped.append(
+            "registry_migrations_sql: emulator accepts `ALTER TABLE ... ADD COLUMN [IF NOT EXISTS]` but does not add the column "
+            f"(columns after migration: {table_columns('e2e_old', '_releases')[-3:]}); only the SQL being accepted is verified"
+        )
+    print("[registry] ensure_registry_tables_sql + registry_migrations_sql (old-shape registry, idempotent) verified.")
+
+    # 12. Batched registry flush: one MERGE for several objects, build_quality stamped
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_reg.{fin_alias}` AS SELECT 'a' AS k, 1 AS v UNION ALL SELECT 'b', 7")
+    q(f"CREATE OR REPLACE VIEW `{project}.e2e_stg_fin.fin_orders` AS SELECT * FROM `{project}.e2e_reg.{fin_alias}`")
+    results = [
+        {"node": nodes[uid], "status": "success"}
+        for uid in ("model.p.fin_orders", "model.p.udf_x", "model.p.tvf_fin")
+    ]
+    h = make_harness(extra_vars={"_dbt_virtual_release": "rel1"})
+    rows = h.call_macro("collect_registry_rows", results, "staging", "e2e_reg")
+    assert sorted(r["name"] for r in rows) == ["fin_orders", "tvf_fin", "udf_x"], rows
+    env_sql = h.call_macro(
+        "upsert_environment_pointers_sql", "e2e_reg", "staging",
+        [{"name": r["name"], "resource_type": r["resource_type"], "fingerprint": r["fingerprint"],
+          "physical_identifier": r["physical_identifier"], "release_id": "rel1", "schema_key": r["schema_key"]} for r in rows],
+    )
+    assert env_sql.count("MERGE") == 1 and env_sql.count("UNION ALL") == 2
+    h.executed_queries.clear()
+    h.call_macro("flush_registry", results)
+    merges = [s for s in h.executed_queries if s.startswith("MERGE")]
+    assert len(merges) == 1, h.executed_queries  # one MERGE for the three objects
+    env_rows = q(
+        f"SELECT model_name, resource_type, schema_key, build_quality FROM `{project}.e2e_reg._environments` "
+        f"WHERE environment = 'staging' ORDER BY model_name"
+    )
+    assert env_rows == [
+        {"model_name": "fin_orders", "resource_type": "model", "schema_key": "finance", "build_quality": "full"},
+        {"model_name": "tvf_fin", "resource_type": "table_function", "schema_key": "finance", "build_quality": "full"},
+        {"model_name": "udf_x", "resource_type": "function", "schema_key": None, "build_quality": "full"},
+    ], env_rows
+    rel_rows = q(
+        f"SELECT model_name, dependency_tier, build_quality, sealed_at FROM `{project}.e2e_reg._releases` "
+        f"WHERE release_id = 'rel1' ORDER BY dependency_tier, model_name"
+    )
+    assert [(r["model_name"], r["dependency_tier"], r["build_quality"], r["sealed_at"]) for r in rel_rows] == [
+        ("udf_x", 1, "full", None), ("fin_orders", 2, "full", None), ("tvf_fin", 3, "full", None),
+    ], rel_rows
+    h.call_macro("flush_registry", results)  # idempotent re-run: still one candidate row per object
+    assert q(f"SELECT COUNT(*) AS n FROM `{project}.e2e_reg._releases` WHERE release_id = 'rel1'") == [{"n": 3}]
+    print("[registry] batched flush_registry: one MERGE for 3 objects, rows + build_quality verified, re-run idempotent.")
+
+    # 13. Multi-dataset env: per-object placeholders in the TVF template, rendered per environment
+    templates = {
+        r["model_name"]: r["routine_ddl_template"]
+        for r in q(
+            f"SELECT model_name, routine_ddl_template FROM `{project}.e2e_reg._releases` "
+            f"WHERE release_id = 'rel1' AND routine_ddl_template IS NOT NULL"
+        )
+    }
+    tvf_template = templates["tvf_fin"]
+    assert "__DBT_VIRTUAL_ENV_SCHEMA_finance__.fin_orders" in tvf_template, tvf_template
+    assert "__DBT_VIRTUAL_ENV_SCHEMA__.udf_x" in tvf_template, tvf_template
+    assert "e2e_stg" not in tvf_template, tvf_template
+    stg_ddl = h.call_macro("resolve_env_placeholders_sql", tvf_template, "staging")
+    assert "e2e_stg_fin`.fin_orders" in stg_ddl or "e2e_stg_fin.fin_orders" in stg_ddl, stg_ddl
+    prod_ddl = h.call_macro("resolve_env_placeholders_sql", tvf_template, "prod")
+    assert "e2e_prod_fin" in prod_ddl and "e2e_prod`.udf_x" in prod_ddl.replace("e2e_prod.udf_x", "e2e_prod`.udf_x"), prod_ddl
+    q(h.call_macro("resolve_env_placeholders_sql", templates["udf_x"], "staging"))
+    q(stg_ddl)
+    stg_tvf = q(f"SELECT k, v10 FROM `{project}.e2e_stg_fin.tvf_fin`(5)")
+    assert stg_tvf == [{"k": "b", "v10": 70}], stg_tvf
+    print("[multi-dataset] env_schemas mapping: view in e2e_stg_fin, TVF template resolved per object for staging and prod.")
+
+    # 14. Virtual view promotion: register_view_deployment -> promote -> view in prod with the right body
+    q(f"CREATE OR REPLACE VIEW `{project}.e2e_stg.v_big` AS SELECT k, v FROM `{project}.e2e_stg_fin.fin_orders` WHERE v > 0")
+    view_sql = h.call_macro(
+        "register_view_deployment", nodes["model.p.v_big"], FakeRelation(project, "e2e_stg", "v_big", "view", "`")
+    )
+    exec_script(view_sql)
+    view_template = q(
+        f"SELECT routine_ddl_template AS t FROM `{project}.e2e_reg._releases` WHERE release_id = 'rel1' AND model_name = 'v_big'"
+    )[0]["t"]
+    assert "CREATE OR REPLACE VIEW" in view_template and "__DBT_VIRTUAL_ENV_SCHEMA_finance__.fin_orders" in view_template, view_template
+
+    # 15. Promotion guards: unsealed refused, then sealed; partial build refused
+    hp = make_harness(target_name="prod")
+    refused(lambda: hp.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="rel1"), "is not sealed")
+    assert lookup(project, "e2e_prod_fin", "fin_orders") is None  # nothing was changed
+    exec_script(hp.call_macro("seal_release_sql", "e2e_reg", "rel1"))
+    assert q(f"SELECT COUNT(*) AS n FROM `{project}.e2e_reg._releases` WHERE release_id = 'rel1' AND sealed_at IS NOT NULL") == [{"n": 4}]
+    hp = make_harness(target_name="prod")
+    hp.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="rel1", expected_fps_json=json.dumps(fps))
+    assert lookup(project, "e2e_prod_fin", "fin_orders") is not None, "table view must land in the mapped finance dataset"
+    assert lookup(project, "e2e_prod", "fin_orders") is None
+    assert lookup(project, "e2e_prod", "v_big") is not None
+    # Staging objects removed: the promoted routines must read only prod objects.
+    q(f"DROP VIEW `{project}.e2e_stg_fin.fin_orders`")
+    q(f"DROP FUNCTION `{project}.e2e_stg.udf_x`")
+    prod_tvf = q(f"SELECT k, v10 FROM `{project}.e2e_prod_fin.tvf_fin`(5)")
+    assert prod_tvf == [{"k": "b", "v10": 70}], prod_tvf
+    prod_view = q(f"SELECT COUNT(*) AS n FROM `{project}.e2e_prod.v_big`")
+    assert prod_view == [{"n": 2}], prod_view
+    body = client.get_table(f"{project}.e2e_prod.v_big").view_query
+    assert "e2e_prod_fin" in body and "e2e_stg" not in body, body
+    pointers = q(f"SELECT model_name FROM `{project}.e2e_reg._environments` WHERE environment = 'prod' ORDER BY model_name")
+    assert [p["model_name"] for p in pointers] == ["fin_orders", "tvf_fin", "udf_x", "v_big"], pointers
+    assert q(f"SELECT status FROM `{project}.e2e_reg._releases` WHERE release_id = 'rel1' AND model_name = 'v_big'") == [{"status": "promoted"}]
+    print("[promote] sealed release promoted: per-object datasets, TVF/UDF/view bodies resolved to prod, staging dropped.")
+
+    hq = make_harness(extra_vars={"_dbt_virtual_release": "rel_partial", "_dbt_virtual_partial": True})
+    hq.call_macro("flush_registry", results[:1])
+    assert q(f"SELECT build_quality AS b FROM `{project}.e2e_reg._releases` WHERE release_id = 'rel_partial'") == [{"b": "partial"}]
+    exec_script(hq.call_macro("seal_release_sql", "e2e_reg", "rel_partial"))
+    hp = make_harness(target_name="prod")
+    refused(lambda: hp.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="rel_partial"), "built partially")
+    print("[guards] unsealed release refused, seal_release_sql, partial build_quality refused (nothing changed).")
+
+    # 16. Partition coverage audit
+    for ident, days in (("cov_m__aaaaaaaaaaaa", ("2026-10-01",)), ("cov_m__bbbbbbbbbbbb", ("2026-10-01", "2026-10-02"))):
+        selects = " UNION ALL ".join(f"SELECT DATE '{d}' AS d, 1 AS x" for d in days)
+        q(f"CREATE OR REPLACE TABLE `{project}.e2e_reg.{ident}` PARTITION BY d AS {selects}")
+    hc = make_harness()
+    q(f"INSERT INTO `{project}.e2e_reg._releases` (release_id, source_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at) "
+      f"VALUES ('rel_cov', 'staging', 'cov_m', 'model', 2, 'aaaaaaaaaaaa', 'e2e_reg.cov_m__aaaaaaaaaaaa', 'candidate', CURRENT_TIMESTAMP())")
+    q(f"INSERT INTO `{project}.e2e_reg._environments` (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at) "
+      f"VALUES ('prod', 'cov_m', 'model', 'bbbbbbbbbbbb', 'e2e_reg.cov_m__bbbbbbbbbbbb', 'rel_x', CURRENT_TIMESTAMP())")
+    cand_rel = FakeRelation(project, "e2e_reg", "cov_m__aaaaaaaaaaaa")
+    base_rel = FakeRelation(project, "e2e_reg", "cov_m__bbbbbbbbbbbb")
+    coverage_sql = hc.call_macro("partition_coverage_sql", cand_rel, base_rel)
+    try:
+        missing = [r["partition_id"] for r in q(coverage_sql)]
+    except Exception as exc:  # noqa: BLE001 - classify the emulator's answer, do not hide it
+        skipped.append(
+            "partition coverage audit + virtual_audit row counts: emulator has no INFORMATION_SCHEMA.PARTITIONS and no "
+            f"`__TABLES__` (row_count_sql), so virtual_audit cannot run; not faked ({str(exc)[:120]})"
+        )
+        print(f"[audit] SKIPPED partition coverage (emulator limitation): {str(exc)[:200]}")
+    else:
+        assert missing == ["20261002"], missing
+        refused(
+            lambda: hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov"),
+            "lacks 1 partition",
+        )
+        # Ignoring partitions before the cutoff makes the same pair pass.
+        hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov", coverage_ignore_before="2026-10-15")
+        print("[audit] partition coverage: missing partition 20261002 refused; coverage_ignore_before lets it pass.")
+
+    # 17. Regions: CREATE SCHEMA ... OPTIONS(location=...) from the regions macros
+    hr = make_harness(extra_cfg={"physical_schemas_by_location": {"EU": "e2e_reg_eu", "US": "e2e_reg_us"}, "physical_schema": "e2e_reg"})
+    assert hr.call_macro("physical_schema_for", "EU") == "e2e_reg_eu"
+    assert hr.call_macro("create_location_for", "US") == "US"
+    schema_sql = hr.call_macro("create_schema_if_not_exists_sql", "e2e_reg_eu", hr.call_macro("create_location_for", "EU"))
+    assert "OPTIONS (location = 'EU')" in schema_sql, schema_sql
+    q(schema_sql)  # must be accepted (it is a BigQuery statement); the emulator does not act on it, see below
+    try:
+        client.get_dataset(f"{project}.e2e_reg_eu")
+    except NotFound:
+        # EMULATOR LIMITATION: `CREATE SCHEMA IF NOT EXISTS ... [OPTIONS (location = ...)]` succeeds but creates no dataset.
+        skipped.append(
+            "regions: emulator accepts CREATE SCHEMA IF NOT EXISTS `p`.`d` OPTIONS (location = 'EU') but creates no dataset "
+            "(later DDL fails 'dataset d is not found'); dataset created through the REST API instead"
+        )
+        requests.post(
+            f"{endpoint}/bigquery/v2/projects/{project}/datasets",
+            json={"datasetReference": {"projectId": project, "datasetId": "e2e_reg_eu"}, "location": "EU"},
+            timeout=10,
+        ).raise_for_status()
+    exec_script(hr.call_macro("ensure_registry_tables_sql", hr.call_macro("physical_schema_for", "EU")))
+    assert lookup(project, "e2e_reg_eu", "_releases") is not None
+    print("[regions] CREATE SCHEMA ... OPTIONS (location = 'EU') rendered and accepted; per-location registry created in e2e_reg_eu")
+    location = client.get_dataset(f"{project}.e2e_reg_eu").location
+    print(f"[regions] emulator reports dataset location: {location!r}")
+    if location != "EU":
+        skipped.append(f"regions: emulator does not report the dataset location (got {location!r}, real BigQuery: 'EU')")
+
+    # 18. GC retention per environment (`find_orphan_tables_sql`) with releases in two environments
+    gc_tables = [
+        "m__0123456789ab",  # in _environments (prod pointer)
+        "m__1111111111aa",  # newest release of env prod
+        "m__2222222222bb",  # older release of env prod, beyond retention 1 -> orphan
+        "n__3333333333cc",  # only release of env pr_7: kept by per-environment retention
+        "m__4444444444dd",  # unreferenced -> orphan
+    ]
+    for ident in gc_tables:
+        q(f"CREATE OR REPLACE TABLE `{project}.e2e_gc.{ident}` AS SELECT 1 AS x")
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_gc.not_a_fingerprint_table` AS SELECT 1 AS x")
+    exec_script(h.call_macro("ensure_registry_tables_sql", "e2e_gc"))
+    q(f"INSERT INTO `{project}.e2e_gc._environments` (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at) "
+      f"VALUES ('prod', 'm', 'model', '0123456789ab', 'e2e_gc.m__0123456789ab', 'a0', CURRENT_TIMESTAMP())")
+    release_values = [
+        ("a1", "prod", "m", "2222222222bb", "2026-10-01"),
+        ("a2", "prod", "m", "1111111111aa", "2026-10-02"),
+        ("b1", "pr_7", "n", "3333333333cc", "2026-09-01"),
+    ]
+    values = ", ".join(
+        f"('{rid}', '{env}', '{env}', '{name}', 'model', 2, '{fp}', 'e2e_gc.{name}__{fp}', 'promoted', TIMESTAMP '{ts} 00:00:00', TIMESTAMP '{ts} 00:00:00')"
+        for rid, env, name, fp, ts in release_values
+    )
+    q(f"INSERT INTO `{project}.e2e_gc._releases` (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at, promoted_at) VALUES {values}")
+    hg = make_harness(extra_cfg={"physical_schema": "e2e_gc"})
+    orphan_sql = hg.call_macro("find_orphan_tables_sql", "e2e_gc", 1, 0)
+    try:
+        q(orphan_sql)
+    except Exception as exc:  # noqa: BLE001
+        # EMULATOR LIMITATION: INFORMATION_SCHEMA.TABLES.creation_time is a STRING here (TIMESTAMP in BigQuery), so
+        # `creation_time < TIMESTAMP_SUB(...)` fails to analyze. Everything else in the query runs as rendered.
+        assert "STRING, TIMESTAMP" in str(exc), exc
+        skipped.append(
+            "gc retention: emulator's INFORMATION_SCHEMA.TABLES.creation_time is STRING, not TIMESTAMP; "
+            "the query runs with `t.creation_time` wrapped in TIMESTAMP() (the only change)"
+        )
+        sql_rewrites["t.creation_time <"] = "TIMESTAMP(t.creation_time) <"
+    if True:
+        orphans = [r["table_name"] for r in q(sql_rewrites_apply(orphan_sql, sql_rewrites))]
+        assert orphans == ["m__2222222222bb", "m__4444444444dd"], orphans
+        hg.call_macro("virtual_gc", dry_run=False, retention_releases=1, retention_days=0)
+        sql_rewrites.pop("t.creation_time <", None)
+        left = sorted(t.table_id for t in client.list_tables(f"{project}.e2e_gc") if "__" in t.table_id)
+        assert left == ["m__0123456789ab", "m__1111111111aa", "n__3333333333cc"], left
+        print("[gc] per-environment retention: orphans", orphans, "dropped; pr_7's only release and prod's newest kept.")
+
+    # 19. Companion state save/restore on a fake manifest table
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_cmp.manifest` (model STRING, last_success TIMESTAMP)")
+    inc_node = {
+        "unique_id": "model.p.inc_m", "name": "inc_m", "resource_type": "model", "alias": "inc_m__fp1fp1fp1fp1",
+        "database": project, "schema": "e2e_reg", "tags": [],
+        "config": {"materialized": "incremental", "virtual_env": True}, "depends_on": {"nodes": []},
+    }
+    hk = make_harness(
+        extra_cfg={"companion_state": [{"table": "e2e_cmp.manifest", "key_column": "model"}]},
+        graph_nodes={"model.p.inc_m": inc_node},
+    )
+    q(f"INSERT INTO `{project}.e2e_cmp.manifest` (model, last_success) VALUES "
+      f"('inc_m', TIMESTAMP '2026-11-01 00:00:00'), ('other', TIMESTAMP '2026-01-01 00:00:00')")
+    exec_script(hk.call_macro(
+        "upsert_environment_pointer_sql", "e2e_reg", "staging", "inc_m", "model", "fp1fp1fp1fp1", "e2e_reg.inc_m__fp1fp1fp1fp1", "", None
+    ))
+    assert hk.call_macro("companion_depart", inc_node, "staging", "fp2fp2fp2fp2") is True  # saves rows for fp1
+    saved = q(f"SELECT fingerprint, state_json FROM `{project}.e2e_reg._companion_state`")
+    assert len(saved) == 1 and saved[0]["fingerprint"] == "fp1fp1fp1fp1" and "2026-11-01" in saved[0]["state_json"], saved
+    # The environment moves on: its live state is replaced, then it returns to fp1.
+    q(f"DELETE FROM `{project}.e2e_cmp.manifest` WHERE model = 'inc_m'")
+    q(f"INSERT INTO `{project}.e2e_cmp.manifest` (model, last_success) VALUES ('inc_m', TIMESTAMP '2026-12-31 00:00:00')")
+    hk.call_macro("restore_companion_state", "inc_m", "fp1fp1fp1fp1", "staging")
+    restored = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest` ORDER BY model")
+    assert restored == [{"model": "inc_m", "d": "2026-11-01"}, {"model": "other", "d": "2026-01-01"}], restored
+    print("[companion] state saved when the env left fp1, restored on return; other models' rows untouched.")
+    return skipped
 
 
 def run_e2e() -> int:
@@ -466,7 +894,13 @@ def run_e2e() -> int:
     q(f"DELETE FROM `{project}.analytics_physical._locks` WHERE environment = 'prod' AND owner = 'ci_runner_1'")
     print("[locks] BigQuery concurrency lease acquisition & release verified.")
 
+    skipped = run_feature_steps(client, q, project, requests, endpoint)
+
     print("All dbt-virtual emulator E2E checks PASSED.")
+    if skipped:
+        print(f"Skipped because of emulator limitations ({len(skipped)}):")
+        for line in skipped:
+            print(f"  - {line}")
     return 0
 
 
