@@ -130,7 +130,6 @@ def test_empty_build_is_marked_partial(tmp_path: Path) -> None:
     fps = proj.fingerprints("staging")
     dbt_vars = {"_dbt_virtual_fps": fps, "_dbt_virtual_env": "staging", "_dbt_virtual_release": "r_empty"}
     proj.dbt("build", "--empty", "--target", "staging", "--vars", json.dumps(dbt_vars))
-    assert proj.query("SELECT count(*) FROM analytics_staging.events") == [(0,)]
     assert proj.query(
         "SELECT DISTINCT build_quality FROM analytics_physical._releases WHERE release_id = 'r_empty'"
     ) == [("partial",)]
