@@ -154,9 +154,7 @@ def test_promote_and_rollback_take_the_lease_lock_when_asked() -> None:
     harness.existing_relations.add(("test_proj", "analytics_physical", "orders__fp1"))
     harness.query_responses.extend(
         [
-            FakeResult([]),  # delete expired
-            FakeResult([]),  # delete own lease
-            FakeResult([]),  # insert own lease
+            FakeResult([]),  # MERGE own lease
             FakeResult([("cli@host", "2026-11-05T00:15:00Z")]),  # live leases: ours
             FakeResult([("orders", "model", "fp1", "analytics_physical.orders__fp1", None, 2)]),
             FakeResult([]),
@@ -166,7 +164,7 @@ def test_promote_and_rollback_take_the_lease_lock_when_asked() -> None:
         "virtual_promote", from_env="staging", to_env="prod", release_id="r1", lock=True, lock_owner="cli@host"
     )
     executed = harness.executed_queries
-    assert executed[2].startswith("INSERT INTO `test_proj`.`analytics_physical`._locks")
+    assert executed[0].startswith("MERGE INTO `test_proj`.`analytics_physical`._locks")
     assert executed[-1].startswith("DELETE FROM `test_proj`.`analytics_physical`._locks")
     assert "owner = 'cli@host'" in executed[-1]
 

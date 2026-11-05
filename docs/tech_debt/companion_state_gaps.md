@@ -47,12 +47,12 @@ paid three items (see "Paid in dbt-virtual-0024"):
   `flush_registry` in on-run-end, both registry write modes) puts the environment's rows back to
   the table its pointer still names. Tests: `test_failed_build_puts_the_environments_state_back`
   (DuckDB), `test_failed_build_restores_the_state_of_the_table_the_environment_still_points_at`
-  (BigQuery SQL), emulator step 21.
+  (BigQuery SQL), emulator step 27.
 - `virtual_gc` deletes the `_companion_state` rows of the tables it drops (`companion_forget_tables`).
   Tests: `test_gc_deletes_saved_state_of_the_tables_it_drops` (DuckDB and BigQuery SQL), emulator step 18.
 - Promote across locations (`source_database` / `source_schema`, or `physical_locations`) restored no
   state; it now reads the source environment's live rows and the rows saved in the source registry.
-  Tests: `test_cross_location_promote_*` (DuckDB, BigQuery SQL), emulator step 22
+  Tests: `test_cross_location_promote_*` (DuckDB, BigQuery SQL), emulator step 28
   (real `CREATE TABLE ... CLONE`, emulator flipto/main a5289ad).
 
 ## Why it exists
