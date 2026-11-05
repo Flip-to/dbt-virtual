@@ -13,7 +13,7 @@ Verified stages on each warehouse:
    - Snowflake SQL function translation verification (`IFF`, `NVL`) on `nnnkkk7/snowflake-emulator`
 3. Zero-rebuild promotion (`staging` -> `prod` for release `v1`) via `virtual_promote`.
 4. Ephemeral PR environment (`pr_42`) zero-compute initialization (`virtual_init_env`) & teardown (`virtual_drop_env`).
-5. Release v2 build in `staging` (`clone_if_new_fp` + incremental insert) & zero-rebuild promotion to `prod`.
+5. Release v2 build in `staging` (`seed_incremental_clones` + incremental insert) & zero-rebuild promotion to `prod`.
 6. Instant rollback (`prod` -> release `v1`) via `virtual_rollback`.
 """
 
@@ -69,6 +69,9 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
         vars_dict={
             "dbt_virtual": {
                 "physical_schema": "analytics_physical",
+                # The `emulator` target name selects CTAS clones; the environment is staging.
+                # Unmapped environments get `<base_env_schema>_<env>`, not `target.schema`.
+                "environment": "staging",
                 "base_environment": "prod",
                 "use_ctas_for_clone": True,
                 "env_schemas": {
@@ -163,7 +166,7 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     for q_str in harness.executed_queries:
         sf_exec(q_str)
 
-    # 5. Build v2 in staging (`clone_if_new_fp` + incremental insert) & promote to prod
+    # 5. Build v2 in staging (`seed_incremental_clones` + incremental insert) & promote to prod
     node_v2 = {
         **node_v1,
         "compiled_code": "SELECT 'store_1', 10 UNION ALL SELECT 'store_2', 25 UNION ALL SELECT 'store_3', 40",
@@ -175,9 +178,23 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     harness.model = node_v2
     harness.this = FakeRelation("", "analytics_physical", phys_v2, "table", quote_char="")
 
-    harness.query_responses.append(FakeResult([(f"analytics_physical.{phys_v1}",)]))
-    clone_sql = harness.call_macro("clone_if_new_fp")
-    sf_exec(clone_sql)
+    # Seed v2 from prod's v1 before the materialization runs (`seed_incremental_clones`);
+    # a clone made in a model pre-hook is replaced by dbt's incremental materialization.
+    harness.graph = {
+        "nodes": {
+            node_v2["unique_id"]: {
+                **node_v2,
+                "database": "",
+                "schema": "analytics_physical",
+                "alias": phys_v2,
+            }
+        }
+    }
+    harness.query_responses.append(FakeResult([("orders_metrics", f"analytics_physical.{phys_v1}")]))
+    harness.executed_queries.clear()
+    harness.call_macro("seed_incremental_clones")
+    for q_str in harness.executed_queries[1:]:  # skip the base-pointer SELECT answered above
+        sf_exec(q_str)
     sf_exec(f"INSERT INTO analytics_physical.{phys_v2} VALUES ('store_3', 40)")
     sf_exec(harness.call_macro("sync_env_view"))
 
@@ -290,7 +307,7 @@ def run_postgres_e2e(dsn: str) -> None:
         assert cur.fetchone()[0] == 35
         print("[postgres v1] Zero-rebuild promote to prod verified: sum=35")
 
-        # 4. Build v2 via clone_if_new_fp + promote + rollback
+        # 4. Build v2 via seed_incremental_clones + promote + rollback
         node_v2 = {
             **node_v1,
             "compiled_code": "SELECT 'store_1', 10 UNION ALL SELECT 'store_2', 25 UNION ALL SELECT 'store_3', 40",
@@ -302,8 +319,23 @@ def run_postgres_e2e(dsn: str) -> None:
         harness.model = node_v2
         harness.this = FakeRelation("", "analytics_physical", phys_v2, "table", quote_char="")
 
-        harness.query_responses.append(FakeResult([(f"analytics_physical.{phys_v1}",)]))
-        pg_exec(harness.call_macro("clone_if_new_fp"))
+        # Seed v2 from prod's v1 before the materialization runs (`seed_incremental_clones`);
+        # a clone made in a model pre-hook is replaced by dbt's incremental materialization.
+        harness.graph = {
+            "nodes": {
+                node_v2["unique_id"]: {
+                    **node_v2,
+                    "database": "",
+                    "schema": "analytics_physical",
+                    "alias": phys_v2,
+                }
+            }
+        }
+        harness.query_responses.append(FakeResult([("orders_metrics", f"analytics_physical.{phys_v1}")]))
+        harness.executed_queries.clear()
+        harness.call_macro("seed_incremental_clones")
+        for q_str in harness.executed_queries[1:]:  # skip the base-pointer SELECT answered above
+            pg_exec(q_str)
         pg_exec(f"INSERT INTO analytics_physical.{phys_v2} VALUES ('store_3', 40)")
         pg_exec(harness.call_macro("sync_env_view"))
 
