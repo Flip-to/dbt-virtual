@@ -161,63 +161,51 @@ def cmd_build(ns: argparse.Namespace) -> int:
     if ns.end:
         dbt_vars["_dbt_virtual_end"] = ns.end
 
-    def _run_operation(name: str, op_args: dict[str, object]) -> int:
-        # Same target and vars as the build, so node schemas/aliases match what dbt builds.
-        return _run_dbt(
-            [
-                "run-operation",
-                name,
-                "--target",
-                ns.env,
-                "--args",
-                json.dumps(op_args),
-                "--vars",
-                json.dumps(dbt_vars),
-            ],
-            project_dir,
-        )
-
-    def _snapshot_release() -> int:
+    seed_names = sorted(a.name for a in actions.values() if a.action == "SEED_INCREMENTAL")
+    # DECISION(single_dbt_build_invocation): REUSE view sync, incremental seeding (dbt decides
+    # "new table" before model pre-hooks run, so it must precede the build) and the release
+    # snapshot used to be three `dbt run-operation` calls around `dbt build`, each paying a full
+    # project parse. They now run in the build's own on-run-start / on-run-end hooks
+    # (`dbt_virtual.run_start()`, `dbt_virtual.flush_registry(results)`), driven by these vars.
+    if reused_models:
+        dbt_vars["_dbt_virtual_reuse"] = reused_models
+    if seed_names:
+        dbt_vars["_dbt_virtual_seed"] = seed_names
+    if ns.release:
         # Record every current virtual node in the release, not only what dbt built, so that
         # promote/rollback of this release do not demote REUSE models and unchanged routines.
-        if not ns.release:
-            return 0
-        current = {
-            fp.name: {"fingerprint": fp.fingerprint, "materialized": fp.materialized}
-            for fp in fps.values()
-        }
-        return _run_operation(
-            "virtual_snapshot_release",
-            {"env": ns.env, "release_id": ns.release, "models_json": json.dumps(current)},
-        )
+        dbt_vars["_dbt_virtual_snapshot"] = True
 
-    # 1. Zero-compute view pointer sync for REUSE models
-    if reused_models:
-        sync_args = {
-            "env": ns.env,
-            "release_id": ns.release or "",
-            "models_json": json.dumps(reused_models),
-        }
-        rc = _run_operation("virtual_sync_reused_views", sync_args)
-        if rc != 0:
-            return rc
-
-    # If the plan has nothing to build and no explicit selector overrides it, do not
-    # fall through to an unscoped `dbt build` (which would build the whole project).
+    # If the plan has nothing to build and no explicit selector overrides it, do not fall through
+    # to an unscoped `dbt build` (which would build the whole project). `dbt build` of an empty
+    # selection runs no hooks, so REUSE sync and the snapshot take one `run-operation` instead.
     if not models_to_build and not ns.select:
         if reused_models:
             print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
         else:
             print("dbt-virtual build: No planned models require a build.")
-        return _snapshot_release()
-
-    # 2. Clone base tables for SEED_INCREMENTAL models before dbt starts: dbt's incremental
-    # materialization decides "new table" before model pre-hooks run.
-    seed_names = sorted(a.name for a in actions.values() if a.action == "SEED_INCREMENTAL")
-    if seed_names:
-        rc = _run_operation("virtual_seed_incremental_clones", {"model_names": seed_names})
-        if rc != 0:
-            return rc
+        if not reused_models and not ns.release:
+            return 0
+        return _run_dbt(
+            [
+                "run-operation",
+                "virtual_finalize_plan",
+                "--target",
+                ns.env,
+                "--args",
+                json.dumps(
+                    {
+                        "env": ns.env,
+                        "release_id": ns.release or "",
+                        "reuse": reused_models,
+                        "snapshot": bool(ns.release),
+                    }
+                ),
+                "--vars",
+                json.dumps(dbt_vars),
+            ],
+            project_dir,
+        )
 
     build_args = [
         "build",
@@ -232,10 +220,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
         build_args.extend(["--select", " ".join(models_to_build)])
     if ns.full_refresh:
         build_args.append("--full-refresh")
-    rc = _run_dbt(build_args, project_dir)
-    if rc != 0:
-        return rc
-    return _snapshot_release()
+    return _run_dbt(build_args, project_dir)
 
 
 def cmd_promote(ns: argparse.Namespace) -> int:

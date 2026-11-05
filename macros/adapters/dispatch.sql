@@ -347,6 +347,55 @@
 {%- endmacro %}
 
 
+{% macro upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  {#-
+    Multi-row form of `upsert_environment_pointer_sql` for `flush_registry`: one statement (batch)
+    for N pointers of one environment. `rows` are dicts with `name`, `resource_type`, `fingerprint`,
+    `physical_identifier`, `release_id` and `schema_key`; names must be unique within `rows`.
+  -#}
+  {{ return(adapter.dispatch('upsert_environment_pointers_sql', 'dbt_virtual')(physical_schema, env_name, rows)) }}
+{%- endmacro %}
+
+{% macro bigquery__upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  MERGE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} AS T
+  USING (
+    {%- for r in rows %}
+    {{ 'UNION ALL ' if not loop.first else '' }}SELECT
+      {{ dbt_virtual.sql_string_literal(env_name) }} AS environment,
+      {{ dbt_virtual.sql_string_literal(r['name']) }} AS model_name,
+      {{ dbt_virtual.sql_string_literal(r['resource_type']) }} AS resource_type,
+      {{ dbt_virtual.sql_string_literal(r['fingerprint']) }} AS fingerprint,
+      {{ dbt_virtual.sql_string_literal(r['physical_identifier']) }} AS physical_identifier,
+      {{ dbt_virtual.sql_string_literal(r['release_id']) }} AS release_id,
+      CURRENT_TIMESTAMP() AS updated_at,
+      CAST({{ dbt_virtual.sql_nullable_literal(r['schema_key']) }} AS STRING) AS schema_key
+    {%- endfor %}
+  ) AS S
+  ON T.environment = S.environment AND T.model_name = S.model_name
+  WHEN MATCHED THEN UPDATE SET
+    resource_type = S.resource_type,
+    fingerprint = S.fingerprint,
+    physical_identifier = S.physical_identifier,
+    release_id = S.release_id,
+    updated_at = S.updated_at,
+    schema_key = S.schema_key
+  WHEN NOT MATCHED THEN INSERT (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key)
+    VALUES (S.environment, S.model_name, S.resource_type, S.fingerprint, S.physical_identifier, S.release_id, S.updated_at, S.schema_key)
+{%- endmacro %}
+
+{% macro default__upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  WHERE environment = {{ dbt_virtual.sql_string_literal(env_name) }}
+    AND model_name IN ({% for r in rows %}{{ dbt_virtual.sql_string_literal(r['name']) }}{{ ', ' if not loop.last else '' }}{% endfor %});
+  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
+  ) VALUES
+  {%- for r in rows %}
+  ({{ dbt_virtual.sql_string_literal(env_name) }}, {{ dbt_virtual.sql_string_literal(r['name']) }}, {{ dbt_virtual.sql_string_literal(r['resource_type']) }}, {{ dbt_virtual.sql_string_literal(r['fingerprint']) }}, {{ dbt_virtual.sql_string_literal(r['physical_identifier']) }}, {{ dbt_virtual.sql_string_literal(r['release_id']) }}, CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(r['schema_key']) }}){{ ',' if not loop.last else '' }}
+  {%- endfor %}
+{%- endmacro %}
+
+
 {% macro create_routine_ddl_sql(routine_type, target_relation_str, params_sig, returns_sig, body_sql) -%}
   {{ return(adapter.dispatch('create_routine_ddl_sql', 'dbt_virtual')(routine_type, target_relation_str, params_sig, returns_sig, body_sql)) }}
 {%- endmacro %}

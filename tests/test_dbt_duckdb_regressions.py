@@ -83,7 +83,9 @@ def _table_model(sql: str) -> str:
 class Project:
     """A throwaway dbt project wired to the local dbt_virtual macros and a DuckDB file."""
 
-    def __init__(self, root: Path, models: dict[str, str], project_yml: str = PROJECT_YML) -> None:
+    def __init__(
+        self, root: Path, models: dict[str, str], project_yml: str = PROJECT_YML, threads: int = 1
+    ) -> None:
         self.dir = root / "proj"
         self.db_path = (root / "warehouse.duckdb").as_posix()
         (self.dir / "models").mkdir(parents=True)
@@ -100,7 +102,7 @@ class Project:
         (self.dir / "macros" / "routing.sql").write_text(ROUTING_SHIM, encoding="utf-8")
         outputs = "".join(
             f'    {name}:\n      type: duckdb\n      path: "{self.db_path}"\n'
-            f"      schema: {schema}\n      threads: 1\n"
+            f"      schema: {schema}\n      threads: {threads}\n"
             for name, schema in TARGETS.items()
         )
         (self.dir / "profiles.yml").write_text(
