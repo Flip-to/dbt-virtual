@@ -396,8 +396,9 @@ def compute_node_fingerprint(
     if config_subset.get("physical_version"):
         digest = str(config_subset["physical_version"])
 
-    is_routine = materialized in ROUTINE_MATERIALIZATIONS
-    physical_identifier = name if is_routine else f"{name}__{digest}"
+    # Routines and views have no `<name>__<fp>` physical table; they are deployed by DDL.
+    has_physical_table = materialized not in ROUTINE_MATERIALIZATIONS and materialized != "view"
+    physical_identifier = f"{name}__{digest}" if has_physical_table else name
 
     return NodeFingerprint(
         unique_id=unique_id,

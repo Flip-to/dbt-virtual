@@ -615,7 +615,7 @@ $$
 {% macro bigquery__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }}
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP TABLE FUNCTION IF EXISTS {{ object_relation }}
@@ -631,7 +631,7 @@ $$
 {% macro duckdb__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }}
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP MACRO TABLE IF EXISTS {{ object_relation }}
@@ -645,7 +645,7 @@ $$
 {% macro default__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }} CASCADE
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }} CASCADE
   {%- else -%}
     SELECT 1

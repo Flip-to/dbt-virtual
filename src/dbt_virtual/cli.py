@@ -1,4 +1,4 @@
-"""CLI entry point for dbt-virtual (plan, build, promote, rollback, diff, audit, status, gc, init-env, drop-env)."""
+"""CLI entry point for dbt-virtual (plan, build, run, promote, rollback, diff, audit, status, gc, init-env, drop-env)."""
 
 from __future__ import annotations
 
@@ -238,6 +238,131 @@ def cmd_build(ns: argparse.Namespace) -> int:
     return _snapshot_release()
 
 
+def _selected_model_names(project_dir: Path, env: str, select: str) -> set[str] | None:
+    """Names of the models a dbt `--select` expression matches (via `dbt ls`), or None on failure."""
+    result = subprocess.run(
+        [
+            "dbt", "ls", "--quiet", "--target", env,
+            "--resource-type", "model", "--select", select,
+            "--output", "json", "--output-keys", "name",
+        ],
+        cwd=project_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(result.stderr, file=sys.stderr, end="")
+        return None
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                names.add(json.loads(line)["name"])
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return names
+
+
+def cmd_run(ns: argparse.Namespace) -> int:
+    """Refresh the data of the table/incremental models an environment already has, in place.
+
+    SQLMesh `run` semantics: a model whose fingerprint is unchanged keeps its physical table
+    (`<model>__<fp>`) and is re-run against it (incrementals append the new interval, tables are
+    rebuilt). It uses `dbt build`, not `dbt run`, so the models' tests run right after each one and
+    a failing test stops the models downstream of it from refreshing on top of bad data.
+    A fingerprint that differs from the environment's registered one is a deploy and belongs to
+    `build`, so `run` refuses unless `--allow-changes`.
+    """
+    project_dir = Path(ns.project_dir).resolve()
+    if not ns.skip_compile:
+        rc = _run_dbt(["compile", "--target", ns.env], project_dir)
+        if rc != 0:
+            return rc
+
+    manifest = _load_manifest(project_dir)
+    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
+    write_fingerprints_file(fps, project_dir / ".dbt_virtual" / "fingerprints.json")
+
+    if ns.state_file:
+        env_state, _base, _existing, _registered = _load_state_file(ns.state_file)
+    else:
+        rc, state = _capture_state(
+            project_dir,
+            {"env": ns.env, "base_env": ns.base_env},
+            target=ns.env,
+        )
+        if state is None:
+            return rc or 1
+        env_state = dict(state.get("env_state") or {})
+
+    candidates = sorted(
+        (fp for fp in fps.values() if fp.materialized in {"table", "incremental"}),
+        key=lambda fp: fp.name,
+    )
+    if ns.select:
+        selected = _selected_model_names(project_dir, ns.env, ns.select)
+        if selected is None:
+            return 1
+        candidates = [fp for fp in candidates if fp.name in selected]
+    if not candidates:
+        print("dbt-virtual run: no virtual table or incremental models to run.")
+        return 0
+
+    changed = [fp for fp in candidates if env_state.get(fp.name) != fp.fingerprint]
+    if changed and not ns.allow_changes:
+        print(
+            f"dbt-virtual run: refusing to run; {len(changed)} model(s) differ from env "
+            f"'{ns.env}' (a change is a deploy, use `dbt-virtual build`, or pass --allow-changes):",
+            file=sys.stderr,
+        )
+        for fp in changed:
+            registered = env_state.get(fp.name)
+            print(
+                f"  - {fp.name}: registered={registered or 'none'} current={fp.fingerprint}",
+                file=sys.stderr,
+            )
+        return 2
+
+    by_name = {fp.name: fp.fingerprint for fp in fps.values()}
+    dbt_vars: dict[str, object] = {"_dbt_virtual_fps": by_name, "_dbt_virtual_env": ns.env}
+    if ns.start:
+        dbt_vars["_dbt_virtual_start"] = ns.start
+    if ns.end:
+        dbt_vars["_dbt_virtual_end"] = ns.end
+
+    # A changed incremental gets a new physical table: seed it from the base environment first,
+    # like `build` does for SEED_INCREMENTAL.
+    seed_names = [fp.name for fp in changed if fp.materialized == "incremental"]
+    if seed_names and not ns.full_refresh:
+        rc = _run_dbt(
+            [
+                "run-operation", "virtual_seed_incremental_clones",
+                "--target", ns.env,
+                "--args", json.dumps({"model_names": seed_names}),
+                "--vars", json.dumps(dbt_vars),
+            ],
+            project_dir,
+        )
+        if rc != 0:
+            return rc
+
+    build_args = [
+        "build",
+        "--target",
+        ns.env,
+        "--vars",
+        json.dumps(dbt_vars),
+        "--select",
+        *[fp.name for fp in candidates],
+    ]
+    if ns.full_refresh:
+        build_args.append("--full-refresh")
+    return _run_dbt(build_args, project_dir)
+
+
 def cmd_promote(ns: argparse.Namespace) -> int:
     project_dir = Path(ns.project_dir).resolve()
     op_args = {
@@ -270,16 +395,16 @@ def cmd_audit(ns: argparse.Namespace) -> int:
     )
 
 
-def cmd_status(ns: argparse.Namespace) -> int:
-    project_dir = Path(ns.project_dir).resolve()
-    op_args = {
-        "env": ns.env,
-        "base_env": ns.base_env,
-    }
-    dbt_args = ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)]
-    if not ns.output:
-        return _run_dbt(dbt_args, project_dir)
+def _capture_state(
+    project_dir: Path, op_args: dict[str, object], *, target: str | None = None
+) -> tuple[int, dict | None]:
+    """Run `virtual_export_state` and parse the `DBT_VIRTUAL_STATE_JSON:` line it logs.
 
+    Echoes dbt's output. Returns `(returncode, state)`; `state` is None on any failure.
+    """
+    dbt_args = ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)]
+    if target:
+        dbt_args.extend(["--target", target])
     result = subprocess.run(
         ["dbt", *dbt_args],
         cwd=project_dir,
@@ -292,7 +417,7 @@ def cmd_status(ns: argparse.Namespace) -> int:
     if result.stderr:
         print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
     if result.returncode != 0:
-        return result.returncode
+        return result.returncode, None
 
     state_marker = "DBT_VIRTUAL_STATE_JSON:"
     state_json = None
@@ -308,13 +433,30 @@ def cmd_status(ns: argparse.Namespace) -> int:
             "dbt-virtual status: dbt completed but did not emit DBT_VIRTUAL_STATE_JSON.",
             file=sys.stderr,
         )
-        return 1
+        return 1, None
 
     try:
-        state = json.loads(state_json)
+        return 0, json.loads(state_json)
     except json.JSONDecodeError as exc:
         print(f"dbt-virtual status: invalid state JSON: {exc}", file=sys.stderr)
-        return 1
+        return 1, None
+
+
+def cmd_status(ns: argparse.Namespace) -> int:
+    project_dir = Path(ns.project_dir).resolve()
+    op_args = {
+        "env": ns.env,
+        "base_env": ns.base_env,
+    }
+    if not ns.output:
+        return _run_dbt(
+            ["run-operation", "virtual_export_state", "--args", json.dumps(op_args)],
+            project_dir,
+        )
+
+    rc, state = _capture_state(project_dir, op_args)
+    if state is None:
+        return rc
 
     output_path = Path(ns.output)
     if not output_path.is_absolute():
@@ -477,6 +619,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
     p_build.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
     p_build.set_defaults(func=cmd_build)
+
+    # run
+    p_run = sub.add_parser(
+        "run",
+        help="Refresh table/incremental models in place (same fingerprint, same physical table).",
+    )
+    p_run.add_argument("--env", default="prod", help="Virtual environment to refresh.")
+    p_run.add_argument("--base-env", default="prod", help="Base environment incremental clones are seeded from.")
+    p_run.add_argument("--select", default=None, help="Only run the matching models (dbt --select expression).")
+    p_run.add_argument("--start", default=None, help="Interval start; recorded in _intervals and passed as a var.")
+    p_run.add_argument("--end", default=None, help="Interval end; recorded in _intervals and passed as a var.")
+    p_run.add_argument("--state-file", default=None, help="Warehouse state JSON (`status --output`); default: query the warehouse.")
+    p_run.add_argument(
+        "--allow-changes",
+        action="store_true",
+        help="Run even when a model's fingerprint differs from the environment's (a deploy).",
+    )
+    p_run.add_argument("--full-refresh", action="store_true", help="Pass --full-refresh to dbt build.")
+    p_run.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_run.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
+    p_run.set_defaults(func=cmd_run)
 
     # promote
     p_promote = sub.add_parser("promote", help="Zero-rebuild promotion by repointing views and routines.")

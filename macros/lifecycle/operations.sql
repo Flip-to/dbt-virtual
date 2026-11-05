@@ -283,8 +283,10 @@
 
 
 {% macro ordered_registry_rows(rows, schema_key_index) -%}
-  {#- Registry rows as dicts in deployment order: environment views first (they are `SELECT *`
-      over physical tables), then routines by DAG depth, then UDFs before TVFs before procedures. -#}
+  {#- Registry rows as dicts in deployment order: environment views of tables first (they are
+      `SELECT *` over physical tables), then virtual views and routines together by DAG depth (a
+      view can read another view or a UDF, a routine can read a view), then UDFs before TVFs before
+      procedures within a depth. -#}
   {%- set depths = dbt_virtual.routine_depths() -%}
   {%- set items = [] -%}
   {%- for row in rows -%}
@@ -297,7 +299,7 @@
       'schema_key': dbt_virtual.row_value(row, schema_key_index),
       'group': 0 if row[1] == 'model' else 1,
       'depth': depths.get(row[0], 0),
-      'rank': {'function': 1, 'virtual_function': 1, 'table_function': 2}.get(row[1], 3)
+      'rank': {'view': 0, 'function': 1, 'virtual_function': 1, 'table_function': 2}.get(row[1], 3)
     }) -%}
   {%- endfor -%}
   {{ return(items | sort(attribute='model_name') | sort(attribute='rank') | sort(attribute='depth') | sort(attribute='group')) }}
@@ -457,9 +459,11 @@
         {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
       {%- elif routine_ddl is not none and routine_ddl != '' -%}
         {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, to_env) -%}
-        {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
+        {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying " ~ resource_type ~ " " ~ to_schema ~ "." ~ model_name, info=True) }}
         {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
-        {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
+        {%- if resource_type != 'view' -%}
+          {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
 
@@ -734,7 +738,7 @@
       {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, env) -%}
-      {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying routine " ~ env_schema ~ "." ~ model_name, info=True) }}
+      {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying " ~ resource_type ~ " " ~ env_schema ~ "." ~ model_name, info=True) }}
       {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
       {#- Same identifier `virtual_promote` records for a deployed routine. -#}
       {%- set phys_ident = env_schema ~ '.' ~ model_name -%}
@@ -996,12 +1000,12 @@
   {%- for model_name, info in models_map.items() | sort -%}
     {%- set mat = (info or {}).get('materialized', '') if info is mapping else '' -%}
     {%- set ptr = env_ptrs.get(model_name) -%}
-    {%- if model_name in in_release or mat not in ['table', 'incremental', 'table_function', 'function', 'virtual_function', 'procedure'] -%}
+    {%- if model_name in in_release or mat not in ['table', 'incremental', 'view', 'table_function', 'function', 'virtual_function', 'procedure'] -%}
     {%- elif ptr is none -%}
       {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: " ~ model_name ~ " has no pointer in env=" ~ env ~ "; it is not part of the release.", info=True) }}
     {%- else -%}
       {%- set rtype = ptr['resource_type'] -%}
-      {%- set tier = {'function': 1, 'model': 2, 'table_function': 3}.get(rtype, 4) -%}
+      {%- set tier = {'function': 1, 'model': 2, 'view': 2, 'table_function': 3}.get(rtype, 4) -%}
       {%- set template = templates.get(model_name ~ '|' ~ ptr['fingerprint']) if rtype != 'model' else none -%}
       {%- if (info or {}).get('fingerprint') and info.get('fingerprint') != ptr['fingerprint'] -%}
         {{ log("dbt-virtual snapshot-release [" ~ release_id ~ "]: " ~ model_name ~ " in env=" ~ env ~ " is at " ~ ptr['fingerprint'] ~ ", not the planned " ~ info.get('fingerprint') ~ "; recording the environment's version.", info=True) }}
