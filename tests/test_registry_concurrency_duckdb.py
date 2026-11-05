@@ -21,14 +21,6 @@ def test_flushes_of_different_environments_keep_every_pointer(backend) -> None:
     rc.scenario_flushes_of_different_environments(backend, n=4)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "the default (DuckDB/PostgreSQL) `_environments` upsert is DELETE then INSERT, so two writers "
-        "of one (environment, model) can leave two rows; fixed by branch "
-        "claude/dbt-virtual-registry-merge (MERGE). The marker must be removed when that lands."
-    ),
-)
 def test_interleaved_upserts_of_one_pointer_leave_one_row(backend) -> None:
     rc.scenario_interleaved_pointer_upserts(backend)
 

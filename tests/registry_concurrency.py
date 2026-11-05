@@ -696,13 +696,6 @@ def scenario_simultaneous_promotes(backend: Backend, rounds: int = 2) -> None:
         assert view == [({"r1": 1, "r2": 2, "r3": 3}[state[0][2]],)], (view, state)
 
 
-REGISTRY_MERGE_XFAIL = (
-    "the default (DuckDB/PostgreSQL) `_environments` upsert is DELETE then INSERT, so two writers of one "
-    "(environment, model) can leave two rows; fixed by branch claude/dbt-virtual-registry-merge (MERGE). "
-    "Remove this xfail when that lands: a pass is reported as a failure (strict)."
-)
-
-
 def run_checks(checks: list[tuple], label: str = "") -> list[str]:
     """Run `(name, fn[, xfail_reason])` checks, print one line each, return the unexpected outcomes.
 

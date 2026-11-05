@@ -618,8 +618,8 @@ emulator = [
 requires-dist = [
     { name = "dbt-core", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "dbt-duckdb", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "duckdb", marker = "extra == 'dev'", specifier = ">=1.0.0" },
-    { name = "duckdb", marker = "extra == 'emulator'", specifier = ">=1.0.0" },
+    { name = "duckdb", marker = "extra == 'dev'", specifier = ">=1.4.0" },
+    { name = "duckdb", marker = "extra == 'emulator'", specifier = ">=1.4.0" },
     { name = "google-cloud-bigquery", marker = "extra == 'emulator'", specifier = ">=3.20.0" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100.0" },
     { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1.0" },

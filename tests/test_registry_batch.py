@@ -97,10 +97,10 @@ def test_flush_registry_default_adapter_uses_one_delete_and_one_insert() -> None
     harness.call_macro("flush_registry", _results())
 
     env_stmts = [q for q in harness.executed_queries if "_environments" in q]
-    assert len(env_stmts) == 3  # DELETE + INSERT for all nodes, plus one build_quality UPDATE
-    assert env_stmts[0].startswith("DELETE FROM")
-    assert env_stmts[0].count("'m") == 5 and "'tvf'" in env_stmts[0]
-    assert env_stmts[1].count("CURRENT_TIMESTAMP") == 6
+    assert len(env_stmts) == 2  # one MERGE for all nodes (DuckDB), plus one build_quality UPDATE
+    assert env_stmts[0].startswith("MERGE INTO")
+    assert env_stmts[0].count("AS model_name") == 6 and "'tvf'" in env_stmts[0]
+    assert env_stmts[0].count("CURRENT_TIMESTAMP") == 6
 
 
 def test_flush_registry_is_a_noop_for_per_model_mode_and_compile() -> None:
