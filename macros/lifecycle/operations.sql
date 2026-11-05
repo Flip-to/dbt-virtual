@@ -279,6 +279,13 @@
 {%- endmacro %}
 
 
+{% macro virtual_print_base_environment() -%}
+  {#- Logs the rendered `base_environment` (it may be Jinja, e.g. on `target.name`), so the CLI can
+      decide whether `promote --to <env>` audits by default. -#}
+  {{ log("DBT_VIRTUAL_BASE_ENV:" ~ dbt_virtual.get_config().get('base_environment', 'prod'), info=True) }}
+{%- endmacro %}
+
+
 {% macro virtual_export_state(env='staging', base_env='prod') -%}
   {#-
     Live warehouse state introspection:

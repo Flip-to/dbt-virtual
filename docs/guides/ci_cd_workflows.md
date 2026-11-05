@@ -8,7 +8,7 @@ This guide shows recommended GitHub Actions / GitLab CI patterns for running `db
 
 ```mermaid
 sequenceDiagram
-    participant Dev as Developer PR (#42)
+    participant Dev as Developer PR 42
     participant STG as Staging CI (merge to main)
     participant WH as Warehouse (analytics_physical)
     participant PRD as Production (analytics)

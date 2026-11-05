@@ -29,6 +29,7 @@
 
 
 {% macro build_quality() -%}
+  {#- TECH_DEBT(reuse_pointer_build_quality): per invocation; REUSE pointers should keep the reused release's quality. docs/tech_debt/reuse_pointer_build_quality.md -#}
   {{ return('partial' if (dbt_virtual.build_partial_reasons() | length) > 0 else 'full') }}
 {%- endmacro %}
 

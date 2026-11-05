@@ -400,7 +400,11 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
         recorded_cmds.append(args)
         return 0
 
-    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+    # `--select` is resolved with `dbt ls` (not available here): `+orders_metrics` matches itself.
+    with (
+        patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt),
+        patch("dbt_virtual.cli._selected_model_names", return_value={"orders_metrics"}),
+    ):
         assert (
             main(
                 [
