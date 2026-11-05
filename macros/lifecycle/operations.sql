@@ -321,7 +321,7 @@
     ) AS q
     ORDER BY ts ASC
   {%- endset -%}
-  {%- set quality_rows = run_query(quality_query) -%}
+  {%- set quality_rows = run_query(quality_query) if registry_exists else none -%}
   {%- set latest_quality = {} -%}
   {%- if quality_rows -%}
     {%- for r in quality_rows.rows -%}

@@ -60,9 +60,11 @@
   {%- if release_id == '' -%}
     {{ exceptions.raise_compiler_error("dbt-virtual seal-release: release_id is required.") }}
   {%- endif -%}
-  {%- set phys_schema = dbt_virtual.get_config().get('physical_schema') -%}
-  {%- do dbt_virtual.ensure_registry() -%}
-  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.seal_release_sql(phys_schema, release_id)) -%}
+  {#- A release spans the registries of every location (one per BigQuery region). -#}
+  {%- for location in dbt_virtual.physical_locations() -%}
+    {%- do dbt_virtual.ensure_registry(location) -%}
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.seal_release_sql(dbt_virtual.physical_schema_for(location), release_id)) -%}
+  {%- endfor -%}
   {{ log("dbt-virtual seal-release: sealed release " ~ release_id ~ ".", info=True) }}
 {%- endmacro %}
 
