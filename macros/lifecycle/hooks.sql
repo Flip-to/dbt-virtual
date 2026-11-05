@@ -272,7 +272,12 @@
       type='table'
     ) -%}
     {%- set existing_target = adapter.get_relation(database=target_rel.database, schema=target_rel.schema, identifier=target_rel.identifier) -%}
-    {%- if existing_target is not none and target_rel.identifier not in registered -%}
+    {#- A table this invocation seeded (`_dbt_virtual_seeded`: the seeding hook appends to it, and the
+        CLI pre-fills the models it seeded in an earlier process) is not an orphan: dropping and
+        cloning it again doubled the work of every new incremental. -#}
+    {%- set seeded_now = var('_dbt_virtual_seeded', none) -%}
+    {%- set seeded_earlier = seeded_now is not none and node_name in seeded_now -%}
+    {%- if existing_target is not none and target_rel.identifier not in registered and not seeded_earlier -%}
       {#- A table nobody points at is a leftover of a run that failed after seeding (only a
           finished build registers its table): it holds base data without this version's delta. -#}
       {{ log("dbt-virtual: " ~ target_rel ~ " exists but was never registered (a previous run failed after seeding); re-seeding it.", info=True) }}
@@ -301,7 +306,7 @@
         {{ log("dbt-virtual: not seeding " ~ target_rel ~ " from " ~ source_rel ~ ": partitioning or clustering changed, dbt will build it in full.", info=True) }}
       {%- elif adapter.get_relation(database=source_rel.database, schema=source_rel.schema, identifier=source_rel.identifier) is not none -%}
         {{ log("dbt-virtual: Seeding " ~ target_rel ~ " via zero-copy CLONE from " ~ source_rel, info=True) }}
-        {%- do dbt_virtual.exec_sql_statement(dbt_virtual.clone_table_sql(source_rel, target_rel)) -%}
+        {%- do dbt_virtual.clone_or_copy_table(source_rel, target_rel) -%}
         {%- for col_spec in (dbt_virtual.node_attr(node_cfg, 'virtual_add_columns', []) or []) -%}
           {%- do dbt_virtual.exec_sql_statement("ALTER TABLE " ~ target_rel ~ " ADD COLUMN IF NOT EXISTS " ~ col_spec) -%}
         {%- endfor -%}
@@ -322,6 +327,9 @@
             and `is_incremental()` see it as an existing table. -#}
         {%- do adapter.cache_added(target_rel) -%}
         {%- set cloned = true -%}
+        {%- if seeded_now is not none -%}
+          {%- do seeded_now.append(node_name) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
     {%- if tracked and target_rel.identifier.startswith(node_name ~ '__') -%}

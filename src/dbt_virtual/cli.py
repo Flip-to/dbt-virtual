@@ -205,6 +205,29 @@ def _run_dbt(args: list[str], project_dir: Path) -> int:
     return result.returncode
 
 
+def _run_locked_operation(
+    args: list[str], project_dir: Path, *, env: str, op_args: dict[str, object]
+) -> int:
+    """Run a `run-operation` that takes the environment lease lock, and release the lock if it fails.
+
+    A failed promote or rollback used to keep its lease until the TTL expired (15 minutes), so the
+    retry needed `--no-lock`. Warehouse errors cannot be caught in Jinja, hence the release here.
+    """
+    rc = _run_dbt(args, project_dir)
+    if rc != 0 and op_args.get("lock"):
+        release = {"env": env, "owner": op_args["lock_owner"]}
+        release_rc = _run_dbt(
+            ["run-operation", "virtual_release_lock", "--args", json.dumps(release)], project_dir
+        )
+        if release_rc != 0:
+            print(
+                f"dbt-virtual: could not release the lock of '{env}' after the failure; "
+                "it expires by itself (15 minutes).",
+                file=sys.stderr,
+            )
+    return rc
+
+
 def _compile_quietly(args: list[str], project_dir: Path) -> int:
     """`dbt compile` whose output never reaches stdout (machine-readable output must stay clean)."""
     result = subprocess.run(
@@ -541,6 +564,9 @@ def cmd_build(ns: argparse.Namespace) -> int:
         dbt_vars["_dbt_virtual_reuse"] = reused_models
     if seed_names:
         dbt_vars["_dbt_virtual_seed"] = seed_names
+        # The seeding hook appends every model it clones, so a later hook of the same invocation
+        # does not mistake that clone for the leftover of a failed run.
+        dbt_vars["_dbt_virtual_seeded"] = []
     if ns.release:
         # Record every current virtual node in the release, not only what dbt built, so that
         # promote/rollback of this release do not demote REUSE models and unchanged routines.
@@ -718,6 +744,8 @@ def cmd_run(ns: argparse.Namespace) -> int:
         )
         if rc != 0:
             return rc
+        # Seeded by that process: the build's on-run-start must not treat the clones as orphans.
+        dbt_vars["_dbt_virtual_seeded"] = list(seed_names)
 
     build_args = [
         "build",
@@ -779,9 +807,11 @@ def cmd_promote(ns: argparse.Namespace) -> int:
         manifest = _load_manifest(project_dir)
         fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
         op_args["expected_fps_json"] = json.dumps({fp.name: fp.fingerprint for fp in fps.values()})
-    return _run_dbt(
+    return _run_locked_operation(
         ["run-operation", "virtual_promote", "--args", json.dumps(op_args)],
         project_dir,
+        env=ns.to_env,
+        op_args=op_args,
     )
 
 
@@ -945,9 +975,11 @@ def cmd_rollback(ns: argparse.Namespace) -> int:
         "lock": not ns.no_lock,
         "lock_owner": ns.lock_owner or _default_lock_owner(),
     }
-    return _run_dbt(
+    return _run_locked_operation(
         ["run-operation", "virtual_rollback", "--args", json.dumps(op_args)],
         project_dir,
+        env=ns.env,
+        op_args=op_args,
     )
 
 

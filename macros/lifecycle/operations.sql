@@ -141,6 +141,17 @@
 {%- endmacro %}
 
 
+{% macro fail_releasing_lock(lock, env, owner, location, message) -%}
+  {#- Raises `message` after releasing this run's lease. A failed promote / rollback used to keep its
+      lease until the TTL expired, so the retry needed `--no-lock`. Errors raised by the warehouse
+      (not by this package) are covered by the CLI, which releases the lock when the operation fails. -#}
+  {%- if lock -%}
+    {%- do dbt_virtual.virtual_release_lock(env=env, owner=owner, location=location) -%}
+  {%- endif -%}
+  {{ exceptions.raise_compiler_error(message) }}
+{%- endmacro %}
+
+
 {% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0, location=none, check_coverage=true, coverage_ignore_before='', source_database='', source_schema='') -%}
   {#-
     SQLMesh-style pre-promotion quality gate:
@@ -603,17 +614,14 @@
       {%- endif -%}
       {{ return('skipped') }}
     {%- endif -%}
-    {{ exceptions.raise_compiler_error("dbt-virtual promote: No models found for env=" ~ from_env ~ " release=" ~ release_id) }}
+    {{ dbt_virtual.fail_releasing_lock(lock, to_env, owner, location, "dbt-virtual promote: No models found for env=" ~ from_env ~ " release=" ~ release_id) }}
   {%- endif -%}
 
   {%- set guard_problems = dbt_virtual.promotion_guard_problems(
     rows.rows, to_env, release_id, expected_fps_json, allow_unsealed, require_sealed, 7, 8 if release_id != '' else none
   ) -%}
   {%- if guard_problems | length > 0 -%}
-    {%- if lock -%}
-      {%- do dbt_virtual.virtual_release_lock(env=to_env, owner=owner) -%}
-    {%- endif -%}
-    {{ exceptions.raise_compiler_error("dbt-virtual promote refused (nothing was changed): " ~ (guard_problems | join(' | '))) }}
+    {{ dbt_virtual.fail_releasing_lock(lock, to_env, owner, location, "dbt-virtual promote refused (nothing was changed): " ~ (guard_problems | join(' | '))) }}
   {%- endif -%}
 
   {%- set ordered = dbt_virtual.ordered_registry_rows(rows.rows, 6) -%}
@@ -627,7 +635,7 @@
       {%- set phys_table = phys_ident.split('.')[-1] -%}
       {%- set exists_rel = adapter.get_relation(database=src_db, schema=src_schema, identifier=phys_table) -%}
       {%- if exists_rel is none -%}
-        {{ exceptions.raise_compiler_error("dbt-virtual promote pre-flight failed: physical table " ~ src_db ~ "." ~ src_schema ~ "." ~ phys_table ~ " for model " ~ model_name ~ " does not exist.") }}
+        {{ dbt_virtual.fail_releasing_lock(lock, to_env, owner, location, "dbt-virtual promote pre-flight failed: physical table " ~ src_db ~ "." ~ src_schema ~ "." ~ phys_table ~ " for model " ~ model_name ~ " does not exist.") }}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
@@ -674,7 +682,14 @@
     {%- endif -%}
 
     {%- set unchanged = existing_fp_map.get(model_name, '') == fp and existing_ident_map.get(model_name, '') == target_phys_ident -%}
-    {%- if unchanged -%}
+    {#- A table still at the environment path (kept by `adopt --keep-existing-table`) is not the view
+        the pointer says: replace it, or a later rollback to an adopt release cannot create the view. -#}
+    {%- set legacy_table = false -%}
+    {%- if unchanged and resource_type == 'model' -%}
+      {%- set legacy_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=to_schema, identifier=model_name) -%}
+      {%- set legacy_table = legacy_rel is not none and legacy_rel.type is defined and legacy_rel.type == 'table' -%}
+    {%- endif -%}
+    {%- if unchanged and not legacy_table -%}
       {{ log("dbt-virtual promote [" ~ to_env ~ "]: Skipping unchanged " ~ model_name ~ " (fp=" ~ fp ~ " already promoted)", info=True) }}
     {%- else -%}
       {%- if to_schema not in ensured_schemas -%}
@@ -836,7 +851,7 @@
     {%- do dbt_virtual.ensure_schema_exists(target_relation.schema) -%}
     {%- set source_rel = api.Relation.create(database=source_database, schema=source_schema, identifier=target_relation.identifier, type='table') -%}
     {{ log("dbt-virtual promote: cloning " ~ source_rel ~ " -> " ~ target_relation, info=True) }}
-    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.clone_table_sql(source_rel, target_relation)) -%}
+    {%- do dbt_virtual.clone_or_copy_table(source_rel, target_relation) -%}
     {%- if adapter.cache_added is defined -%}
       {%- do adapter.cache_added(target_relation) -%}
     {%- endif -%}
@@ -1056,7 +1071,7 @@
       {%- endif -%}
       {{ return('skipped') }}
     {%- endif -%}
-      {{ exceptions.raise_compiler_error("dbt-virtual rollback: No previous promoted release found for env=" ~ env) }}
+      {{ dbt_virtual.fail_releasing_lock(lock, env, owner, location, "dbt-virtual rollback: No previous promoted release found for env=" ~ env) }}
     {%- endif -%}
     {%- set target_release = prev_res.rows[0][0] -%}
   {%- endif -%}
@@ -1101,7 +1116,7 @@
       {%- endif -%}
       {{ return('skipped') }}
     {%- endif -%}
-    {{ exceptions.raise_compiler_error("dbt-virtual rollback: No models found for release " ~ target_release) }}
+    {{ dbt_virtual.fail_releasing_lock(lock, env, owner, location, "dbt-virtual rollback: No models found for release " ~ target_release) }}
   {%- endif -%}
   {%- set ordered = dbt_virtual.ordered_registry_rows(rows.rows, 5) -%}
   {#- Pre-flight: every physical table of the target release must still exist (GC may have
@@ -1110,7 +1125,7 @@
     {%- if item['resource_type'] == 'model' -%}
       {%- set phys_table = item['physical_identifier'].split('.')[-1] -%}
       {%- if adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table) is none -%}
-        {{ exceptions.raise_compiler_error("dbt-virtual rollback pre-flight failed: physical table " ~ phys_schema ~ "." ~ phys_table ~ " of release " ~ target_release ~ " (model " ~ item['model_name'] ~ ") does not exist.") }}
+        {{ dbt_virtual.fail_releasing_lock(lock, env, owner, location, "dbt-virtual rollback pre-flight failed: physical table " ~ phys_schema ~ "." ~ phys_table ~ " of release " ~ target_release ~ " (model " ~ item['model_name'] ~ ") does not exist.") }}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
@@ -1133,6 +1148,14 @@
       {%- set phys_table = phys_ident.split('.')[-1] -%}
       {%- set view_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name, type='view') -%}
       {%- set phys_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table, type='table') -%}
+      {#- The pre-flight above has verified every physical table, so replacing a legacy TABLE here
+          (kept by `adopt --keep-existing-table`) cannot leave the rollback half done; BigQuery
+          refuses CREATE OR REPLACE VIEW over a table. The data lives on in the physical table. -#}
+      {%- set legacy_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name) -%}
+      {%- if legacy_rel is not none and legacy_rel.type is defined and legacy_rel.type == 'table' -%}
+        {{ log("dbt-virtual rollback [" ~ env ~ "]: Dropping legacy physical table " ~ legacy_rel ~ " before creating the view", info=True) }}
+        {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(legacy_rel, 'table')) -%}
+      {%- endif -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Re-pointing " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
       {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
       {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
