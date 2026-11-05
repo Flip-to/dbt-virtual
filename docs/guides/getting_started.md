@@ -6,7 +6,7 @@ This guide walks you through adding `dbt-virtual` to a new or existing dbt proje
 
 ## Prerequisites
 
-- **dbt-core** `>= 1.8.0` with one of the supported adapters (`dbt-bigquery`, `dbt-snowflake`, `dbt-duckdb`, `dbt-postgres`, `dbt-databricks`)
+- **dbt-core** `>= 1.8.0` with one of the supported adapters (`dbt-bigquery`, `dbt-snowflake`, `dbt-duckdb`, `dbt-postgres`, `dbt-databricks` (experimental: never executed in CI))
 - **Python** `>= 3.10` (for the `dbt-virtual` CLI planner & orchestrator)
 - On **dbt-core 1.11+**, scalar UDFs use `materialized='virtual_function'` (dbt-core now owns `function`; see [Routines](routines_and_tvf_testing.md))
 

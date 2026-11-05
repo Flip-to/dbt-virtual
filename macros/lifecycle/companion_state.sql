@@ -1,6 +1,6 @@
 {#-
   DECISION(companion_state_for_manifest_tracked_models)
-  TECH_DEBT(companion_state_gaps): state moves at lifecycle operations only, see docs/tech_debt/companion_state_gaps.md
+  TECH_DEBT(companion_state_gaps): remaining gaps (bare runs, stale snapshots, shared tables, key shape), see docs/tech_debt/companion_state_gaps.md
 
   Companion state: rows in a table outside the virtual models (e.g. the Snowplow incremental
   manifest, one row per model name with `last_success`) that say how much input a model's table
@@ -234,11 +234,15 @@
 {%- endmacro %}
 
 
-{% macro companion_snapshot_load(entry, model_name, fp) -%}
-  {#- The rows recorded for `<model>__<fp>`, or none when nothing was recorded. -#}
-  {%- set phys_schema = dbt_virtual.get_config().get('physical_schema') -%}
+{% macro companion_snapshot_load(entry, model_name, fp, source_database=none, source_schema=none) -%}
+  {#- The rows recorded for `<model>__<fp>`, or none when nothing was recorded. With `source_schema`
+      (a cross-location promote) they are read from that registry, which may not hold the table. -#}
+  {%- set phys_schema = source_schema or dbt_virtual.get_config().get('physical_schema') -%}
+  {%- if source_schema is not none and adapter.get_relation(database=(source_database or dbt_virtual.active_database()), schema=source_schema, identifier='_companion_state') is none -%}
+    {{ return(none) }}
+  {%- endif -%}
   {%- set res = run_query(
-    "SELECT state_json FROM " ~ dbt_virtual.registry_relation(phys_schema, '_companion_state')
+    "SELECT state_json FROM " ~ dbt_virtual.registry_relation(phys_schema, '_companion_state', source_database)
     ~ " WHERE companion = " ~ dbt_virtual.sql_string_literal(entry['table'])
     ~ " AND model_name = " ~ dbt_virtual.sql_string_literal(model_name)
     ~ " AND fingerprint = " ~ dbt_virtual.sql_string_literal(fp)

@@ -1274,3 +1274,14 @@ $$
 {% macro default__routine_exists_sql(schema_name, routine_name) -%}
   {{ return('') }}
 {%- endmacro %}
+
+{% macro warn_if_experimental_adapter() -%}
+  {#-
+    DECISION(databricks_experimental): Databricks is experimental. Its SQL is only checked as text by the
+    macro harness and has never been executed. Log one warning per lifecycle operation
+    (promote, rollback, init-env, incremental seeding) so nobody relies on it by accident.
+  -#}
+  {%- if execute and target.type == 'databricks' -%}
+    {{ log("dbt-virtual WARNING: Databricks support is EXPERIMENTAL. The Databricks SQL is only checked as text in the macro harness and has never been executed against Databricks. Test in a throwaway catalog before relying on it (docs/decisions/20261105_databricks_experimental.md).", info=True) }}
+  {%- endif -%}
+{%- endmacro %}
