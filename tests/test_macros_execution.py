@@ -108,6 +108,7 @@ class MacroTestHarness:
             REPO / "macros" / "lifecycle" / "operations.sql",
             REPO / "macros" / "lifecycle" / "companion_state.sql",
             REPO / "macros" / "lifecycle" / "companion_state_ops.sql",
+            REPO / "macros" / "lifecycle" / "data_diff.sql",
             REPO / "macros" / "testing" / "tvf_test_ref.sql",
         ]
         combined_source = "\n\n".join(f.read_text(encoding="utf-8") for f in macro_files)

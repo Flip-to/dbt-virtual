@@ -122,6 +122,19 @@ The planner only knows what exists in the warehouse through the state file writt
 
 When called from the CLI, `promote` (and `rollback`) first take the environment's lease lock in `_locks` and release it at the end (`--no-lock` to skip). Objects whose fingerprint and location are already active in the target environment are skipped (partial promotion). Each routine's stored DDL template is resolved for the target environment: every reference to a virtual object is pointed at that object's schema in the target environment. An object that was active in the target but is not in the release is **demoted** (dropped) only if it is no longer a virtual node in the project.
 
+### Data diff (`virtual_data_diff`, `dbt-virtual diff-data`)
+A row-level comparison of a candidate table with the baseline, by checksum bisection (the approach of Datafold data-diff and reladiff) instead of a full join:
+
+1. **Segment checksums.** One grouped query per side returns `COUNT(*)` and an order-independent hash aggregate per segment: a partition (BigQuery `partition_by`; `diff_partition_by` elsewhere), or the whole table. BigQuery uses `BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(STRUCT(<columns>))))`, DuckDB `bit_xor(hash(...))`, Snowflake `BITXOR_AGG(HASH(...))`, Databricks `bit_xor(xxhash64(...))`, PostgreSQL `bit_xor(hashtextextended(ROW(...)::text, 0))`.
+2. **Bisection.** A segment whose count or hash differ and that holds more than `--threshold` rows is split into `--branching` key ranges (one grouped query per side per split segment); only the ranges that differ are split again.
+3. **Leaf join.** The small differing ranges are joined on the key (`FULL OUTER JOIN`) to count rows only in the candidate, only in the target and changed rows, with a mismatch count per column and a sample.
+
+Identical tables stop after step 1: one checksum query per side, no join (`queries.join_queries` is `0` in the JSON). `diff_exclude_columns` removes columns from the hash and the comparison; `diff_where` / `--where` / `--window-days` bound the rows read.
+
+Cost. Each query reads only the compared columns, once per side per segment per level, and only for segments that still differ; identical segments are never read again. On BigQuery the bytes billed are about the size of the compared columns of the rows in the scanned segments: a partition filter prunes the rest, and the first level reads every selected partition once per side. Not measured on BigQuery: run it first with `--window-days` on a large table and compare the logged `queries` counts with the job's bytes billed.
+
+Limits: a model needs a unique key (`unique_key` / `diff_key`) to be drilled, and range bisection needs a numeric key; duplicated keys make the join overcount. `BIT_XOR` cancels pairs of identical rows, so a pair of duplicate rows added to one side changes the count but not the hash. Tables with `require_partition_filter` need `diff_where` or `--window-days`.
+
 ### Rollback
 `virtual_rollback` first checks that every physical table of the target release still exists (GC may have dropped it) and stops before changing anything if one is missing. It then re-points views and redeploys routines of the target release in the same order, removes active objects that are not in that release, and marks the undone releases `rolled_back`. A second `dbt-virtual rollback --env prod` therefore goes one release further back instead of returning to the same one.
 
