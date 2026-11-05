@@ -104,6 +104,7 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     merges_translated: list[str] = []
 
     def sf_exec(sql: str) -> list[list]:
+        rows: list[list] = []
         for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
             if stmt.startswith("MERGE INTO"):
                 emulator_merge(stmt)
