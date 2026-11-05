@@ -6,6 +6,12 @@ require-dbt-version: [">=1.6.0", "<2.0.0"]
 
 macro-paths: ["macros"]
 model-paths: ["models"]
+# The repo's tests/ holds a fixture dbt project; dbt's default test-paths ("tests") made
+# installed packages parse it and fail ("value of 'models' is not a list").
+test-paths: ["dbt_package_tests"]
+seed-paths: ["dbt_package_seeds"]
+snapshot-paths: ["dbt_package_snapshots"]
+analysis-paths: ["dbt_package_analyses"]
 
 clean-targets:
   - "target"

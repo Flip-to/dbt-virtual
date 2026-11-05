@@ -91,7 +91,14 @@ def _state_args(ns: argparse.Namespace) -> list[str]:
     return args
 
 
+_DEFAULT_TARGET: str | None = None
+
+
 def _run_dbt(args: list[str], project_dir: Path) -> int:
+    # Commands without their own target (promote, rollback, status, gc, adopt, init/drop-env)
+    # used the profile's default target, which is prod in some projects.
+    if _DEFAULT_TARGET and "--target" not in args:
+        args = [*args, "--target", _DEFAULT_TARGET]
     cmd = ["dbt", *args]
     result = subprocess.run(cmd, cwd=project_dir, check=False)
     return result.returncode
@@ -788,12 +795,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_adopt.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
     p_adopt.set_defaults(func=cmd_adopt)
 
+    for subparser in sub.choices.values():
+        if not any("--target" in action.option_strings for action in subparser._actions):
+            subparser.add_argument(
+                "--target",
+                default=None,
+                help="dbt profile target for the dbt calls (default: the profile's default target).",
+            )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv)
+    global _DEFAULT_TARGET
+    _DEFAULT_TARGET = getattr(ns, "target", None)
     return ns.func(ns)
 
 

@@ -791,3 +791,17 @@ def test_cli_build_target_vars_and_defer_are_separate_from_env(tmp_path: Path) -
     assert build_vars["enable_prod_hooks"] is False
     # dbt-virtual's own vars cannot be overridden by --vars.
     assert build_vars["_dbt_virtual_env"] == "pr_42"
+
+
+def test_cli_operations_pass_the_requested_target(tmp_path: Path) -> None:
+    """promote/rollback/status/gc used the profile's default target (prod in some projects)."""
+    recorded: list[list[str]] = []
+
+    def fake_run_dbt_cmd(args, **_kwargs):
+        recorded.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    with patch("dbt_virtual.cli.subprocess.run", side_effect=fake_run_dbt_cmd):
+        assert main(["--project-dir", str(tmp_path), "gc", "--dry-run", "--target", "ci"]) == 0
+        assert main(["--project-dir", str(tmp_path), "drop-env", "--env", "pr_1", "--target", "ci"]) == 0
+    assert all(cmd[cmd.index("--target") + 1] == "ci" for cmd in recorded)
