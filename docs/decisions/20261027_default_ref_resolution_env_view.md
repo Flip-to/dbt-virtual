@@ -7,7 +7,7 @@ spec: docs/specs/20261027_routing_ref_modes_and_clone_seeding.md
 prs: []
 ---
 
-# Default `ref()` resolution for virtualized models is `env_view` (Option A), with `physical`, `hybrid`, and `explicit` supported
+# Default `ref()` resolution for virtualized models is `env_view` (Option A), with `physical` and `hybrid` supported (`explicit` rejected since 20261105)
 
 ## Context
 
@@ -27,7 +27,7 @@ Set `ref_resolution: "env_view"` (Option A) as the default in `dbt-virtual`, so 
 
 - **Option B (`physical` as default)**: Resolves `{{ ref('A') }}` directly to `<physical_schema>.A__<fp>`. Provides strict physical immutability across table chains, but requires re-executing `CREATE OR REPLACE TABLE FUNCTION` for every downstream TVF whenever a root table's fingerprint changes. Kept as a supported config option (`ref_resolution: "physical"`).
 - **Option C (`hybrid` as default)**: Resolves `table`/`incremental` models to `<physical_schema>.A__<fp>` and routines/views to `<env_schema>.A`. Kept as a supported config option (`ref_resolution: "hybrid"`).
-- **Option D (`explicit` macro only)**: Leaves `ref()` untouched and requires `{{ dbt_virtual.virtual_ref('A') }}`. Rejected as default because it requires editing every `ref()` call in opted-in models.
+- **Option D (`explicit` macro only)** (never worked, now rejected: `20261105_ref_resolution_explicit_is_rejected.md`): Leaves `ref()` untouched and requires `{{ dbt_virtual.virtual_ref('A') }}`. Rejected as default because it requires editing every `ref()` call in opted-in models.
 
 ## Impact
 

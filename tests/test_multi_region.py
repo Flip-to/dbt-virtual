@@ -161,6 +161,9 @@ def test_rollback_gc_and_locks_iterate_locations() -> None:
 
 def test_export_state_merges_every_location() -> None:
     harness = _harness()
+    for schema in ("rt_virtual_physical", "rt_virtual_physical_us"):
+        for registry in ("_environments", "_releases"):
+            harness.existing_relations.add((harness.target["database"], schema, registry))
     # Per location: environment rows, physical tables, registered tables, build quality.
     harness.query_responses.extend(
         [

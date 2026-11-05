@@ -54,16 +54,32 @@
     - Mode C ('hybrid'): physical tables bind to <physical_schema>.<model_name>__<fp>, routines/views bind to <env_schema>.<model_name>.
   -#}
   {%- set raw_rel = builtins.ref(*varargs, **kwargs) -%}
-  {%- if not execute -%}
-    {{ return(raw_rel) }}
-  {%- endif -%}
-
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- if not cfg.get('enabled', true) -%}
     {{ return(raw_rel) }}
   {%- endif -%}
 
   {%- set mode = cfg.get('ref_resolution', 'env_view') -%}
+  {#- Validate at parse time too, so a bad value fails `dbt parse` and not only `dbt run`.
+      `explicit` was documented as "ref() untouched, call virtual_ref yourself", but
+      virtual_ref is also what the project's `ref()` override calls, so a call site cannot be told
+      apart from an override call; it silently behaved like `physical`. See
+      docs/decisions/20261105_ref_resolution_explicit_is_rejected.md. -#}
+  {%- if mode == 'explicit' -%}
+    {{ exceptions.raise_compiler_error(
+      "dbt-virtual: ref_resolution 'explicit' is not supported (it used to behave exactly like 'physical'). "
+      ~ "Use 'env_view' (default), 'physical', or 'hybrid'. To keep today's behaviour, set ref_resolution: 'physical'."
+    ) }}
+  {%- elif mode not in ['env_view', 'physical', 'hybrid'] -%}
+    {{ exceptions.raise_compiler_error(
+      "dbt-virtual: unknown ref_resolution '" ~ mode ~ "'. Supported values: 'env_view' (default), 'physical', 'hybrid'."
+    ) }}
+  {%- endif -%}
+  {%- if not execute -%}
+    {{ return(raw_rel) }}
+  {%- endif -%}
+
+  {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set phys_schemas = dbt_virtual.physical_schemas() -%}
 
   {#- Only fingerprint-shaped suffixes identify virtual tables; arbitrary names may contain `__`. -#}

@@ -14,6 +14,7 @@ from dbt_virtual.fingerprint import (
     MissingCompiledCodeError,
     compute_manifest_fingerprints,
     explain_fingerprint,
+    is_virtual_node,
     write_fingerprints_file,
 )
 from dbt_virtual.planner import (
@@ -662,7 +663,17 @@ def cmd_adopt(ns: argparse.Namespace) -> int:
         "release_id": ns.release,
         "drop_existing_table": not ns.keep_existing_table,
     }
-    dbt_vars = {"_dbt_virtual_fps": fp_map}
+    # Compiled SQL of virtual views and routines: `run-operation` does not see compiled code, and
+    # adopt renders their DDL templates from it.
+    compiled = {
+        node.get("name"): node.get("compiled_code") or node.get("compiled_sql")
+        for node in (manifest.get("nodes") or {}).values()
+        if node.get("resource_type") == "model"
+        and is_virtual_node(node)
+        and (node.get("config") or {}).get("materialized") not in ("table", "incremental")
+        and (node.get("compiled_code") or node.get("compiled_sql"))
+    }
+    dbt_vars = {"_dbt_virtual_fps": fp_map, "_dbt_virtual_compiled": compiled}
     return _run_dbt(
         [
             "run-operation",

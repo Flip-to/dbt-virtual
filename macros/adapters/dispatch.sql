@@ -866,3 +866,36 @@ $$
   SELECT '{{ routine_name }}' AS routine_name
 {%- endmacro %}
 
+
+{% macro routine_exists_sql(schema_name, routine_name) -%}
+  {#- A query returning a row when the routine exists, used by `virtual_adopt`. The default returns
+      an empty string: adopt then skips the routine with a log instead of guessing. -#}
+  {{ return(adapter.dispatch('routine_exists_sql', 'dbt_virtual')(schema_name, routine_name)) }}
+{%- endmacro %}
+
+{% macro bigquery__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM `{{ target.database }}`.`{{ schema_name }}`.INFORMATION_SCHEMA.ROUTINES
+  WHERE routine_name = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro snowflake__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM {{ target.database }}.INFORMATION_SCHEMA.FUNCTIONS
+  WHERE UPPER(function_schema) = UPPER('{{ schema_name }}') AND UPPER(function_name) = UPPER('{{ routine_name }}')
+  UNION ALL
+  SELECT 1 FROM {{ target.database }}.INFORMATION_SCHEMA.PROCEDURES
+  WHERE UPPER(procedure_schema) = UPPER('{{ schema_name }}') AND UPPER(procedure_name) = UPPER('{{ routine_name }}')
+{%- endmacro %}
+
+{% macro duckdb__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM duckdb_functions()
+  WHERE schema_name = '{{ schema_name }}' AND function_name = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro postgres__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = '{{ schema_name }}' AND p.proname = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro default__routine_exists_sql(schema_name, routine_name) -%}
+  {{ return('') }}
+{%- endmacro %}

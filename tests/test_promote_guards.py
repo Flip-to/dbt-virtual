@@ -135,6 +135,8 @@ def test_promote_resets_a_stale_partial_flag_of_the_target_pointer() -> None:
 
 def test_export_state_lists_partial_physical_tables_by_latest_registration() -> None:
     harness = _harness()
+    for registry in ("_environments", "_releases"):
+        harness.existing_relations.add((harness.target["database"], "analytics_physical", registry))
     harness.query_responses.extend(
         [
             FakeResult([]),  # env pointers

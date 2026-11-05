@@ -20,7 +20,7 @@ Teams running dbt on BigQuery, Snowflake, DuckDB, PostgreSQL, or Databricks face
 Build `dbt-virtual` (`Flip-to/dbt-virtual`) as a 100% open-source (Apache-2.0) hybrid dbt macro package + lightweight Python CLI (`dbt-virtual`):
 
 - **Content-addressed physical tables** (`<physical_schema>.<model>__<fp>`) driven by deterministic `sqlglot` AST Merkle-DAG fingerprinting (`20261027_merkle_dag_fingerprinting.md`).
-- **Default `env_view` `ref()` resolution (Option A)** with support for `physical`, `hybrid`, and `explicit` modes (`20261027_routing_ref_modes_and_clone_seeding.md` and decision [20261027_default_ref_resolution_env_view.md](../decisions/20261027_default_ref_resolution_env_view.md)).
+- **Default `env_view` `ref()` resolution (Option A)** with support for `physical` and `hybrid` modes (`explicit` is rejected, see [the decision](../decisions/20261105_ref_resolution_explicit_is_rejected.md)) (`20261027_routing_ref_modes_and_clone_seeding.md` and decision [20261027_default_ref_resolution_env_view.md](../decisions/20261027_default_ref_resolution_env_view.md)).
 - **Zero-copy `CLONE` incremental seeding** (with post-clone `virtual_add_columns` schema migration) before incremental models execute (`20261027_routing_ref_modes_and_clone_seeding.md`).
 - **First-class routine virtualization** (`table_function`, `function`, `procedure` materializations + `tvf_test_ref`) with environment-tokenized DDL capture (`20261027_routine_virtualization_and_tvf_testing.md`).
 - **Lifecycle state registry (`_environments`, `_releases`, `_locks`, `_intervals`) and CLI/macro operations** (`plan`, `build`, `diff`, `audit`, `promote`, `rollback`, `status`, `init-env`, `drop-env`, `gc`) (`20261027_lifecycle_promote_rollback_and_gc.md`).

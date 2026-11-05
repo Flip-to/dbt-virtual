@@ -232,6 +232,7 @@ class MacroTestHarness:
                 (),
                 {
                     "get_relation": staticmethod(_get_relation),
+                    "check_schema_exists": staticmethod(lambda database, schema: True),
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
                     **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
@@ -846,6 +847,8 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
             "_dbt_virtual_end": "2026-10-27",
         }
     )
+    for registry in ("_environments", "_releases"):
+        harness.existing_relations.add(("test_proj", "analytics_physical", registry))
 
     # 1. Interval tracking in sync_env_view when _dbt_virtual_start / _dbt_virtual_end are set
     harness.model = {

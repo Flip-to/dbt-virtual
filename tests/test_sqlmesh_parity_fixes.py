@@ -47,6 +47,8 @@ def test_unregistered_physical_table_is_rebuilt_not_reused() -> None:
 
 def test_export_state_lists_registered_physical_tables() -> None:
     harness = MacroTestHarness(vars_dict={"dbt_virtual": {"physical_schema": "analytics_physical"}})
+    for registry in ("_environments", "_releases"):
+        harness.existing_relations.add(("test_proj", "analytics_physical", registry))
     harness.query_responses.extend(
         [
             FakeResult([]),

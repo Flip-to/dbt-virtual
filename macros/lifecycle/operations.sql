@@ -269,7 +269,12 @@
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment IN ('{{ env }}', '{{ base_env }}')
   {%- endset -%}
-  {%- set env_rows = run_query(env_query) -%}
+  {#- A project that has never built or promoted has no registry (and maybe no physical schema):
+      report empty state instead of failing on the missing relation. -#}
+  {%- set schema_exists = adapter.check_schema_exists(target.database, phys_schema) -%}
+  {%- set registry_exists = schema_exists and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_environments') is not none
+      and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') is not none -%}
+  {%- set env_rows = run_query(env_query) if registry_exists else none -%}
 
   {%- set env_state = {} -%}
   {%- set base_env_state = {} -%}
@@ -284,7 +289,7 @@
     {%- endfor -%}
   {%- endif -%}
 
-  {%- set tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(phys_schema)) -%}
+  {%- set tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(phys_schema)) if schema_exists else none -%}
   {%- set existing_tables = [] -%}
   {%- if tbl_rows -%}
     {%- for r in tbl_rows.rows -%}
@@ -299,7 +304,7 @@
     UNION DISTINCT
     SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
   {%- endset -%}
-  {%- set registered_rows = run_query(registered_query | replace('UNION DISTINCT', 'UNION') if target.type != 'bigquery' else registered_query) -%}
+  {%- set registered_rows = run_query(registered_query | replace('UNION DISTINCT', 'UNION') if target.type != 'bigquery' else registered_query) if registry_exists else none -%}
   {%- set registered_tables = [] -%}
   {%- if registered_rows -%}
     {%- for r in registered_rows.rows -%}
@@ -1058,7 +1063,9 @@
          - When `drop_existing_table=true`, drops the old physical table `<env_schema>.<model>` and
            immediately creates the virtual view `<env_schema>.<model>` -> `<physical_schema>.<model>__<fp>`
            so consumers experience zero downtime and zero table rebuilds.
-      3. Records the adopted model or routine in `<physical_schema>._environments` and `<physical_schema>._releases`.
+      3. Registers views and routines (table_function, function, virtual_function, procedure) already
+         deployed in the env schema, with a DDL template rendered from the node's compiled SQL.
+      4. Records the adopted model in `<physical_schema>._environments` and `<physical_schema>._releases`.
   -#}
   {%- if not execute -%}
     {{ return('') }}
@@ -1167,9 +1174,87 @@
         {%- endset -%}
         {%- do dbt_virtual.exec_ddl_dml(ins_rel_sql) -%}
         {%- endif -%}
+      {%- elif mat in ['view', 'table_function', 'function', 'virtual_function', 'procedure'] -%}
+        {%- do dbt_virtual.adopt_deployed_object(node, mat, env, env_schema, release_id, fp, schema_key) -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro adopt_deployed_object(node, mat, env, env_schema, release_id, fp, schema_key) -%}
+  {#-
+    Registers a view or routine that is already deployed in `<env_schema>` (adopt never creates or
+    changes it). The DDL template is rendered from the node's compiled SQL, which is what later
+    promotions replay (`register_view_deployment` / `register_routine_deployment` do the same for
+    objects dbt builds). Skips, with a log, when the object is not deployed, its existence cannot
+    be checked on this adapter, or no compiled SQL is available.
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set name = dbt_virtual.node_attr(node, 'name', '') -%}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+  {%- set label = "dbt-virtual adopt [" ~ env ~ "]: " ~ env_schema ~ "." ~ name -%}
+
+  {%- if mat == 'view' -%}
+    {%- set resource_type = 'view' -%}
+    {%- set dep_tier = 2 -%}
+    {%- set deployed = adapter.get_relation(database=target.database, schema=env_schema, identifier=name) is not none -%}
+  {%- else -%}
+    {%- set resource_type = 'function' if mat == 'virtual_function' else mat -%}
+    {%- set dep_tier = 1 if resource_type == 'function' else (3 if resource_type == 'table_function' else 4) -%}
+    {%- set exists_sql = dbt_virtual.routine_exists_sql(env_schema, name) -%}
+    {%- if (exists_sql | trim) == '' -%}
+      {{ log(label ~ ": cannot check whether a " ~ resource_type ~ " exists on adapter '" ~ target.type ~ "'; skipping.", info=True) }}
+      {{ return(none) }}
+    {%- endif -%}
+    {%- set deployed = (run_query(exists_sql).rows | length) > 0 -%}
+  {%- endif -%}
+  {%- if not deployed -%}
+    {{ log(label ~ " (" ~ resource_type ~ ") is not deployed; not registering it.", info=True) }}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- set compiled = var('_dbt_virtual_compiled', {}) -%}
+  {%- set body = compiled.get(name) or dbt_virtual.node_attr(node, 'compiled_code', '') or dbt_virtual.node_attr(node, 'compiled_sql', '') -%}
+  {%- set body = (body | string | trim).rstrip(';') -%}
+  {%- if body == '' -%}
+    {{ log(label ~ " (" ~ resource_type ~ "): no compiled SQL (use `dbt-virtual adopt`, which passes it); not registering it.", info=True) }}
+    {{ return(none) }}
+  {%- endif -%}
+
+  {%- set rel = api.Relation.create(database=target.database, schema=env_schema, identifier=name, type=('external' if (target.type == 'bigquery' and resource_type != 'view') else 'view')) -%}
+  {%- if resource_type == 'view' -%}
+    {%- set ddl = 'CREATE OR REPLACE VIEW ' ~ rel ~ ' AS\n' ~ body -%}
+  {%- else -%}
+    {%- set ddl = dbt_virtual.create_routine_ddl_sql(
+      resource_type,
+      rel | string,
+      dbt_virtual.node_attr(node_cfg, 'parameters', ''),
+      dbt_virtual.node_attr(node_cfg, 'returns', ''),
+      body
+    ) -%}
+  {%- endif -%}
+  {%- set ddl_template = dbt_virtual.env_placeholders_sql(ddl, env) -%}
+  {%- set phys_ident = env_schema ~ '.' ~ name -%}
+  {{ log(label ~ ": registering deployed " ~ resource_type ~ " (fingerprint " ~ fp ~ ")", info=True) }}
+
+  {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
+    phys_schema, env, name, resource_type, fp, phys_ident, release_id, schema_key
+  )) -%}
+  {%- set ins_rel_sql -%}
+    INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} (
+      release_id, source_environment, target_environment, model_name, resource_type,
+      dependency_tier, fingerprint, physical_identifier, routine_ddl_template, status,
+      created_at, promoted_at, rolled_back_at, schema_key
+    ) VALUES (
+      '{{ release_id }}', '{{ env }}', '{{ env }}', '{{ name }}', '{{ resource_type }}',
+      {{ dep_tier }}, '{{ fp }}', '{{ phys_ident }}', {{ dbt_virtual.sql_string_literal(ddl_template) }}, 'promoted',
+      {{ dbt_virtual.current_timestamp_sql() }}, {{ dbt_virtual.current_timestamp_sql() }}, NULL,
+      {{ dbt_virtual.sql_nullable_literal(schema_key) }}
+    )
+  {%- endset -%}
+  {%- do dbt_virtual.exec_ddl_dml(ins_rel_sql) -%}
 {%- endmacro %}
 
 

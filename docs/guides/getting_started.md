@@ -59,7 +59,7 @@ vars:
     physical_schema: "analytics_physical"
     environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"
     base_environment: "prod"
-    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid', 'explicit'
+    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid'
     env_schemas:                 # a string per env, or a mapping per custom schema (see Configuration Reference)
       staging: "analytics_staging"
       prod: "analytics"

@@ -22,7 +22,7 @@ prs: []
    - **Mode A (`ref_resolution: "env_view"`, default)**: Resolves `{{ ref('A') }}` to `<env_schema>.A`. Downstream views and TVFs read the virtual view, so promoting or rolling back `A` via view swap requires zero recompilation of unchanged downstream readers.
    - **Mode B (`ref_resolution: "physical"`)**: Resolves `{{ ref('A') }}` directly to `<physical_schema>.A__<fp_A>`.
    - **Mode C (`ref_resolution: "hybrid"`)**: Physical tables bind `<physical_schema>.A__<fp_A>`, while routines and views bind `<env_schema>.A`.
-   - **Mode D (`ref_resolution: "explicit"`)**: Standard `ref()` is untouched; users call `{{ dbt_virtual.virtual_ref('A') }}` explicitly.
+   - **Mode D (`ref_resolution: "explicit"`)**: Rejected with a compile error since 2026-11-05 (it behaved like `physical`; see [the decision](../decisions/20261105_ref_resolution_explicit_is_rejected.md)).
 3. **Zero-Copy `CLONE` Seeding & Post-Clone Column Migration (`macros/lifecycle/hooks.sql` `clone_if_new_fp`)**:
    - Before an `incremental` model runs (when `--full-refresh` is not set and `<model>__<fp_new>` does not exist), query `<physical_schema>._environments` for `base_environment` (`prod`), execute `clone_table_sql` (`CLONE` on BigQuery/Snowflake, `SHALLOW CLONE` on Databricks, `CTAS` on DuckDB/Postgres), call `adapter.cache_added(this)`, and optionally emit `ALTER TABLE {{ this }} ADD COLUMN IF NOT EXISTS ...` for any columns listed in `config(virtual_add_columns=[...])`.
 4. **Post-Hook View Sync (`sync_env_view`)**:
