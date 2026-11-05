@@ -392,13 +392,15 @@ def test_physical_version_pinning_and_forward_only_config() -> None:
 
 def test_property_based_sql_normalization_and_dag_determinism() -> None:
     """Property-based fuzzing for SQL normalization idempotence and Merkle-DAG determinism."""
-    from hypothesis import given, settings
+    from hypothesis import HealthCheck, given, settings
     from hypothesis import strategies as st
 
     ident_strategy = st.from_regex(r"[a-z][a-z0-9_]{1,12}", fullmatch=True)
     ws_strategy = st.sampled_from([" ", "  ", "\n", "\t", " /* comment */ "])
 
-    @settings(max_examples=40)
+    # Each example parses SQL with sqlglot; generation is slow on some CI hosts (seen 2026-11-04 on
+    # Windows: FailedHealthCheck too_slow), which says nothing about the invariants under test.
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
     @given(
         col1=ident_strategy,
         col2=ident_strategy,
@@ -443,3 +445,60 @@ def test_property_based_sql_normalization_and_dag_determinism() -> None:
     _check_invariants()
 
 
+
+
+def test_run_hook_operation_nodes_are_not_virtual() -> None:
+    """on-run-start hooks inherit `+virtual_env` from `models:` config; they are not deployable."""
+    hook = {
+        "unique_id": "operation.proj.proj-on-run-start-0",
+        "name": "proj-on-run-start-0",
+        "resource_type": "operation",
+        "config": {"virtual_env": True, "materialized": "view"},
+    }
+    assert is_virtual_node(hook) is False
+    manifest = {"nodes": {hook["unique_id"]: hook, "model.test.orders_metrics": _make_node()}}
+    assert list(compute_manifest_fingerprints(manifest)) == ["model.test.orders_metrics"]
+
+
+def test_unset_optional_configs_keep_existing_fingerprints() -> None:
+    base = _make_node()
+    noisy = _make_node()
+    noisy["config"].update(
+        {
+            "require_partition_filter": None,
+            "incremental_predicates": [],
+            "sql_header": None,
+            "contract": {"enforced": False},
+            "pre-hook": [],
+            "post-hook": [{"sql": "{{ dbt_virtual.sync_env_view() }}", "transaction": True}],
+        }
+    )
+    assert compute_node_fingerprint(noisy).fingerprint == compute_node_fingerprint(base).fingerprint
+
+
+def test_bigquery_table_options_hooks_and_contracts_change_fingerprint() -> None:
+    """Settings that change table contents or options must produce a new physical table."""
+    base_fp = compute_node_fingerprint(_make_node()).fingerprint
+    changes = {
+        "require_partition_filter": True,
+        "partition_expiration_days": 30,
+        "incremental_predicates": ["DBT_INTERNAL_DEST.order_date > '2026-01-01'"],
+        "merge_update_columns": ["c"],
+        "sql_header": "CREATE TEMP FUNCTION f(x INT64) AS (x + 1);",
+        "pre-hook": [{"sql": "DELETE FROM {{ this }} WHERE c = 0", "transaction": True}],
+    }
+    for key, value in changes.items():
+        node = _make_node()
+        node["config"][key] = value
+        assert compute_node_fingerprint(node).fingerprint != base_fp, key
+
+    contract_v1 = _make_node()
+    contract_v1["config"]["contract"] = {"enforced": True}
+    contract_v1["columns"] = {"c": {"name": "c", "data_type": "INT64"}}
+    contract_v2 = _make_node()
+    contract_v2["config"]["contract"] = {"enforced": True}
+    contract_v2["columns"] = {"c": {"name": "c", "data_type": "NUMERIC"}}
+    assert (
+        compute_node_fingerprint(contract_v1).fingerprint
+        != compute_node_fingerprint(contract_v2).fingerprint
+    )

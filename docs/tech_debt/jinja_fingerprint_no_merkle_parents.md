@@ -28,3 +28,11 @@ In `macros/fingerprint/get_fingerprint.sql`, when `execute` is true and `graph.n
 ## Workaround meanwhile
 
 Use `dbt-virtual plan` / `dbt-virtual build` (which passes the full Merkle-DAG `_dbt_virtual_fps` map to dbt), or increment `config(virtual_env_epoch=2)` on the downstream model when running bare `dbt run`.
+
+## Correction (2026-11-04)
+
+The parent walk that paid this item runs only at execution time. The physical table name is
+generated at parse time, where dbt sets `execute` to False, so under bare `dbt run` the walk never
+reaches the alias, and `sync_env_view` registered a different fingerprint than the one in the
+table name. The registry is now kept consistent with the table name; the remaining limitation is
+tracked as [bare_dbt_run_parse_time_fingerprint](bare_dbt_run_parse_time_fingerprint.md).

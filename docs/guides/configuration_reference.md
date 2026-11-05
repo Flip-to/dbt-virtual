@@ -70,7 +70,7 @@ vars:
 - **Default**: `"prod"`
 - **What it does**:
   Specifies the canonical production environment name. It serves three critical purposes:
-  1. **Incremental Clone Source (`clone_if_new_fp`)**: When a model's SQL changes in `staging` or `pr_123`, `clone_if_new_fp()` looks up the active physical table for `base_environment` (`prod`) in `_environments` and clones it (`CREATE TABLE new_fp CLONE prod_fp`) so your incremental model starts with full production history.
+  1. **Incremental Clone Source (`seed_incremental_clones`)**: When a model's SQL changes in `staging` or `pr_123`, `seed_incremental_clones()` (run by `dbt-virtual build` and by the `on-run-start` hook, before dbt materializes anything) looks up the active physical table for `base_environment` (`prod`) in `_environments` and clones it (`CREATE TABLE new_fp CLONE prod_fp`) so your incremental model starts with full production history.
   2. **Planner Baseline (`dbt-virtual plan`)**: Used to determine whether a modified incremental model can be classified as `SEED_INCREMENTAL` (base table exists in `prod`) vs `FULL_BUILD` (brand-new model).
   3. **Teardown Guardrail (`virtual_drop_env`)**: `dbt-virtual drop-env` refuses to drop `base_environment`, preventing accidental deletion of production views.
 
@@ -193,7 +193,7 @@ Virtual table and incremental models must keep dbt's alias equal to the model na
   }}
   ```
 - **What it does**:
-  When you add new columns to an incremental model, `clone_if_new_fp()` first clones the existing `prod` table (`CREATE TABLE new_fp CLONE prod_fp`), which has the *old* column schema. When `virtual_add_columns` is specified, `clone_if_new_fp()` immediately runs:
+  When you add new columns to an incremental model, `seed_incremental_clones()` first clones the existing `prod` table (`CREATE TABLE new_fp CLONE prod_fp`), which has the *old* column schema. When `virtual_add_columns` is specified, `seed_incremental_clones()` immediately runs:
   ```sql
   ALTER TABLE `analytics_physical`.`orders_metrics__newfp`
   ADD COLUMN IF NOT EXISTS discount_amount NUMERIC;

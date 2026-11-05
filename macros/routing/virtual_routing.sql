@@ -31,6 +31,8 @@
           ~ dbt_virtual.node_attr(node, 'name', '') ~ "' so refs resolve to the environment view."
         ) }}
       {%- endif -%}
+      {#- TECH_DEBT(bare_dbt_run_parse_time_fingerprint): dbt calls this with `execute` False, so
+          without CLI `_dbt_virtual_fps` the suffix omits upstream fingerprints. -#}
       {%- set fp = dbt_virtual.get_fingerprint(node) -%}
       {{ return(base_name ~ '__' ~ fp) }}
     {%- endif -%}

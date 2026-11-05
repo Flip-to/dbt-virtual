@@ -18,18 +18,18 @@ Canonical references (maintain DRY — consult these guides for full CLI flags a
    ```bash
    dbt compile --target staging
    dbt-virtual status --env staging --base-env prod --output state.json
-   dbt-virtual plan --env staging --base-env prod --state-file state.json
+   dbt-virtual plan --env staging --state-file state.json
    ```
    - `REUSE`: Physical table `<model>__<fp>` already exists (0 compute; only view pointer synced).
-   - `SEED_INCREMENTAL`: Cloned from `prod` via zero-copy `CLONE` (`clone_if_new_fp`), then incremental delta merged.
+   - `SEED_INCREMENTAL`: Cloned from `prod` via zero-copy `CLONE` (`seed_incremental_clones`, before `dbt build`), then incremental delta merged.
    - `FULL_BUILD`: New table or full refresh.
    - `ROUTINE_DEPLOY`: `table_function`, `function`, or `procedure`.
 
 2. **Build a Candidate Release in Staging (`build`)**:
    ```bash
-   dbt-virtual build --env staging --base-env prod --state-file state.json --release <release_id>
+   dbt-virtual build --env staging --state-file state.json --release <release_id>
    ```
-   - If adding columns to an incremental model, configure `virtual_add_columns: ['col_name TYPE']` so `clone_if_new_fp` alters the cloned table before incremental insertion.
+   - If adding columns to an incremental model, configure `virtual_add_columns: ['col_name TYPE']` so `seed_incremental_clones` alters the cloned table before incremental insertion.
    - For forward-only changes where you want to pin an existing physical table version, set `physical_version: '<fp>'` and `forward_only: true`.
 
 3. **Schema Diff & Pre-Promotion Quality Gate (`diff` + `audit`)**:

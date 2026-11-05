@@ -41,10 +41,10 @@ dbt compile --target staging --vars "{dbt_virtual: {environment: ${PR_ENV}}}"
 dbt-virtual status --env "${PR_ENV}" --base-env prod --output state.json
 
 # 3. Inspect the plan
-dbt-virtual plan --env "${PR_ENV}" --base-env prod --state-file state.json
+dbt-virtual plan --env "${PR_ENV}" --state-file state.json
 
 # 4. Build in pr_42 (unchanged models are REUSED in 0 compute!)
-dbt-virtual build --env "${PR_ENV}" --base-env prod --state-file state.json --release "pr_${GITHUB_EVENT_NUMBER}_${GITHUB_SHA::8}"
+dbt-virtual build --env "${PR_ENV}" --state-file state.json --release "pr_${GITHUB_EVENT_NUMBER}_${GITHUB_SHA::8}"
 ```
 
 When the Pull Request is closed or merged, tear down the ephemeral environment:

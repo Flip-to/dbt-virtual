@@ -526,7 +526,7 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
             == 0
         )
 
-    assert len(recorded_cmds) == 8
+    assert len(recorded_cmds) == 9
     build_cmd = recorded_cmds[0]
     assert build_cmd[:3] == ["build", "--target", "staging"]
     assert "--full-refresh" in build_cmd
@@ -537,13 +537,21 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
     assert vars_payload["_dbt_virtual_end"] == "2026-10-27"
     assert "orders_metrics" in vars_payload["_dbt_virtual_fps"]
 
-    assert recorded_cmds[1][:2] == ["run-operation", "virtual_promote"]
-    assert recorded_cmds[2][:2] == ["run-operation", "virtual_rollback"]
-    assert recorded_cmds[3][:2] == ["run-operation", "virtual_init_env"]
-    assert recorded_cmds[4][:2] == ["run-operation", "virtual_drop_env"]
-    assert recorded_cmds[5][:2] == ["run-operation", "virtual_gc"]
-    assert recorded_cmds[6][:2] == ["run-operation", "virtual_audit"]
-    assert recorded_cmds[7][:2] == ["run-operation", "virtual_export_state"]
+    # A release build records the whole environment in the release, so promote/rollback of
+    # that release do not demote models the build reused or did not select.
+    snapshot_cmd = recorded_cmds[1]
+    assert snapshot_cmd[:4] == ["run-operation", "virtual_snapshot_release", "--target", "staging"]
+    snapshot_args = json.loads(snapshot_cmd[snapshot_cmd.index("--args") + 1])
+    assert snapshot_args["release_id"] == "v2026.10.27"
+    assert "orders_metrics" in json.loads(snapshot_args["models_json"])
+
+    assert recorded_cmds[2][:2] == ["run-operation", "virtual_promote"]
+    assert recorded_cmds[3][:2] == ["run-operation", "virtual_rollback"]
+    assert recorded_cmds[4][:2] == ["run-operation", "virtual_init_env"]
+    assert recorded_cmds[5][:2] == ["run-operation", "virtual_drop_env"]
+    assert recorded_cmds[6][:2] == ["run-operation", "virtual_gc"]
+    assert recorded_cmds[7][:2] == ["run-operation", "virtual_audit"]
+    assert recorded_cmds[8][:2] == ["run-operation", "virtual_export_state"]
 
 
 def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
@@ -720,3 +728,42 @@ def test_jinja_sql_macros_parse_cleanly() -> None:
             sanitized,
         )
         env.parse(sanitized)
+
+
+def test_cli_build_seeds_incremental_clones_before_dbt_build(tmp_path: Path) -> None:
+    """dbt's incremental materialization loads `existing_relation` before model pre-hooks run,
+    so SEED_INCREMENTAL clones must exist before `dbt build` starts."""
+    manifest = _sample_manifest()
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"base_env_state": {"orders_metrics": "old000111222"}}), encoding="utf-8"
+    )
+
+    recorded_cmds: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded_cmds.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir", str(tmp_path), "build", "--env", "staging",
+                "--skip-compile", "--state-file", str(state_file),
+            ]
+        )
+    assert rc == 0
+    ops = [cmd[:2] for cmd in recorded_cmds]
+    seed_idx = ops.index(["run-operation", "virtual_seed_incremental_clones"])
+    build_idx = next(i for i, cmd in enumerate(recorded_cmds) if cmd[0] == "build")
+    assert seed_idx < build_idx
+    seed_cmd = recorded_cmds[seed_idx]
+    assert json.loads(seed_cmd[seed_cmd.index("--args") + 1]) == {"model_names": ["orders_metrics"]}
+    # Same target and fingerprints as the build, so the clone lands on the alias dbt builds.
+    assert seed_cmd[seed_cmd.index("--target") + 1] == "staging"
+    seed_vars = json.loads(seed_cmd[seed_cmd.index("--vars") + 1])
+    build_cmd = recorded_cmds[build_idx]
+    assert seed_vars == json.loads(build_cmd[build_cmd.index("--vars") + 1])

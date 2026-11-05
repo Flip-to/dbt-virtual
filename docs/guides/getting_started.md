@@ -65,6 +65,10 @@ vars:
     retention_releases: 5
     retention_days: 7
 
+on-run-start:
+  # Clone the base environment's table for changed incremental models BEFORE dbt materializes them.
+  - "{{ dbt_virtual.seed_incremental_clones() }}"
+
 models:
   my_analytics:
     # Opt in your models folder (can be enabled per-folder or per-model)
@@ -229,12 +233,13 @@ Suppose tomorrow you edit `models/marts/orders_metrics.sql` to add a filter or c
    - `orders_metrics` now gets a new fingerprint (`2b8f65b7f303`).
    - Because `prod` already has an active table (`orders_metrics__58cce796d2a1`), the planner classifies `orders_metrics` as **`SEED_INCREMENTAL`**.
 2. Run `dbt-virtual build --env staging --release v2`:
-   - Before dbt runs the model, the pre-hook `clone_if_new_fp()` runs:
+   - Before dbt builds anything, `dbt-virtual build` (or the `on-run-start` hook `seed_incremental_clones()`) runs:
      ```sql
      CREATE TABLE IF NOT EXISTS `analytics_physical`.`orders_metrics__2b8f65b7f303`
      CLONE `analytics_physical`.`orders_metrics__58cce796d2a1`
      ```
    - `is_incremental()` evaluates to `True`, so dbt only processes the incremental delta on top of the zero-copy clone!
+   - The clone has to exist before dbt starts: dbt's incremental materialization (dbt-core and dbt-bigquery 1.12) decides "new table" before model pre-hooks run, so a clone made in a pre-hook is replaced by a full build.
    - Meanwhile, `prod` (`analytics.orders_metrics`) is completely untouched and still points to `orders_metrics__58cce796d2a1` until you promote `v2`.
 
 ---

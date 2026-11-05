@@ -169,6 +169,9 @@ class MacroTestHarness:
             "tojson": json.dumps,
             "log": lambda msg, info=False: self.logs.append(str(msg)) or "",
             "execute": self.execute,
+            "modules": type("ModulesObj", (), {"re": re})(),
+            # dbt's `render()` renders a string in the current context.
+            "render": lambda text: self.env.from_string(text).render(**ctx),
             "target": self.target,
             "flags": self.flags,
             "graph": self.graph,
@@ -178,7 +181,15 @@ class MacroTestHarness:
             "ref": lambda name: FakeRelation(
                 self.target["database"], "analytics_staging", name, "view"
             ),
-            "dbt": type("DbtObj", (), {"string_literal": staticmethod(lambda s: repr(str(s)))})(),
+            "dbt": type(
+                "DbtObj",
+                (),
+                {
+                    "string_literal": staticmethod(lambda s: repr(str(s))),
+                    # dbt's is_incremental(): the target table does not exist in these tests.
+                    "is_incremental": staticmethod(lambda: False),
+                },
+            )(),
             "exceptions": type("ExcObj", (), {"raise_compiler_error": staticmethod(_raise_compiler_error)})(),
             "api": type(
                 "ApiObj",
@@ -432,7 +443,8 @@ def test_jinja_merkle_fallback_tracks_nonvirtual_model_parents() -> None:
     assert fp_v1 != fp_v2
 
 
-def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
+def test_seed_incremental_clones_seeds_before_materialization() -> None:
+    """Seeding happens outside the model pre-hook (dbt loads `existing_relation` before pre-hooks)."""
     harness = MacroTestHarness(
         vars_dict={
             "dbt_virtual": {
@@ -441,53 +453,68 @@ def test_clone_if_new_fp_and_is_incremental_behavior() -> None:
             }
         }
     )
-    harness.model = {
-        "name": "orders_metrics",
-        "config": {
-            "materialized": "incremental",
-            "virtual_env": True,
-            "virtual_add_columns": ["discount_amount NUMERIC", "coupon_code STRING"],
-        },
+    harness.graph = {
+        "nodes": {
+            "model.pkg.orders_metrics": {
+                "unique_id": "model.pkg.orders_metrics",
+                "name": "orders_metrics",
+                "resource_type": "model",
+                "database": "test_proj",
+                "schema": "analytics_physical",
+                "alias": "orders_metrics__newfp123456",
+                "config": {
+                    "materialized": "incremental",
+                    "virtual_env": True,
+                    "virtual_add_columns": ["discount_amount NUMERIC", "coupon_code STRING"],
+                },
+            }
+        }
     }
-    harness.this = FakeRelation("test_proj", "analytics_physical", "orders_metrics__newfp123456")
     # Base table exists in analytics_physical
+    harness.existing_relations.add(("test_proj", "analytics_physical", "orders_metrics__prodfp000000"))
+    harness.query_responses.append(
+        FakeResult([("orders_metrics", "analytics_physical.orders_metrics__prodfp000000")])
+    )
+
+    harness.call_macro("seed_incremental_clones")
+    executed = "\n".join(harness.executed_queries)
+    assert (
+        "CREATE TABLE IF NOT EXISTS `test_proj`.`analytics_physical`.`orders_metrics__newfp123456`\n"
+        "    CLONE `test_proj`.`analytics_physical`.`orders_metrics__prodfp000000`" in executed
+    )
+    assert "ADD COLUMN IF NOT EXISTS discount_amount NUMERIC" in executed
+    assert "ADD COLUMN IF NOT EXISTS coupon_code STRING" in executed
+    # The clone is registered in dbt's relation cache so the materialization treats it as existing.
+    assert [str(r) for r in harness.cache_added_relations] == [
+        "`test_proj`.`analytics_physical`.`orders_metrics__newfp123456`"
+    ]
+
+
+def test_clone_if_new_fp_pre_hook_no_longer_clones() -> None:
+    """A clone made in a pre-hook was replaced by dbt's `create or replace table` (BigQuery)."""
+    harness = MacroTestHarness(vars_dict={"dbt_virtual": {"physical_schema": "analytics_physical"}})
+    harness.model = {"name": "orders_metrics", "config": {"materialized": "incremental", "virtual_env": True}}
+    harness.this = FakeRelation("test_proj", "analytics_physical", "orders_metrics__newfp123456")
     harness.existing_relations.add(("test_proj", "analytics_physical", "orders_metrics__prodfp000000"))
     harness.query_responses.append(FakeResult([("analytics_physical.orders_metrics__prodfp000000",)]))
 
-    sql = harness.call_macro("clone_if_new_fp")
-    assert "CLONE `test_proj`.`analytics_physical`.`orders_metrics__prodfp000000`" in sql
-    assert "ADD COLUMN IF NOT EXISTS discount_amount NUMERIC" in sql
-    assert "ADD COLUMN IF NOT EXISTS coupon_code STRING" in sql
-    # Verify adapter.cache_added(this) was called so dbt knows the table now exists
-    assert harness.cache_added_relations == [harness.this]
+    assert harness.call_macro("clone_if_new_fp") == ""
+    assert not any("CLONE" in q for q in harness.executed_queries)
+    assert harness.cache_added_relations == []
 
 
-def test_is_incremental_requires_existing_base_physical_table() -> None:
-    harness = MacroTestHarness(
-        vars_dict={
-            "dbt_virtual": {
-                "physical_schema": "analytics_physical",
-                "base_environment": "prod",
-            }
-        }
-    )
-    harness.model = {
-        "name": "orders_metrics",
-        "config": {"materialized": "incremental", "virtual_env": True},
-    }
-    harness.query_responses.append(
-        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
-    )
+def test_is_incremental_does_not_claim_unseeded_table() -> None:
+    """Returning True for a missing table made BigQuery keep only the incremental delta."""
+    harness = MacroTestHarness(vars_dict={"dbt_virtual": {"physical_schema": "analytics_physical"}})
+    harness.model = {"name": "orders_metrics", "config": {"materialized": "incremental", "virtual_env": True}}
+    harness.existing_relations.add(("test_proj", "analytics_physical", "orders_metrics__prodfp000000"))
+    harness.query_responses.append(FakeResult([("analytics_physical.orders_metrics__prodfp000000",)]))
 
+    # `builtins.is_incremental()` is False in the harness: the target table does not exist yet.
     assert harness.call_macro("is_incremental") is False
-
-    harness.existing_relations.add(
-        ("test_proj", "analytics_physical", "orders_metrics__prodfp000000")
-    )
-    harness.query_responses.append(
-        FakeResult([("analytics_physical.orders_metrics__prodfp000000",)])
-    )
-    assert harness.call_macro("is_incremental") is True
+    # The name used in docs/guides/getting_started.md exists.
+    assert harness.call_macro("virtual_is_incremental") is False
+    assert harness.executed_queries == []
 
 
 def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
@@ -945,3 +972,160 @@ def test_virtual_adopt_zero_compute_existing_project_migration() -> None:
 
 
 
+    # The registry DDL runs as SQL statements, not one statement per character of the SQL string.
+    assert all(len(q) > 1 for q in harness.executed_queries)
+
+
+def _bq_harness(**cfg: Any) -> MacroTestHarness:
+    return MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+                "env_schemas": {"staging": "analytics_staging", "prod": "analytics"},
+                **cfg,
+            }
+        }
+    )
+
+
+def test_bigquery_audit_counts_rows_from_table_metadata() -> None:
+    """`COUNT(*)` fails on BigQuery tables with `require_partition_filter = true`.
+
+    Measured 2026-11-04 on BigQuery: `SELECT COUNT(*)` on a table with require_partition_filter
+    returned "Cannot query over table ... without a filter over column(s) ... that can be used
+    for partition elimination", while `__TABLES__.row_count` returned the row count.
+    """
+    harness = _bq_harness()
+    harness.query_responses.extend(
+        [
+            FakeResult([("events", "analytics_physical.events__fp2")]),
+            FakeResult([("events", "analytics_physical.events__fp1")]),
+            FakeResult([(90,)]),
+            FakeResult([(100,)]),
+        ]
+    )
+    harness.call_macro("virtual_audit", from_env="staging", to_env="prod", max_row_drop_pct=20.0)
+    count_queries = harness.executed_queries[2:]
+    assert len(count_queries) == 2
+    assert all("COUNT(*)" not in q for q in count_queries)
+    assert "FROM `test_proj`.`analytics_physical`.__TABLES__" in count_queries[0]
+    assert "WHERE table_id = 'events__fp2'" in count_queries[0]
+    assert "WHERE table_id = 'events__fp1'" in count_queries[1]
+
+
+def test_routine_ddl_template_replaces_only_qualified_env_schema() -> None:
+    harness = _bq_harness()
+    ddl = (
+        "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`analytics_staging`.`tvf`()\nAS (\n"
+        "SELECT o.analytics_staging_flag, 'analytics_staging' AS label\n"
+        "FROM `test_proj`.`analytics_staging`.`orders` AS o\n"
+        "JOIN raw_analytics_staging.events USING (id)\n"
+        "JOIN analytics_staging.dim USING (id)\n"
+        "JOIN `test_proj.analytics_staging.fact` USING (id)\n)"
+    )
+    template = harness.call_macro("env_schema_placeholder_sql", ddl, "analytics_staging")
+    assert template == (
+        "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`()\nAS (\n"
+        "SELECT o.analytics_staging_flag, 'analytics_staging' AS label\n"
+        "FROM `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`orders` AS o\n"
+        "JOIN raw_analytics_staging.events USING (id)\n"
+        "JOIN __DBT_VIRTUAL_ENV_SCHEMA__.dim USING (id)\n"
+        "JOIN `test_proj.__DBT_VIRTUAL_ENV_SCHEMA__.fact` USING (id)\n)"
+    )
+
+
+def test_bigquery_routine_template_literal_escapes_quotes_backslashes_and_newlines() -> None:
+    """dbt-bigquery's `string_literal` is `'''value'''`: it breaks on `r'\\d'` regexes and trailing quotes."""
+    import ast
+
+    harness = _bq_harness()
+    body = "SELECT REGEXP_EXTRACT(x, r'\\d+') AS n\nFROM t\nWHERE s = 'it''s'"
+    assert "\\d" in body and "\n" in body
+    literal = harness.call_macro("sql_string_literal", body)
+    assert literal.startswith("'") and literal.endswith("'")
+    assert "\n" not in literal
+    # BigQuery and Python share the escapes used here (\, \', \n), so Python can decode it.
+    assert ast.literal_eval(literal) == body
+
+    pg = MacroTestHarness(adapter_type="postgres")
+    assert pg.call_macro("sql_string_literal", "it's") == "'it''s'"
+
+
+def test_unmapped_env_schema_derives_from_base_env_schema() -> None:
+    harness = _bq_harness()
+    assert harness.call_macro("get_env_schema", "staging") == "analytics_staging"
+    # Documented fallback `<base_env_schema>_<env>`; it used to be `target.schema`.
+    assert harness.call_macro("get_env_schema", "pr_42") == "analytics_pr_42"
+    assert harness.call_macro("get_env_schema", "pr-42") == "analytics_pr_42"
+
+
+def test_get_config_renders_jinja_nested_in_the_vars_mapping() -> None:
+    harness = _bq_harness(environment="{{ var('_dbt_virtual_env', target.name) }}")
+    assert harness.call_macro("get_current_env") == "staging"
+    harness.vars_dict["dbt_virtual"]["env_schemas"]["staging"] = "{{ 'stg_' ~ target.name }}"
+    assert harness.call_macro("get_env_schema", "staging") == "stg_staging"
+
+
+def test_drop_env_refuses_schemas_of_other_environments() -> None:
+    harness = _bq_harness()
+    harness.vars_dict["dbt_virtual"]["env_schemas"]["oops"] = "analytics_physical"
+    try:
+        harness.call_macro("virtual_drop_env", env="oops")
+    except RuntimeError as exc:
+        assert "Refusing to drop schema 'analytics_physical'" in str(exc)
+    else:
+        raise AssertionError("drop-env must refuse the physical schema")
+    assert not any("DROP SCHEMA" in q for q in harness.executed_queries)
+
+
+def test_init_env_deploys_routines_from_recorded_templates() -> None:
+    harness = _bq_harness()
+    template = (
+        "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`()\n"
+        "AS (SELECT * FROM `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`orders`)"
+    )
+    harness.query_responses.extend(
+        [
+            FakeResult([("tvf", "table_function", "fp1", "analytics.tvf", template, 3)]),
+            FakeResult([]),
+        ]
+    )
+    harness.call_macro("virtual_promote", from_env="prod", to_env="pr_7", release_id="")
+    env_query = harness.executed_queries[0]
+    assert "CAST(NULL AS STRING)" not in env_query
+    assert "MAX(r.routine_ddl_template)" in env_query
+    executed = "\n".join(harness.executed_queries)
+    assert "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`analytics_pr_7`.`tvf`()" in executed
+    assert "FROM `test_proj`.`analytics_pr_7`.`orders`" in executed
+
+
+def test_promote_keeps_project_models_missing_from_the_release() -> None:
+    harness = _bq_harness()
+    harness.graph = {
+        "nodes": {
+            "model.pkg.kept": {
+                "unique_id": "model.pkg.kept",
+                "name": "kept",
+                "resource_type": "model",
+                "config": {"materialized": "table", "virtual_env": True},
+            }
+        }
+    }
+    harness.existing_relations.add(("test_proj", "analytics_physical", "changed__fp2"))
+    harness.query_responses.extend(
+        [
+            FakeResult([("changed", "model", "fp2", "analytics_physical.changed__fp2", None, 2)]),
+            FakeResult(
+                [
+                    ("changed", "model", "fp1", "analytics_physical.changed__fp1"),
+                    ("kept", "model", "fpk", "analytics_physical.kept__fpk"),
+                    ("removed", "model", "fpr", "analytics_physical.removed__fpr"),
+                ]
+            ),
+        ]
+    )
+    harness.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="r2")
+    executed = "\n".join(harness.executed_queries)
+    assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`kept`" not in executed
+    assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`removed`" in executed

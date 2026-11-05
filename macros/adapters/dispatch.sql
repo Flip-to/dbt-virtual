@@ -553,6 +553,12 @@ $$
   )
 {%- endmacro %}
 
+{% macro default__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- dbt resolves `adapter.dispatch(...)` while parsing; without a default, every dbt command on
+      BigQuery and Snowflake failed with "No macro named 'orphan_table_age_predicate_sql'". -#}
+  {{ exceptions.raise_compiler_error("dbt-virtual gc: no table age predicate for adapter '" ~ target.type ~ "'.") }}
+{%- endmacro %}
+
 {% macro databricks__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
   t.created < DATEADD(DAY, -{{ retention_days }}, CURRENT_TIMESTAMP())
 {%- endmacro %}
@@ -646,6 +652,54 @@ $$
     AND table_type = 'BASE TABLE'
     AND table_name LIKE '%\_\_%' ESCAPE '\'
   ORDER BY table_name
+{%- endmacro %}
+
+
+{% macro env_schema_placeholder_sql(sql_text, env_schema) -%}
+  {#- Swap only schema-qualified references (`env.x`, `` `env`.x ``, `"env".x`) for the
+      promotion placeholder. A bare `replace()` also rewrote columns, other schemas and string
+      literals that merely contain the env schema name (`staging_flag`, `raw_staging.events`). -#}
+  {%- set pattern = '(?<![0-9A-Za-z_$])' ~ modules.re.escape(env_schema) ~ '(?=[`"]?\\.)' -%}
+  {{ return(modules.re.sub(pattern, '__DBT_VIRTUAL_ENV_SCHEMA__', sql_text)) }}
+{%- endmacro %}
+
+
+{% macro sql_string_literal(value) -%}
+  {{ return(adapter.dispatch('sql_string_literal', 'dbt_virtual')(value)) }}
+{%- endmacro %}
+
+{% macro bigquery__sql_string_literal(value) -%}
+  {#- dbt-bigquery's `string_literal` is `'''value'''`, which breaks on regex backslashes
+      (`r'\d+'`) and on bodies that end with a quote. Escape instead. -#}
+  {{ return("'" ~ (value | string | replace('\\', '\\\\') | replace("'", "\\'") | replace('\n', '\\n') | replace('\r', '\\r')) ~ "'") }}
+{%- endmacro %}
+
+{% macro databricks__sql_string_literal(value) -%}
+  {{ return(dbt_virtual.bigquery__sql_string_literal(value)) }}
+{%- endmacro %}
+
+{% macro snowflake__sql_string_literal(value) -%}
+  {{ return("'" ~ (value | string | replace('\\', '\\\\') | replace("'", "''")) ~ "'") }}
+{%- endmacro %}
+
+{% macro default__sql_string_literal(value) -%}
+  {{ return("'" ~ (value | string | replace("'", "''")) ~ "'") }}
+{%- endmacro %}
+
+
+{% macro row_count_sql(relation) -%}
+  {{ return(adapter.dispatch('row_count_sql', 'dbt_virtual')(relation)) }}
+{%- endmacro %}
+
+{% macro bigquery__row_count_sql(relation) -%}
+  {#- `COUNT(*)` fails on tables with `require_partition_filter = true`; table metadata does not. -#}
+  SELECT row_count
+  FROM `{{ relation.database }}`.`{{ relation.schema }}`.__TABLES__
+  WHERE table_id = '{{ relation.identifier }}'
+{%- endmacro %}
+
+{% macro default__row_count_sql(relation) -%}
+  SELECT COUNT(*) FROM {{ relation }}
 {%- endmacro %}
 
 

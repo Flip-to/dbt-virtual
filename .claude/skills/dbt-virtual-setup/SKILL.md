@@ -30,6 +30,11 @@ Canonical references (maintain DRY — always read these guides for full paramet
 
 3. **Configure `vars.dbt_virtual` and Model Hooks in `dbt_project.yml`**:
    - Add `vars.dbt_virtual` (`enabled`, `physical_schema`, `environment`, `base_environment`, `ref_resolution`, `env_schemas`, `retention_releases`, `retention_days`) following `docs/guides/configuration_reference.md`.
+   - Add the top-level hook that seeds changed incremental models before dbt materializes them:
+     ```yaml
+     on-run-start:
+       - "{{ dbt_virtual.seed_incremental_clones() }}"
+     ```
    - On opted-in model folders, add:
      ```yaml
      +virtual_env: true

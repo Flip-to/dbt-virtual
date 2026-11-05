@@ -6,7 +6,7 @@ Executes the actual SQL rendered by `MacroTestHarness` against a real in-process
 3. DuckDB scalar & table macros (`create_routine_ddl_sql` for `function` and `table_function`)
 4. Zero-rebuild `virtual_promote` (`staging` -> `prod`)
 5. Ephemeral PR environment `virtual_init_env` (`pr_42`) + `virtual_drop_env`
-6. Incremental v2 seeding (`clone_if_new_fp` via CTAS on DuckDB) + `virtual_promote` to `prod`
+6. Incremental v2 seeding (`seed_incremental_clones` via CTAS on DuckDB) + `virtual_promote` to `prod`
 7. Instant `virtual_rollback` (`prod` -> release `v1`)
 8. Janitor `virtual_gc` orphan detection and table drop.
 """
@@ -158,10 +158,22 @@ def test_duckdb_full_virtual_lifecycle_e2e() -> None:
     harness.model = node_v2
     harness.this = FakeRelation("", "analytics_physical", phys_v2, "table", quote_char="")
 
-    # Seed v2 from prod's v1 via `clone_if_new_fp`
-    harness.query_responses.append(FakeResult([(f"analytics_physical.{phys_v1}",)]))
-    clone_sql = harness.call_macro("clone_if_new_fp")
-    exec_multi(clone_sql)
+    # Seed v2 from prod's v1 before the materialization runs (`seed_incremental_clones`)
+    harness.graph = {
+        "nodes": {
+            "model.test.orders_metrics": {
+                **node_v2,
+                "database": "",
+                "schema": "analytics_physical",
+                "alias": phys_v2,
+            }
+        }
+    }
+    harness.query_responses.append(FakeResult([("orders_metrics", f"analytics_physical.{phys_v1}")]))
+    harness.executed_queries.clear()
+    harness.call_macro("seed_incremental_clones")
+    for q_str in harness.executed_queries[1:]:  # skip the base-pointer SELECT that FakeResult answered
+        exec_multi(q_str)
     con.execute(f"INSERT INTO analytics_physical.{phys_v2} VALUES ('store_3', 40)")
 
     sync_v2_sql = harness.call_macro("sync_env_view")

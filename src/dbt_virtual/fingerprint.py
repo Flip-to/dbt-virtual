@@ -121,7 +121,9 @@ class NodeFingerprint:
 
 def is_virtual_node(node: dict[str, Any]) -> bool:
     """Return True if a manifest node opts into dbt-virtual (`virtual_env: true`)."""
-    if node.get("resource_type") not in {"model", "function", "operation"}:
+    # `operation` nodes are on-run-start/on-run-end hooks; they inherit `+virtual_env` from the
+    # project's `models:` config but are not deployable objects.
+    if node.get("resource_type") not in {"model", "function"}:
         return False
     config = node.get("config") or {}
     if config.get("virtual_env") is True:
@@ -214,6 +216,31 @@ def normalize_sql(
     return " ".join(line for line in lines if line)
 
 
+_OPTIONAL_SHAPE_KEYS = (
+    "require_partition_filter",
+    "partition_expiration_days",
+    "incremental_predicates",
+    "predicates",
+    "merge_update_columns",
+    "merge_exclude_columns",
+    "sql_header",
+)
+
+
+def _user_hook_sql(hooks: Any) -> list[str]:
+    """Return the SQL of user hooks, skipping dbt-virtual's own lifecycle hooks."""
+    if not hooks:
+        return []
+    if not isinstance(hooks, list):
+        hooks = [hooks]
+    sqls: list[str] = []
+    for hook in hooks:
+        sql = hook.get("sql", "") if isinstance(hook, dict) else str(hook)
+        if sql and "dbt_virtual." not in sql:
+            sqls.append(sql.strip())
+    return sqls
+
+
 def extract_relevant_config(node: dict[str, Any]) -> dict[str, Any]:
     """Extract the subset of node configuration that affects physical table or routine shape."""
     config = node.get("config") or {}
@@ -228,7 +255,27 @@ def extract_relevant_config(node: dict[str, Any]) -> dict[str, Any]:
     if isinstance(cluster_by, list):
         cluster_by = list(cluster_by)
 
+    # Settings that change table contents or options. Added only when set, so fingerprints of
+    # nodes that do not use them stay the same as before these keys existed.
+    optional: dict[str, Any] = {}
+    for key in _OPTIONAL_SHAPE_KEYS:
+        value = _get(key)
+        if value not in (None, "", [], {}):
+            optional[key] = value
+    for hook_key in ("pre-hook", "post-hook"):
+        hooks = _user_hook_sql(config.get(hook_key) or config.get(hook_key.replace("-", "_")))
+        if hooks:
+            optional[hook_key] = hooks
+    contract = _get("contract") or {}
+    if isinstance(contract, dict) and contract.get("enforced"):
+        # An enforced contract creates the table from the declared column types.
+        optional["contract_columns"] = {
+            name: (meta or {}).get("data_type")
+            for name, meta in sorted((node.get("columns") or {}).items())
+        }
+
     return {
+        **optional,
         "materialized": _get("materialized", "view"),
         "incremental_strategy": _get("incremental_strategy"),
         "unique_key": _get("unique_key"),
