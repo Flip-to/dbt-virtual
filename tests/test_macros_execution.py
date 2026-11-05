@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 from dataclasses import dataclass
@@ -89,6 +90,7 @@ class MacroTestHarness:
             REPO / "macros" / "routing" / "virtual_routing.sql",
             REPO / "macros" / "adapters" / "dispatch.sql",
             REPO / "macros" / "lifecycle" / "hooks.sql",
+            REPO / "macros" / "lifecycle" / "guards.sql",
             REPO / "macros" / "lifecycle" / "operations.sql",
             REPO / "macros" / "testing" / "tvf_test_ref.sql",
         ]
@@ -175,7 +177,7 @@ class MacroTestHarness:
             "tojson": json.dumps,
             "log": lambda msg, info=False: self.logs.append(str(msg)) or "",
             "execute": self.execute,
-            "modules": type("ModulesObj", (), {"re": re})(),
+            "modules": type("ModulesObj", (), {"re": re, "datetime": datetime})(),
             # dbt's `render()` renders a string in the current context.
             "render": lambda text: self.env.from_string(text).render(**ctx),
             "target": self.target,
@@ -1014,7 +1016,9 @@ def test_bigquery_audit_counts_rows_from_table_metadata() -> None:
             FakeResult([(100,)]),
         ]
     )
-    harness.call_macro("virtual_audit", from_env="staging", to_env="prod", max_row_drop_pct=20.0)
+    harness.call_macro(
+        "virtual_audit", from_env="staging", to_env="prod", max_row_drop_pct=20.0, check_coverage=False
+    )
     count_queries = harness.executed_queries[2:]
     assert len(count_queries) == 2
     assert all("COUNT(*)" not in q for q in count_queries)

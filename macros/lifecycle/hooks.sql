@@ -11,7 +11,7 @@
       {%- endcall -%}
     {%- elif adapter.get_columns_in_relation is defined -%}
       {%- set column_names = adapter.get_columns_in_relation(releases_rel) | map(attribute='name') | map('lower') | list -%}
-      {%- if 'schema_key' not in column_names -%}
+      {%- if 'schema_key' not in column_names or 'build_quality' not in column_names or 'sealed_at' not in column_names -%}
         {%- call statement('migrate_registry', fetch_result=False) -%}
           {{ dbt_virtual.registry_migrations_sql(phys_schema) }}
         {%- endcall -%}
@@ -370,6 +370,9 @@
       {{ dbt_virtual.sql_nullable_literal(schema_key) }}
     );
     {%- endif %}
+
+    {#- Mark windowed / `--empty` builds so promote refuses them (guards.sql). -#}
+    {{ dbt_virtual.set_build_quality_sql(phys_schema, env_name, model.name, release_id, dbt_virtual.build_quality()) }}
 
     {%- set start_ts = var('_dbt_virtual_start', '') -%}
     {%- set end_ts = var('_dbt_virtual_end', '') -%}

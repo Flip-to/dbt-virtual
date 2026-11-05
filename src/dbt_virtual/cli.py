@@ -54,6 +54,26 @@ def _load_state_file(
     return env_state, base_env_state, existing_tables, registered
 
 
+def _load_partial_tables(state_path: str | None) -> set[str]:
+    """Physical tables the state snapshot marks as built from a window or with `--empty`."""
+    if not state_path:
+        return set()
+    raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    return set(raw.get("partial_physical_tables") or [])
+
+
+def _base_environment(project_dir: Path) -> str:
+    """`vars.dbt_virtual.base_environment` from dbt_project.yml (default `prod`)."""
+    try:
+        import yaml
+
+        project = yaml.safe_load((project_dir / "dbt_project.yml").read_text(encoding="utf-8")) or {}
+        value = ((project.get("vars") or {}).get("dbt_virtual") or {}).get("base_environment")
+    except Exception:  # noqa: BLE001 - no project file / unparsable: use the default
+        value = None
+    return value if isinstance(value, str) and value and "{{" not in value else "prod"
+
+
 def _default_lock_owner() -> str:
     """A lease owner that is stable for one user on one machine, so a failed promote can be retried."""
     import getpass
@@ -91,6 +111,7 @@ def cmd_plan(ns: argparse.Namespace) -> int:
         base_env_state=base_env_state,
         existing_physical_tables=existing_tables,
         registered_physical_tables=registered,
+        partial_physical_tables=_load_partial_tables(ns.state_file),
     )
 
     counts: dict[str, int] = {}
@@ -147,6 +168,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
         existing_physical_tables=existing_tables,
         full_refresh=ns.full_refresh,
         registered_physical_tables=registered,
+        partial_physical_tables=_load_partial_tables(ns.state_file),
     )
     models_to_build, reused_models = compute_dbt_select_for_build(actions)
 
@@ -240,15 +262,37 @@ def cmd_build(ns: argparse.Namespace) -> int:
 
 def cmd_promote(ns: argparse.Namespace) -> int:
     project_dir = Path(ns.project_dir).resolve()
-    op_args = {
+    # Auditing is on by default when promoting into the base environment (usually prod).
+    audit = ns.audit if ns.audit is not None else ns.to_env == _base_environment(project_dir)
+    op_args: dict[str, object] = {
         "from_env": ns.from_env,
         "to_env": ns.to_env,
         "release_id": ns.release,
-        "audit": bool(ns.audit),
+        "audit": bool(audit),
         "max_row_drop_pct": float(ns.max_row_drop_pct),
         "lock": not ns.no_lock,
         "lock_owner": ns.lock_owner or _default_lock_owner(),
+        "allow_unsealed": bool(ns.allow_unsealed),
+        "require_sealed": bool(ns.require_sealed),
+        "check_coverage": not ns.no_coverage_check,
+        "coverage_ignore_before": ns.coverage_ignore_before or "",
     }
+    if ns.skip_fingerprint_check:
+        print(
+            "dbt-virtual promote: WARNING fingerprint check skipped (--skip-fingerprint-check); a table "
+            "built from other code or variables (e.g. a windowed build) can be promoted.",
+            file=sys.stderr,
+        )
+    else:
+        # The release must have been built from the code (and variables) of the target environment.
+        compile_target = ns.compile_target or ns.to_env
+        if not ns.skip_compile:
+            rc = _run_dbt(["compile", "--target", compile_target], project_dir)
+            if rc != 0:
+                return rc
+        manifest = _load_manifest(project_dir)
+        fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
+        op_args["expected_fps_json"] = json.dumps({fp.name: fp.fingerprint for fp in fps.values()})
     return _run_dbt(
         ["run-operation", "virtual_promote", "--args", json.dumps(op_args)],
         project_dir,
@@ -263,6 +307,8 @@ def cmd_audit(ns: argparse.Namespace) -> int:
         "release_id": ns.release or "",
         "allow_empty": bool(ns.allow_empty),
         "max_row_drop_pct": float(ns.max_row_drop_pct),
+        "check_coverage": not ns.no_coverage_check,
+        "coverage_ignore_before": ns.coverage_ignore_before or "",
     }
     return _run_dbt(
         ["run-operation", "virtual_audit", "--args", json.dumps(op_args)],
@@ -485,8 +531,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_promote.add_argument("--release", required=True, help="Release ID to promote.")
     p_promote.add_argument(
         "--audit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run the virtual_audit gate (row counts, BigQuery partition coverage) before promoting. "
+        "Default: on when --to is the base environment (vars.dbt_virtual.base_environment, default prod).",
+    )
+    p_promote.add_argument(
+        "--no-coverage-check",
         action="store_true",
-        help="Run virtual_audit quality gate before promoting.",
+        help="Skip the BigQuery partition coverage part of the audit.",
+    )
+    p_promote.add_argument(
+        "--coverage-ignore-before",
+        default=None,
+        help="Ignore partitions older than this date (e.g. 2026-01-01) in the coverage audit "
+        "(default: vars.dbt_virtual.coverage_ignore_before).",
+    )
+    p_promote.add_argument(
+        "--skip-fingerprint-check",
+        action="store_true",
+        help="DANGEROUS: do not compare the release's fingerprints with the code compiled for --to. "
+        "A windowed, --empty or other-branch build can then reach the target.",
+    )
+    p_promote.add_argument(
+        "--compile-target",
+        default=None,
+        help="dbt --target used to compile the expected fingerprints (default: --to).",
+    )
+    p_promote.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_promote.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
+    p_promote.add_argument(
+        "--require-sealed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also refuse releases created before sealing existed (default). Seal one after checking it "
+        "with `dbt run-operation virtual_seal_release`, or pass --no-require-sealed.",
+    )
+    p_promote.add_argument(
+        "--allow-unsealed",
+        action="store_true",
+        help="DANGEROUS: promote a release whose `build --release` did not finish successfully.",
     )
     p_promote.add_argument(
         "--max-row-drop-pct",
@@ -517,6 +601,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         help="Fail if row count drops by more than this percentage vs base.",
+    )
+    p_audit.add_argument(
+        "--no-coverage-check", action="store_true", help="Skip the BigQuery partition coverage check."
+    )
+    p_audit.add_argument(
+        "--coverage-ignore-before",
+        default=None,
+        help="Ignore partitions older than this date (e.g. 2026-01-01); default vars.dbt_virtual.coverage_ignore_before.",
     )
     p_audit.set_defaults(func=cmd_audit)
 

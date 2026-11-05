@@ -143,15 +143,18 @@ class Project:
         if select:
             args += ["--select", *select]
         self.dbt(*args)
+        if release:
+            # `dbt-virtual build --release` seals the release after a successful `dbt build`.
+            self.operation("virtual_seal_release", {"release_id": release}, env=env)
         return fps
 
     def cli(self, *args: str) -> int:
         return dbt_virtual_main(["--project-dir", str(self.dir), *args])
 
-    def operation(self, name: str, args: dict, *, expect_ok: bool = True) -> subprocess.CompletedProcess:
-        return self.dbt(
-            "run-operation", name, "--target", "staging", "--args", json.dumps(args), expect_ok=expect_ok
-        )
+    def operation(
+        self, name: str, args: dict, *, expect_ok: bool = True, env: str = "staging"
+    ) -> subprocess.CompletedProcess:
+        return self.dbt("run-operation", name, "--target", env, "--args", json.dumps(args), expect_ok=expect_ok)
 
     def query(self, sql: str) -> list[tuple]:
         con = duckdb.connect(self.db_path, read_only=True)

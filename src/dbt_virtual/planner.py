@@ -153,6 +153,7 @@ def classify_plan_actions(
     existing_physical_tables: set[str] | None = None,
     full_refresh: bool = False,
     registered_physical_tables: set[str] | None = None,
+    partial_physical_tables: set[str] | None = None,
 ) -> dict[str, NodePlanAction]:
     """Classify each virtualized node into REUSE, SEED_INCREMENTAL, FULL_BUILD, or ROUTINE_DEPLOY.
 
@@ -172,6 +173,10 @@ def classify_plan_actions(
         Optional set of physical tables referenced by `_environments` or `_releases`, i.e. written
         by a build that finished. When given, an existing table that is not registered (e.g. a
         clone whose `dbt build` failed) is rebuilt instead of reused.
+    partial_physical_tables:
+        Physical tables whose latest registration is a windowed or `--empty` build
+        (`build_quality = 'partial'`). They are neither reused nor cloned as an incremental
+        seed: another environment would inherit the missing data.
     """
     env_map = env_state or {}
     base_map = base_env_state or {}
@@ -184,6 +189,8 @@ def classify_plan_actions(
     if existing_physical_tables is None:
         for model_name, fp in (*env_map.items(), *base_map.items()):
             phys_tables.add(f"{model_name}__{fp}")
+    if partial_physical_tables:
+        phys_tables -= set(partial_physical_tables)
 
     actions: dict[str, NodePlanAction] = {}
     for uid, fp_obj in sorted(fingerprints.items()):
