@@ -11,7 +11,9 @@ from pathlib import Path
 
 from dbt_virtual import __version__
 from dbt_virtual.fingerprint import (
+    MissingCompiledCodeError,
     compute_manifest_fingerprints,
+    explain_fingerprint,
     write_fingerprints_file,
 )
 from dbt_virtual.planner import (
@@ -32,6 +34,18 @@ def _load_manifest(project_dir: Path, manifest_override: str | None = None) -> d
             f"Manifest not found at {manifest_path}. Run `dbt compile` or omit `--skip-compile`."
         )
     return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def _fingerprints(manifest: dict, ns: argparse.Namespace) -> dict:
+    """Fingerprints for the manifest; exits 2 with a hint when it was parsed, not compiled."""
+    try:
+        return compute_manifest_fingerprints(
+            manifest,
+            known_schemas=getattr(ns, "known_schemas", None) or [],
+            hash_compiled_ancestors=getattr(ns, "hash_compiled_ancestors", False),
+        )
+    except MissingCompiledCodeError as exc:
+        raise SystemExit(f"dbt-virtual: {exc}") from exc
 
 
 def _load_state_file(
@@ -115,7 +129,23 @@ def cmd_plan(ns: argparse.Namespace) -> int:
             return rc
 
     manifest = _load_manifest(project_dir)
-    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
+    if ns.explain_fingerprint:
+        try:
+            print(
+                explain_fingerprint(
+                    manifest,
+                    ns.explain_fingerprint,
+                    known_schemas=ns.known_schemas,
+                    hash_compiled_ancestors=ns.hash_compiled_ancestors,
+                    include_ancestors=ns.explain_ancestors,
+                )
+            )
+        except MissingCompiledCodeError as exc:
+            raise SystemExit(f"dbt-virtual: {exc}") from exc
+        except ValueError as exc:
+            raise SystemExit(f"dbt-virtual: {exc}") from exc
+        return 0
+    fps = _fingerprints(manifest, ns)
     out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps, out_file)
 
@@ -173,7 +203,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
             return rc
 
     manifest = _load_manifest(project_dir)
-    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
+    fps = _fingerprints(manifest, ns)
     out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps, out_file)
 
@@ -308,7 +338,7 @@ def cmd_run(ns: argparse.Namespace) -> int:
             return rc
 
     manifest = _load_manifest(project_dir)
-    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
+    fps = _fingerprints(manifest, ns)
     write_fingerprints_file(fps, project_dir / ".dbt_virtual" / "fingerprints.json")
 
     if ns.state_file:
@@ -578,7 +608,7 @@ def cmd_adopt(ns: argparse.Namespace) -> int:
             return rc
 
     manifest = _load_manifest(project_dir)
-    fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas or [])
+    fps = _fingerprints(manifest, ns)
     fp_map = {v.name: v.fingerprint for v in fps.values()}
 
     op_args = {
@@ -618,6 +648,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--env", default="staging", help="Target virtual environment name.")
     p_plan.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
     p_plan.add_argument(
+        "--hash-compiled-ancestors",
+        action="store_true",
+        help="Hash the compiled SQL of non-virtual ancestors too (default: raw SQL + macros, which do not depend on warehouse state).",
+    )
+    p_plan.add_argument(
         "--state-file",
         default=None,
         help="Optional JSON file containing warehouse env_state / base_env_state / existing_physical_tables.",
@@ -630,6 +665,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Known environment schema names to normalize out of SQL fingerprints.",
     )
     p_plan.add_argument("--format", choices=["text", "json"], default="text")
+    p_plan.add_argument(
+        "--explain-fingerprint",
+        metavar="MODEL",
+        default=None,
+        help="Print what went into MODEL's fingerprint (normalized SQL, config, upstream fingerprints, "
+        "tokens that may differ per environment) instead of the plan.",
+    )
+    p_plan.add_argument(
+        "--explain-ancestors",
+        action="store_true",
+        help="With --explain-fingerprint: also print every ancestor, to find which one differs between environments.",
+    )
     p_plan.add_argument(
         "--target",
         default=None,
@@ -652,6 +699,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--state-file", default=None, help="Optional warehouse state JSON file for REUSE skipping.")
     p_build.add_argument("--full-refresh", action="store_true", help="Pass --full-refresh to dbt build.")
     p_build.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_build.add_argument(
+        "--hash-compiled-ancestors",
+        action="store_true",
+        help="Hash the compiled SQL of non-virtual ancestors too (default: raw SQL + macros, which do not depend on warehouse state).",
+    )
     p_build.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
     p_build.add_argument(
         "--target",
@@ -685,6 +737,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("--full-refresh", action="store_true", help="Pass --full-refresh to dbt build.")
     p_run.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_run.add_argument(
+        "--hash-compiled-ancestors",
+        action="store_true",
+        help="Hash the compiled SQL of non-virtual ancestors too (default: raw SQL + macros, which do not depend on warehouse state).",
+    )
     p_run.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
     p_run.set_defaults(func=cmd_run)
 
@@ -792,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clone into physical_schema and register in _environments without replacing the existing table with a view yet.",
     )
     p_adopt.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
+    p_adopt.add_argument(
+        "--hash-compiled-ancestors",
+        action="store_true",
+        help="Hash the compiled SQL of non-virtual ancestors too (default: raw SQL + macros, which do not depend on warehouse state).",
+    )
     p_adopt.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
     p_adopt.set_defaults(func=cmd_adopt)
 

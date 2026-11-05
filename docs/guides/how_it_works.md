@@ -65,14 +65,32 @@ Since points 1 and 4 above (commit `48d2c41`), the same model gets the same fing
 
 `--known-schema <name>` (on `plan`, `build` and `adopt`) is now only needed when compiled SQL contains a schema name that is **not** the location of a dependency and that differs per target, for example:
 - a hard-coded `analytics_staging.lookup` or `{{ target.schema }}_raw.events` written in SQL instead of a `ref()`;
-- a `source()` whose schema is set per target (sources are not dependencies in the fingerprint, so their full name stays in the hash);
 - a hand-written two-part reference (`schema.table`) to a model: the automatic rule only rewrites three-part names, because a two-part name may be `alias.column`.
 
 Pass every per-target value of such a schema, e.g. `--known-schema analytics_staging_raw --known-schema analytics_raw`.
 
+### Why the same code can still get two fingerprints, and how to see it
+
+Measured 2026-11-05 on the flipto-dbt pilot (`dbt compile --select +tag:dbt_virtual`, target `prod_oauth` vs the sandbox target `dbt_virtual_pilot` with `--defer`): the normalized SQL of the four pilot objects was identical in both. What differed was 14 non-virtual ancestors in their upstream closure, all but one `incremental`, so each pilot fingerprint (a hash over its parents' fingerprints) differed. Their compiled SQL depends on the warehouse and the clock, not on the code: `is_incremental()` is true only where the table exists, `snowplow_utils` macros render `CAST(TRUE AS BOOL)` vs `TRUE`, a `run_query` result is inlined as a timestamp literal, `{{ this }}` is `db.schema.alias` of wherever the table lives. Four rules follow, all in `compute_manifest_fingerprints`:
+
+1. **Ancestors dbt-virtual does not build hash raw SQL plus their macro closure, not compiled SQL.** For non-virtual models and snapshots the payload carries `macro_closure_hash`: the `macro_sql` of every macro the node calls, transitively, except dbt's, the adapters' and dbt-virtual's own (a dbt upgrade must not rebuild everything). Editing the model, a macro it calls, or any of its parents still changes the downstream fingerprint (SQLMesh also hashes the model definition and its macro code, not a warehouse-dependent rendering). What is *not* seen: a `var()` value or a `{% if target.name %}` branch inside a non-virtual ancestor. `--hash-compiled-ancestors` (on `plan`, `build`, `run`, `adopt`) restores hashing their compiled SQL.
+2. **Virtual nodes still hash compiled SQL**, so a `target.name` branch or a var in a virtual model changes its fingerprint. That is intended: the behaviour differs.
+3. **A node's own `{{ this }}`, dependencies and `source()` relations lose their `db.schema` qualifier**, including when `--defer` pointed a parent at prod. Remaining qualified names (hard-coded tables, a project id written in SQL) stay in the hash: they are logic.
+4. **A manifest without compiled SQL is refused.** After `dbt parse` or `dbt run-operation` the manifest has no `compiled_code`; `plan --skip-compile` used to hash the raw SQL only and print a different fingerprint than after a compile. It now exits with "no compiled SQL" for a virtual node whose raw SQL has Jinja. Omit `--skip-compile`.
+
+Not measured: a *virtual* `incremental` model also compiles differently once its table exists (`is_incremental()`); the pilot has none. Treat it as open.
+
+To see why two environments disagree, compare the output of
+
+```bash
+dbt-virtual plan --env <env> --target <target> --explain-fingerprint <model> --explain-ancestors
+```
+
+in each: it prints, per node, the fingerprint, what was hashed (`compiled_sql` or `raw_sql_and_macros`), the config, the upstream fingerprints, the normalized SQL, and tokens that may differ per environment (qualified relations that are not dependencies, clock functions, timestamp literals). Diff the two outputs; the first ancestor whose line differs is the cause.
+
 ### Bare `dbt run` uses a different fingerprint
 
-The fingerprint above is computed by the Python CLI and handed to dbt as `--vars '{_dbt_virtual_fps: ...}'`. A bare `dbt run` / `dbt build` has no such map, so the physical name comes from a Jinja fallback that dbt evaluates while parsing, before parents are resolved: it hashes the model's own raw SQL and a few configs, not its parents, and with a different algorithm. Changing an upstream model then does not give downstream models a new physical table, and the names do not match the CLI's ([tech debt `bare_dbt_run_parse_time_fingerprint`](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). Build virtual models with `dbt-virtual build`. To enforce that, set [`require_cli_fingerprints: true`](configuration_reference.md): a bare `dbt run` / `dbt build` / `dbt retry` that selects a virtual `table` / `incremental` model then fails in `on-run-start`, before anything is built.
+The fingerprint above is computed by the Python CLI and handed to dbt as `--vars '{_dbt_virtual_fps: ...}'`. A bare `dbt run` / `dbt build` has no such map, so the physical name comes from a Jinja fallback that dbt evaluates while parsing, before parents are resolved: it hashes the model's own raw SQL and a few configs, not its parents, and with a different algorithm. Changing an upstream model then does not give downstream models a new physical table, and the names do not match the CLI's ([tech debt `bare_dbt_run_parse_time_fingerprint`](../tech_debt/bare_dbt_run_parse_time_fingerprint.md)). The two names cannot be made equal: the Jinja fallback runs at parse time, before the manifest, parents and compiled SQL exist (pilot, 2026-11-04: `slv_web__imported_transactions__b17401f52861` from a bare `dbt build`, `__c4a89e19cc97` from `dbt-virtual build`). Build virtual models with `dbt-virtual build`. To enforce that, set [`require_cli_fingerprints: true`](configuration_reference.md): a bare `dbt run` / `dbt build` / `dbt retry` that selects a virtual `table` / `incremental` model then fails in `on-run-start`, before anything is built.
 
 ---
 
