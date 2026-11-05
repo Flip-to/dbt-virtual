@@ -1,6 +1,6 @@
 # `dbt-virtual`
 
-**SQLMesh-style Virtual Data Environments for dbt** (first-class **BigQuery** + **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks**) — `sqlglot` AST Merkle-DAG fingerprinting (`<model>__<fp>`), zero-copy `CLONE` incremental seeding with post-clone column migration, per-environment routine virtualization (`table_function`, `virtual_function`, `procedure`), one or several datasets per environment, pre-promotion quality gates (`audit`), concurrency lease locks (`_locks`), interval tracking (`_intervals`), zero-rebuild view-swap promotion (with partial promotion & automatic demotion), and instant rollback.
+**SQLMesh-style Virtual Data Environments for dbt** (first-class **BigQuery** + **Snowflake**, **DuckDB**, **PostgreSQL**, and **Databricks** (experimental: SQL checked as text only, never executed)) — `sqlglot` AST Merkle-DAG fingerprinting (`<model>__<fp>`), zero-copy `CLONE` incremental seeding with post-clone column migration, per-environment routine virtualization (`table_function`, `virtual_function`, `procedure`), one or several datasets per environment, pre-promotion quality gates (`audit`), concurrency lease locks (`_locks`), interval tracking (`_intervals`), zero-rebuild view-swap promotion (with partial promotion & automatic demotion), and instant rollback.
 
 [![CI](https://github.com/Flip-to/dbt-virtual/actions/workflows/ci.yml/badge.svg)](https://github.com/Flip-to/dbt-virtual/actions/workflows/ci.yml)
 [![Documentation](https://img.shields.io/badge/docs-GitHub_Pages-indigo?logo=materialformkdocs)](https://flip-to.github.io/dbt-virtual/)
@@ -30,7 +30,7 @@ In standard dbt deployments:
 
 | Capability | Standard dbt | `dbt-virtual` |
 |---|---|---|
-| **Supported Warehouses** | Adapter-specific | **BigQuery**, **Snowflake**, **DuckDB**, **PostgreSQL** (SQL executed in CI on emulators/engines), **Databricks** (macro harness only) |
+| **Supported Warehouses** | Adapter-specific | **BigQuery**, **Snowflake**, **DuckDB**, **PostgreSQL** (SQL executed in CI on emulators/engines), **Databricks** (**experimental**: macro harness only, SQL never executed) |
 | **Physical Storage** | Mutable in-place table (`prod.orders`) | Content-addressed (`analytics_physical.orders__8f3a9c1b2d4e`) |
 | **Environment Isolation** | Separate physical rebuilds per target | Lightweight per-environment `VIEW` layers (`analytics_staging.orders`, `analytics.orders`) |
 | **Modified Incrementals** | Full refresh or manual clone | Automatic zero-copy `CLONE` (BigQuery / Snowflake / Databricks) or CTAS seed (DuckDB / Postgres) from active `prod` table |

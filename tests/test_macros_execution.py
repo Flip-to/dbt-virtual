@@ -1197,3 +1197,22 @@ def test_promote_keeps_project_models_missing_from_the_release() -> None:
     executed = "\n".join(harness.executed_queries)
     assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`kept`" not in executed
     assert "DROP VIEW IF EXISTS `test_proj`.`analytics`.`removed`" in executed
+
+
+def test_databricks_logs_an_experimental_warning_and_other_adapters_do_not() -> None:
+    dbx = MacroTestHarness(adapter_type="databricks", target_name="prod")
+    dbx.call_macro("warn_if_experimental_adapter")
+    assert len([m for m in dbx.logs if "Databricks support is EXPERIMENTAL" in m]) == 1
+
+    # Lifecycle entry points call it, so a promote or init-env on Databricks warns too.
+    dbx_ops = MacroTestHarness(adapter_type="databricks", target_name="prod")
+    try:
+        dbx_ops.call_macro("virtual_init_env", env="pr_7", from_env="prod")
+    except RuntimeError:
+        pass  # no registry rows in the harness; the warning is logged before that
+    assert any("Databricks support is EXPERIMENTAL" in m for m in dbx_ops.logs)
+
+    for adapter_type in ("bigquery", "snowflake", "duckdb", "postgres"):
+        other = MacroTestHarness(adapter_type=adapter_type, target_name="prod")
+        other.call_macro("warn_if_experimental_adapter")
+        assert not any("EXPERIMENTAL" in m for m in other.logs)
