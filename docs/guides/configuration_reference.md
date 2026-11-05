@@ -62,6 +62,42 @@ Always set the keys you rely on: `vars` are not deep-merged, so a `vars.dbt_virt
 
 ---
 
+### `physical_schemas_by_location` (multi-region BigQuery)
+- **Type**: `dict[string, string]` (location to physical schema)
+- **Default when omitted**: `{}` (one physical schema, one registry)
+- **Example**:
+  ```yaml
+  vars:
+    dbt_virtual:
+      physical_schema: "rt_virtual_physical"            # default and EU
+      physical_schemas_by_location:
+        EU: "rt_virtual_physical"
+        US: "rt_virtual_physical_us"
+      schema_locations:                                  # optional: enables the mismatch check
+        rt: EU
+        rt_staging: EU
+        rt_us: US
+        rt_staging_us: US
+      env_schemas:
+        prod:    {default: "rt",         us: "rt_us"}
+        staging: {default: "rt_staging", us: "rt_staging_us"}
+  models:
+    my_project:
+      +virtual_env: true
+      us_marts:
+        +schema: us
+        +virtual_location: US
+  ```
+- **What it does**:
+  A BigQuery view cannot read a table in another location, `CLONE` needs the same location and a job runs in one location, so each location gets its own physical schema and its own registry (`_environments`, `_releases`, `_intervals`, `_locks`). A model's location is `+virtual_location` (or `meta.virtual_location`), else the profile's `location`. `physical_schema` is the schema for every location not listed and is iterated as a registry only when you set it yourself. A location with no entry and no `physical_schema`, or a model with no location, is a compiler error.
+  - **Routing**: physical tables go to their location's schema. Environment views and routines go to the environment dataset of the model's custom schema: map the custom schema of US models (`schema: us`) to a US dataset in `env_schemas`, as above.
+  - **Validation**: with `schema_locations` (dataset to location), parsing fails when a virtual model's physical dataset or the dataset of any environment in `env_schemas` is declared in another location than the model. Datasets you do not declare are not checked. With `schema_locations` set, an unmapped environment such as `pr_42` gets one schema per base schema (`rt_pr_42`, `rt_us_pr_42`).
+  - **Operations**: `promote`, `rollback`, `audit`, `gc`, `drop-env`, locks and `status` run once per location (one job per location); promote and rollback fail only when no location has the release. The `location` argument of the macros (`dbt run-operation virtual_promote --args '{..., location: US}'`) limits an operation to one location (`default` stands for `physical_schema`).
+  - **Datasets** the package creates are created with `OPTIONS (location = ...)`.
+  - **Jobs**: a dbt BigQuery connection has one job location. Leave `location` unset in the profile so BigQuery infers it from the dataset in each statement, or build each location with its own target and `--select`. Not verified on real BigQuery (see decision [`20261105_physical_location_per_region`](../decisions/20261105_physical_location_per_region.md)).
+
+---
+
 ### `environment`
 - **Type**: `string` (may contain Jinja)
 - **Default when omitted**: `target.name`
@@ -204,6 +240,14 @@ You can configure these parameters either in `dbt_project.yml` under `models:` (
   Enables `dbt-virtual` for the model or routine. Models without `virtual_env: true` are completely ignored by `dbt-virtual` and behave like standard dbt models.
 
 Virtual table and incremental models must keep dbt's alias equal to the model name. A custom `alias` (or a custom alias-generation macro) makes dbt `ref()` resolve to a different environment-view name than dbt-virtual creates; the planner and routing macro fail early with an error when they detect this configuration. Virtual model names must also be unique across the project (the planner fails on duplicates), because pointers are keyed by name.
+
+---
+
+### `virtual_location`
+- **Type**: `string` (a BigQuery location such as `EU`, `US`, `europe-west1`)
+- **Default**: the target's `location`, else none
+- **What it does**:
+  Location of the model's datasets in a project that sets [`physical_schemas_by_location`](#physical_schemas_by_location-multi-region-bigquery). Chooses the physical schema and registry of the model. Case is ignored. dbt-bigquery has no model-level `location` config, so this key is specific to dbt-virtual.
 
 ---
 

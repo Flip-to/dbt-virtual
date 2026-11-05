@@ -49,6 +49,7 @@ class MacroTestHarness:
         target_database: str = "test_proj",
         adapter_type: str = "bigquery",
         execute: bool = True,
+        target_location: str | None = None,
     ) -> None:
         self.vars_dict = vars_dict or {}
         self.target = {
@@ -57,6 +58,8 @@ class MacroTestHarness:
             "database": target_database,
             "type": adapter_type,
         }
+        if target_location is not None:
+            self.target["location"] = target_location
         self.adapter_type = adapter_type
         self.execute = execute
         self.existing_relations: set[tuple[str, str, str]] = set()
@@ -87,6 +90,7 @@ class MacroTestHarness:
         macro_files = [
             REPO / "macros" / "fingerprint" / "get_fingerprint.sql",
             REPO / "macros" / "routing" / "virtual_routing.sql",
+            REPO / "macros" / "routing" / "locations.sql",
             REPO / "macros" / "adapters" / "dispatch.sql",
             REPO / "macros" / "lifecycle" / "hooks.sql",
             REPO / "macros" / "lifecycle" / "registry_batch.sql",

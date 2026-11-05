@@ -70,19 +70,21 @@
 {%- endmacro %}
 
 
-{% macro create_schema_if_not_exists_sql(schema_name) -%}
-  {{ return(adapter.dispatch('create_schema_if_not_exists_sql', 'dbt_virtual')(schema_name)) }}
+{% macro create_schema_if_not_exists_sql(schema_name, location=none) -%}
+  {{ return(adapter.dispatch('create_schema_if_not_exists_sql', 'dbt_virtual')(schema_name, location)) }}
 {%- endmacro %}
 
-{% macro bigquery__create_schema_if_not_exists_sql(schema_name) -%}
-  CREATE SCHEMA IF NOT EXISTS `{{ target.database }}`.`{{ schema_name }}`
+{% macro bigquery__create_schema_if_not_exists_sql(schema_name, location=none) -%}
+  {#- `location` pins the dataset to a BigQuery location; dbt-bigquery's own `create schema` leaves
+      it to the job's location. -#}
+  CREATE SCHEMA IF NOT EXISTS `{{ target.database }}`.`{{ schema_name }}`{{ " OPTIONS (location = '" ~ location ~ "')" if location is not none else "" }}
 {%- endmacro %}
 
-{% macro snowflake__create_schema_if_not_exists_sql(schema_name) -%}
+{% macro snowflake__create_schema_if_not_exists_sql(schema_name, location=none) -%}
   CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
 {%- endmacro %}
 
-{% macro default__create_schema_if_not_exists_sql(schema_name) -%}
+{% macro default__create_schema_if_not_exists_sql(schema_name, location=none) -%}
   CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
 {%- endmacro %}
 
