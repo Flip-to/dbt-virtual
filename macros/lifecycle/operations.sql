@@ -21,11 +21,11 @@
 {% macro ensure_schema_exists(schema_name, location=none) -%}
   {#- Creates `schema_name` through the adapter (dataset location and permissions as dbt uses them).
       In a multi-location project the dataset is created in `location` explicitly. -#}
-  {%- if adapter.check_schema_exists is defined and not adapter.check_schema_exists(target.database, schema_name) -%}
+  {%- if adapter.check_schema_exists is defined and not adapter.check_schema_exists(dbt_virtual.active_database(), schema_name) -%}
     {%- if dbt_virtual.create_location_for(location) is not none -%}
       {%- do dbt_virtual.exec_sql_statement(dbt_virtual.create_schema_if_not_exists_sql(schema_name, dbt_virtual.create_location_for(location))) -%}
     {%- else -%}
-      {%- do adapter.create_schema(api.Relation.create(database=target.database, schema=schema_name)) -%}
+      {%- do adapter.create_schema(api.Relation.create(database=dbt_virtual.active_database(), schema=schema_name)) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endmacro %}
@@ -125,7 +125,7 @@
 {%- endmacro %}
 
 
-{% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0, location=none, check_coverage=true, coverage_ignore_before='') -%}
+{% macro virtual_audit(from_env='staging', to_env='prod', release_id='', allow_empty=false, max_row_drop_pct=100.0, location=none, check_coverage=true, coverage_ignore_before='', source_database='', source_schema='') -%}
   {#-
     SQLMesh-style pre-promotion quality gate:
     1. Resolves candidate `model` tables for `release_id` (or `from_env`).
@@ -139,19 +139,23 @@
   -#}
   {%- if location is none and dbt_virtual.is_multi_location() -%}
     {%- for loc in dbt_virtual.physical_locations() -%}
-      {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=allow_empty, max_row_drop_pct=max_row_drop_pct, location=loc) -%}
+      {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=allow_empty, max_row_drop_pct=max_row_drop_pct, location=loc, source_database=source_database, source_schema=source_schema) -%}
     {%- endfor -%}
     {{ return('') }}
   {%- endif -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {#- Candidates may live in another project (see `promotion_source`); the audited `to_env` is here. -#}
+  {%- set source = dbt_virtual.promotion_source(from_env, to_env, release_id, source_database, source_schema, phys_schema) -%}
+  {%- set src_schema = source['schema'] -%}
+  {%- set src_db = source['database'] -%}
   {%- set ignore_before = coverage_ignore_before if coverage_ignore_before != '' else (cfg.get('coverage_ignore_before') or '') -%}
   {%- set coverage_skip_logged = namespace(value=false) -%}
 
   {%- if release_id != '' -%}
     {%- set cand_query -%}
       SELECT model_name, physical_identifier
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
+      FROM {{ dbt_virtual.registry_relation(src_schema, '_releases', src_db) }}
       WHERE release_id = '{{ release_id }}'
         AND resource_type = 'model'
       ORDER BY model_name ASC
@@ -159,7 +163,7 @@
   {%- else -%}
     {%- set cand_query -%}
       SELECT model_name, physical_identifier
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+      FROM {{ dbt_virtual.registry_relation(src_schema, '_environments', src_db) }}
       WHERE environment = '{{ from_env }}'
         AND resource_type = 'model'
       ORDER BY model_name ASC
@@ -190,14 +194,14 @@
     {%- set model_name = row[0] -%}
     {%- set cand_ident = row[1] -%}
     {%- set cand_tbl = cand_ident.split('.')[-1] -%}
-    {%- set cand_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=cand_tbl, type='table') -%}
+    {%- set cand_rel = api.Relation.create(database=src_db, schema=src_schema, identifier=cand_tbl, type='table') -%}
     {%- set cand_cnt_res = run_query(dbt_virtual.row_count_sql(cand_rel)) -%}
     {%- set cand_cnt = cand_cnt_res.rows[0][0] | int if (cand_cnt_res and (cand_cnt_res.rows | length) > 0) else 0 -%}
 
     {%- set base_ident = base_map.get(model_name, '') -%}
     {%- if base_ident != '' -%}
       {%- set base_tbl = base_ident.split('.')[-1] -%}
-      {%- set base_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=base_tbl, type='table') -%}
+      {%- set base_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=base_tbl, type='table') -%}
       {%- set base_cnt_res = run_query(dbt_virtual.row_count_sql(base_rel)) -%}
       {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
 
@@ -296,9 +300,9 @@
   {%- endset -%}
   {#- A project that has never built or promoted has no registry (and maybe no physical schema):
       report empty state instead of failing on the missing relation. -#}
-  {%- set schema_exists = adapter.check_schema_exists(target.database, phys_schema) -%}
-  {%- set registry_exists = schema_exists and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_environments') is not none
-      and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') is not none -%}
+  {%- set schema_exists = adapter.check_schema_exists(dbt_virtual.active_database(), phys_schema) -%}
+  {%- set registry_exists = schema_exists and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_environments') is not none
+      and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_releases') is not none -%}
   {%- set env_rows = run_query(env_query) if registry_exists else none -%}
 
   {%- set env_state = {} -%}
@@ -360,7 +364,26 @@
     {%- endif -%}
   {%- endfor -%}
 
+  {#- DECISION(cross_project_promote_by_clone): the base environment's pointers and tables are read
+      from its own location when `physical_locations` puts it elsewhere, so a CI run sees prod. -#}
+  {%- set base_loc = dbt_virtual.seed_base_location(base_env, phys_schema) -%}
+  {%- set base_tables = [] -%}
+  {%- if base_loc['cross'] and adapter.get_relation(database=base_loc['database'], schema=base_loc['schema'], identifier='_environments') is not none -%}
+    {%- set base_cross_rows = run_query("SELECT model_name, fingerprint FROM " ~ dbt_virtual.registry_relation(base_loc['schema'], '_environments', base_loc['database']) ~ " WHERE environment = '" ~ base_env ~ "' AND resource_type = 'model'") -%}
+    {%- if base_cross_rows -%}
+      {%- for r in base_cross_rows.rows -%}
+        {%- do base_env_state.update({r[0]: r[1]}) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- set base_tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(base_loc['schema'], base_loc['database'])) -%}
+    {%- if base_tbl_rows -%}
+      {%- for r in base_tbl_rows.rows -%}
+        {%- do base_tables.append(r[0]) -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
   {%- set payload = {
+    'base_physical_tables': base_tables,
     'partial_physical_tables': partial_tables | sort,
     'registered_physical_tables': registered_tables | unique | list | sort,
     'env': env,
@@ -429,6 +452,8 @@
       'physical_identifier': row[3],
       'routine_ddl': row[4],
       'schema_key': dbt_virtual.row_value(row, schema_key_index),
+      'build_quality': dbt_virtual.row_value(row, 7),
+      'sealed_at': dbt_virtual.row_value(row, 8),
       'group': 0 if row[1] == 'model' else 1,
       'depth': depths.get(row[0], 0),
       'rank': {'view': 0, 'function': 1, 'virtual_function': 1, 'table_function': 2}.get(row[1], 3)
@@ -438,9 +463,13 @@
 {%- endmacro %}
 
 
-{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='', data_diff=false, data_diff_max_mismatch_pct=none) -%}
+{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='', location=none, skip_empty=false, expected_fps_json='', allow_unsealed=false, require_sealed=false, check_coverage=true, coverage_ignore_before='', data_diff=false, data_diff_max_mismatch_pct=none, source_database='', source_schema='') -%}
   {#-
     Zero-rebuild promotion:
+    -1. Cross-location (`physical_locations`, or `source_database` / `source_schema`): when the release
+       lives in another project or schema than `to_env`'s location, each model table is CLONEd into
+       the target location first (skipped when present), the release rows are copied into the target
+       registry, and the target views point at the clones. DECISION(cross_project_promote_by_clone).
     0. Guards (guards.sql), checked before anything is changed; the macro raises listing every problem:
        - `expected_fps_json` (`{model: fingerprint}` of the `to_env` code; the CLI always passes it): a
          release row with another fingerprint was built from different code or variables.
@@ -474,6 +503,11 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
   {%- set ensured_schemas = [] -%}
+  {%- set source = dbt_virtual.promotion_source(from_env, to_env, release_id, source_database, source_schema, phys_schema) -%}
+  {%- set cross = source['cross'] -%}
+  {%- set src_schema = source['schema'] -%}
+  {%- set src_db = source['database'] -%}
+  {%- set cross_release_values = [] -%}
   {%- do dbt_virtual.ensure_registry() -%}
   {%- set authorized_schemas = [] -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
@@ -482,7 +516,7 @@
   {%- endif -%}
 
   {%- if audit -%}
-    {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct, location=location, check_coverage=check_coverage, coverage_ignore_before=coverage_ignore_before) -%}
+    {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct, location=location, check_coverage=check_coverage, coverage_ignore_before=coverage_ignore_before, source_database=source_database, source_schema=source_schema) -%}
   {%- endif -%}
 
   {%- if data_diff -%}
@@ -502,7 +536,7 @@
         schema_key,
         build_quality,
         sealed_at
-      FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }}
+      FROM {{ dbt_virtual.registry_relation(src_schema, '_releases', src_db) }}
       WHERE release_id = '{{ release_id }}'
       ORDER BY CASE resource_type WHEN 'model' THEN 1 WHEN 'function' THEN 2 WHEN 'table_function' THEN 3 ELSE 4 END ASC, model_name ASC
     {%- endset -%}
@@ -568,9 +602,9 @@
     {%- set phys_ident = item['physical_identifier'] -%}
     {%- if resource_type == 'model' -%}
       {%- set phys_table = phys_ident.split('.')[-1] -%}
-      {%- set exists_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) -%}
+      {%- set exists_rel = adapter.get_relation(database=src_db, schema=src_schema, identifier=phys_table) -%}
       {%- if exists_rel is none -%}
-        {{ exceptions.raise_compiler_error("dbt-virtual promote pre-flight failed: physical table " ~ phys_schema ~ "." ~ phys_table ~ " for model " ~ model_name ~ " does not exist.") }}
+        {{ exceptions.raise_compiler_error("dbt-virtual promote pre-flight failed: physical table " ~ src_db ~ "." ~ src_schema ~ "." ~ phys_table ~ " for model " ~ model_name ~ " does not exist.") }}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
@@ -609,7 +643,7 @@
     {%- do promoted_names.append(model_name) -%}
 
     {%- if resource_type == 'model' -%}
-      {%- set target_phys_ident = phys_ident -%}
+      {%- set target_phys_ident = (phys_schema ~ '.' ~ phys_ident.split('.')[-1]) if cross else phys_ident -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set target_phys_ident = to_schema ~ '.' ~ model_name -%}
     {%- else -%}
@@ -626,19 +660,26 @@
       {%- endif -%}
       {%- if resource_type == 'model' -%}
         {%- set phys_table = phys_ident.split('.')[-1] -%}
-        {%- set existing_target_rel = adapter.get_relation(database=target.database, schema=to_schema, identifier=model_name) -%}
+        {%- set existing_target_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=to_schema, identifier=model_name) -%}
         {%- if existing_target_rel is not none and existing_target_rel.type is defined and existing_target_rel.type == 'table' -%}
           {{ log("dbt-virtual promote [" ~ to_env ~ "]: Dropping legacy physical table " ~ existing_target_rel ~ " before creating virtual view", info=True) }}
           {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(existing_target_rel, 'table')) -%}
         {%- endif -%}
-        {%- set view_rel = api.Relation.create(database=target.database, schema=to_schema, identifier=model_name, type='view') -%}
-        {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
+        {%- set view_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=to_schema, identifier=model_name, type='view') -%}
+        {%- set phys_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table, type='table') -%}
+        {%- if cross -%}
+          {%- do dbt_virtual.clone_into_location(src_db, src_schema, phys_rel) -%}
+        {%- endif -%}
 
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
         {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
         {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
       {%- elif routine_ddl is not none and routine_ddl != '' -%}
         {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, to_env) -%}
+        {%- if cross and src_db != dbt_virtual.active_database() -%}
+          {#- The template names the source project; deploy into the target project instead. -#}
+          {%- set rendered_ddl = modules.re.sub('(?<![0-9A-Za-z_-])' ~ modules.re.escape(src_db) ~ '(?![0-9A-Za-z_-])', dbt_virtual.active_database(), rendered_ddl) -%}
+        {%- endif -%}
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying " ~ resource_type ~ " " ~ to_schema ~ "." ~ model_name, info=True) }}
         {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
         {%- if resource_type != 'view' -%}
@@ -665,10 +706,15 @@
       release_id,
       schema_key
     )) -%}
-    {%- if resource_type == 'model' and not unchanged -%}
+    {%- if resource_type == 'model' and not unchanged and not cross -%}
       {#- The promoted table and the environment's companion state (e.g. an incremental manifest)
           must describe the same data. -#}
       {%- do dbt_virtual.restore_companion_state(model_name, fp, to_env, prefer_env=from_env) -%}
+    {%- endif -%}
+    {%- if cross -%}
+      {%- do cross_release_values.append(dbt_virtual.promoted_release_values_sql(
+        release_id, from_env, to_env, item, target_phys_ident
+      )) -%}
     {%- endif -%}
   {%- endfor -%}
 
@@ -688,7 +734,7 @@
       {{ log("dbt-virtual promote [" ~ to_env ~ "]: Keeping " ~ old_type ~ " " ~ old_name ~ " (not in release " ~ release_id ~ " but still a virtual model in this project)", info=True) }}
     {%- elif old_name not in promoted_names -%}
       {%- set demote_schema = dbt_virtual.env_schema_for(to_env, existing_key_map.get(old_name)) -%}
-      {%- set demote_rel = api.Relation.create(database=target.database, schema=demote_schema, identifier=old_name, type='view') -%}
+      {%- set demote_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=demote_schema, identifier=old_name, type='view') -%}
       {{ log("dbt-virtual demote [" ~ to_env ~ "]: Removing demoted " ~ old_type ~ " " ~ demote_rel, info=True) }}
       {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(demote_rel, old_type)) -%}
       {%- do dbt_virtual.exec_ddl_dml(
@@ -710,12 +756,85 @@
     ) -%}
   {%- endif -%}
 
-  {%- if release_id != '' -%}
+  {%- if cross and release_id != '' -%}
+    {#- The source registry belongs to another service account: record the release in the target registry. -#}
+    {%- set releases_rel = dbt_virtual.registry_relation(phys_schema, '_releases') -%}
+    {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ releases_rel ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
+    {%- for batch in cross_release_values | batch(100) -%}
+      {%- do dbt_virtual.exec_sql_statement(
+        "INSERT INTO " ~ releases_rel ~ " (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, routine_ddl_template, status, created_at, promoted_at, rolled_back_at, schema_key, build_quality, sealed_at) VALUES "
+        ~ (batch | join(', '))
+      ) -%}
+    {%- endfor -%}
+  {%- elif release_id != '' -%}
     {%- do dbt_virtual.exec_ddl_dml("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
   {%- endif -%}
   {%- if lock -%}
     {%- do dbt_virtual.virtual_release_lock(env=to_env, owner=owner, location=location) -%}
   {%- endif -%}
+{%- endmacro %}
+
+
+{% macro promotion_source(from_env, to_env, release_id, source_database, source_schema, phys_schema) -%}
+  {#-
+    DECISION(cross_project_promote_by_clone): where the release or `from_env` lives, and whether
+    that differs from the target location. Without `physical_locations` and without an explicit
+    `source_database` / `source_schema` nothing is cross-location (previous behaviour).
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set here_db = dbt_virtual.active_database() -%}
+  {%- if not (cfg.get('physical_locations') or {}) and source_database == '' and source_schema == '' -%}
+    {{ return({'cross': false, 'database': here_db, 'schema': phys_schema}) }}
+  {%- endif -%}
+  {%- set src = dbt_virtual.physical_location(from_env) -%}
+  {%- set src = {'database': source_database or src['database'], 'schema': source_schema or src['schema']} -%}
+  {%- set here = {'database': here_db, 'schema': phys_schema} -%}
+  {%- if dbt_virtual.same_location(src, here) -%}
+    {{ return({'cross': false, 'database': here_db, 'schema': phys_schema}) }}
+  {%- endif -%}
+  {%- if dbt_virtual.is_multi_location() -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual promote: cross-project promotion cannot be combined with physical_schemas_by_location.") }}
+  {%- endif -%}
+  {%- if release_id == '' -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual promote: env=" ~ from_env ~ " lives in " ~ src['database'] ~ "." ~ src['schema'] ~ ", not in " ~ here_db ~ "." ~ phys_schema ~ ". Cross-location promotion needs a release (clones are registered from its rows); `init-env` across locations is not supported.") }}
+  {%- endif -%}
+  {%- set to_loc = dbt_virtual.physical_location(to_env) -%}
+  {%- if not dbt_virtual.same_location(to_loc, here) -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual promote: env=" ~ to_env ~ " lives in " ~ to_loc['database'] ~ "." ~ to_loc['schema'] ~ " but this run's environment (target " ~ target.name ~ ") uses " ~ here_db ~ "." ~ phys_schema ~ ". Run promote with the target of the environment you promote to (`dbt-virtual --target " ~ to_env ~ " promote ...`).") }}
+  {%- endif -%}
+  {{ return({'cross': true, 'database': src['database'], 'schema': src['schema']}) }}
+{%- endmacro %}
+
+
+{% macro clone_into_location(source_database, source_schema, target_relation) -%}
+  {#- Zero-copy clone of `<source_database>.<source_schema>.<table>` to `target_relation`, if absent. -#}
+  {%- if adapter.get_relation(database=target_relation.database, schema=target_relation.schema, identifier=target_relation.identifier) is none -%}
+    {%- do dbt_virtual.ensure_schema_exists(target_relation.schema) -%}
+    {%- set source_rel = api.Relation.create(database=source_database, schema=source_schema, identifier=target_relation.identifier, type='table') -%}
+    {{ log("dbt-virtual promote: cloning " ~ source_rel ~ " -> " ~ target_relation, info=True) }}
+    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.clone_table_sql(source_rel, target_relation)) -%}
+    {%- if adapter.cache_added is defined -%}
+      {%- do adapter.cache_added(target_relation) -%}
+    {%- endif -%}
+  {%- else -%}
+    {{ log("dbt-virtual promote: " ~ target_relation ~ " already exists; not cloning.", info=True) }}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro promoted_release_values_sql(release_id, from_env, to_env, item, target_phys_ident) -%}
+  {#- One `_releases` VALUES tuple for an object promoted from another location. `item` is a row
+      of `ordered_registry_rows`. -#}
+  {%- set row_tier = {'function': 1, 'virtual_function': 1, 'model': 2, 'view': 2, 'table_function': 3}.get(item['resource_type'], 4) -%}
+  {{ return(
+    "('" ~ release_id ~ "', '" ~ from_env ~ "', '" ~ to_env ~ "', '" ~ item['model_name'] ~ "', '" ~ item['resource_type'] ~ "', "
+    ~ row_tier ~ ", '" ~ item['fingerprint'] ~ "', '" ~ target_phys_ident ~ "', "
+    ~ (dbt_virtual.sql_string_literal(item['routine_ddl']) if item['routine_ddl'] is not none else 'NULL')
+    ~ ", 'promoted', " ~ dbt_virtual.current_timestamp_sql() ~ ", " ~ dbt_virtual.current_timestamp_sql() ~ ", NULL, "
+    ~ dbt_virtual.sql_nullable_literal(item['schema_key']) ~ ", "
+    ~ dbt_virtual.sql_nullable_literal(item['build_quality']) ~ ", "
+    ~ (dbt_virtual.current_timestamp_sql() if item['sealed_at'] is not none else 'NULL') ~ ")"
+  ) }}
 {%- endmacro %}
 
 
@@ -747,8 +866,8 @@
       {%- do ensured_schemas.append(env_schema) -%}
     {%- endif -%}
     {%- set phys_table = model_name ~ '__' ~ fp -%}
-    {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
-    {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
+    {%- set view_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name, type='view') -%}
+    {%- set phys_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table, type='table') -%}
 
     {{ log("dbt-virtual reuse [" ~ env ~ "]: Pointing " ~ view_rel ~ " -> " ~ phys_rel ~ " (zero compute)", info=True) }}
     {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
@@ -966,7 +1085,7 @@
   {%- for item in ordered -%}
     {%- if item['resource_type'] == 'model' -%}
       {%- set phys_table = item['physical_identifier'].split('.')[-1] -%}
-      {%- if adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) is none -%}
+      {%- if adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table) is none -%}
         {{ exceptions.raise_compiler_error("dbt-virtual rollback pre-flight failed: physical table " ~ phys_schema ~ "." ~ phys_table ~ " of release " ~ target_release ~ " (model " ~ item['model_name'] ~ ") does not exist.") }}
       {%- endif -%}
     {%- endif -%}
@@ -988,8 +1107,8 @@
 
     {%- if resource_type == 'model' -%}
       {%- set phys_table = phys_ident.split('.')[-1] -%}
-      {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
-      {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
+      {%- set view_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name, type='view') -%}
+      {%- set phys_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table, type='table') -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Re-pointing " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
       {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
       {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
@@ -1039,7 +1158,7 @@
   {%- for removed_name, removed_type in current_env_types.items() -%}
     {%- if removed_name not in rollback_names -%}
       {%- set removed_schema = dbt_virtual.env_schema_for(env, current_env_keys.get(removed_name)) -%}
-      {%- set removed_rel = api.Relation.create(database=target.database, schema=removed_schema, identifier=removed_name, type='view') -%}
+      {%- set removed_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=removed_schema, identifier=removed_name, type='view') -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Removing post-release " ~ removed_type ~ " " ~ removed_rel, info=True) }}
       {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(removed_rel, removed_type)) -%}
       {%- do dbt_virtual.exec_ddl_dml(
@@ -1122,7 +1241,7 @@
 
   {%- for row in orphans.rows -%}
     {%- set tbl = row[0] -%}
-    {%- set drop_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=tbl, type='table') -%}
+    {%- set drop_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=tbl, type='table') -%}
     {%- if dry_run -%}
       {{ log("dbt-virtual gc [DRY-RUN]: Would drop " ~ drop_rel, info=True) }}
     {%- else -%}
@@ -1182,9 +1301,9 @@
       {%- if mat in ['table', 'incremental'] -%}
         {%- set phys_table = model_name ~ '__' ~ fp -%}
         {%- set phys_ident = phys_schema ~ '.' ~ phys_table -%}
-        {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
-        {%- set existing_rel = adapter.get_relation(database=target.database, schema=env_schema, identifier=model_name) -%}
-        {%- set phys_exists = adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) is not none -%}
+        {%- set phys_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table, type='table') -%}
+        {%- set existing_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name) -%}
+        {%- set phys_exists = adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier=phys_table) is not none -%}
 
         {%- if existing_rel is not none and existing_rel.type is defined and existing_rel.type == 'view' -%}
           {#- Already a view (adopted before, or a view model): a view cannot be cloned. -#}
@@ -1197,7 +1316,7 @@
             {%- if existing_rel.type is not defined or existing_rel.type != 'view' -%}
               {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(existing_rel, 'table')) -%}
             {%- endif -%}
-            {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
+            {%- set view_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=env_schema, identifier=model_name, type='view') -%}
             {%- do dbt_virtual.create_env_view(view_rel, phys_rel, node, phys_schema, authorized_schemas) -%}
           {%- endif -%}
           {%- set phys_exists = true -%}
@@ -1280,7 +1399,7 @@
   {%- if mat == 'view' -%}
     {%- set resource_type = 'view' -%}
     {%- set dep_tier = 2 -%}
-    {%- set deployed = adapter.get_relation(database=target.database, schema=env_schema, identifier=name) is not none -%}
+    {%- set deployed = adapter.get_relation(database=dbt_virtual.active_database(), schema=env_schema, identifier=name) is not none -%}
   {%- else -%}
     {%- set resource_type = 'function' if mat == 'virtual_function' else mat -%}
     {%- set dep_tier = 1 if resource_type == 'function' else (3 if resource_type == 'table_function' else 4) -%}
@@ -1304,7 +1423,7 @@
     {{ return(none) }}
   {%- endif -%}
 
-  {%- set rel = api.Relation.create(database=target.database, schema=env_schema, identifier=name, type=('external' if (target.type == 'bigquery' and resource_type != 'view') else 'view')) -%}
+  {%- set rel = api.Relation.create(database=dbt_virtual.active_database(), schema=env_schema, identifier=name, type=('external' if (target.type == 'bigquery' and resource_type != 'view') else 'view')) -%}
   {%- if resource_type == 'view' -%}
     {%- set ddl = 'CREATE OR REPLACE VIEW ' ~ rel ~ ' AS\n' ~ body -%}
   {%- else -%}

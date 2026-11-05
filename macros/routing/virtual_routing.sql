@@ -1,3 +1,14 @@
+{% macro virtual_database_name(custom_database_name, node) -%}
+  {#- DECISION(cross_project_promote_by_clone): a virtual node is built in the database of the
+      current environment's location (`physical_locations`), e.g. the CI project for `pr_42`.
+      Use from `generate_database_name`; without `physical_locations` it is `target.database`. -#}
+  {%- if dbt_virtual.is_virtual_node(node) -%}
+    {{ return(dbt_virtual.active_database()) }}
+  {%- endif -%}
+  {{ return(custom_database_name if custom_database_name is not none else target.database) }}
+{%- endmacro %}
+
+
 {% macro virtual_schema_name(custom_schema_name, node) -%}
   {%- if dbt_virtual.is_virtual_node(node) -%}
     {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}

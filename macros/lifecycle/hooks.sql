@@ -4,7 +4,7 @@
       `location` selects the registry of that location (`physical_schemas_by_location`). -#}
   {%- if execute -%}
     {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
-    {%- set releases_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') -%}
+    {%- set releases_rel = adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_releases') -%}
     {%- if releases_rel is none -%}
       {%- if dbt_virtual.create_location_for(location) is not none -%}
         {%- do dbt_virtual.exec_sql_statement(dbt_virtual.create_schema_if_not_exists_sql(phys_schema, dbt_virtual.create_location_for(location))) -%}
@@ -252,8 +252,13 @@
     {%- set phys_schema = dbt_virtual.physical_schema_for_node(node) -%}
     {%- if phys_schema not in seed_info -%}
       {%- do dbt_virtual.ensure_registry(dbt_virtual.node_location(node)) -%}
-      {%- do seed_info.update({phys_schema: dbt_virtual.seed_registry_info(phys_schema, base_env)}) -%}
+      {#- DECISION(cross_project_promote_by_clone): with `physical_locations` the base environment's
+          registry and tables may live in another project; they are read from there and cloned here. -#}
+      {%- set base_loc = dbt_virtual.seed_base_location(base_env, phys_schema) -%}
+      {%- do seed_info.update({phys_schema: dbt_virtual.seed_registry_info(phys_schema, base_env, base_loc['schema'], base_loc['database'])}) -%}
+      {%- do seed_info[phys_schema].update({'base_loc': base_loc}) -%}
     {%- endif -%}
+    {%- set base_loc = seed_info[phys_schema]['base_loc'] -%}
     {%- set base_map = seed_info[phys_schema]['base_map'] -%}
     {%- set registered = seed_info[phys_schema]['registered'] -%}
     {%- set base_fp_map = seed_info[phys_schema]['base_fp_map'] -%}
@@ -280,8 +285,8 @@
     {%- set cloned = false -%}
     {%- set base_ident = base_map.get(node_name, '') -%}
     {%- set base_table_name = base_ident.split('.')[-1] if base_ident else '' -%}
-    {%- if base_table_name != '' and base_table_name != target_rel.identifier and existing_target is none -%}
-      {%- set source_rel = api.Relation.create(database=node_db, schema=phys_schema, identifier=base_table_name, type='table') -%}
+    {%- if base_table_name != '' and (base_table_name != target_rel.identifier or base_loc['cross']) and existing_target is none -%}
+      {%- set source_rel = api.Relation.create(database=(base_loc['database'] if base_loc['cross'] else node_db), schema=(base_loc['schema'] if base_loc['cross'] else phys_schema), identifier=base_table_name, type='table') -%}
       {%- set shape_matches = true -%}
       {%- if adapter.is_replaceable is defined and adapter.parse_partition_by is defined -%}
         {#- A CLONE keeps the base table's partitioning and clustering; when the model changed
@@ -729,17 +734,38 @@
 {%- endmacro %}
 
 
-{% macro seed_registry_info(phys_schema, base_env) -%}
+{% macro seed_base_location(base_env, phys_schema) -%}
+  {#- Where `base_env`'s registry and tables live, and whether that differs from this environment's
+      location (`physical_locations`). Without `physical_locations` it never does. -#}
+  {%- if not (dbt_virtual.get_config().get('physical_locations') or {}) -%}
+    {{ return({'cross': false, 'database': none, 'schema': none}) }}
+  {%- endif -%}
+  {%- set base_loc = dbt_virtual.physical_location(base_env) -%}
+  {%- set here = {'database': dbt_virtual.active_database(), 'schema': phys_schema} -%}
+  {%- if dbt_virtual.same_location(base_loc, here) -%}
+    {{ return({'cross': false, 'database': none, 'schema': none}) }}
+  {%- endif -%}
+  {{ return({'cross': true, 'database': base_loc['database'], 'schema': base_loc['schema']}) }}
+{%- endmacro %}
+
+
+{% macro seed_registry_info(phys_schema, base_env, base_schema=none, base_database=none) -%}
   {#- What `seed_incremental_clones` needs from one registry: the physical table `base_env` points
       at per model, and the tables some environment or release points at, i.e. written by a build
       that finished. -#}
   {%- set base_query -%}
     SELECT model_name, physical_identifier, fingerprint
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    FROM {{ dbt_virtual.registry_relation(base_schema or phys_schema, '_environments', base_database) }}
     WHERE environment = '{{ base_env }}'
       AND resource_type = 'model'
   {%- endset -%}
-  {%- set base_rows = run_query(base_query) -%}
+  {#- The base registry may not exist yet (or not be visible to this service account). -#}
+  {%- if base_database is not none and adapter.get_relation(database=base_database, schema=base_schema, identifier='_environments') is none -%}
+    {{ log("dbt-virtual: base registry " ~ base_database ~ "." ~ base_schema ~ " not found; nothing to seed from.", info=True) }}
+    {%- set base_rows = none -%}
+  {%- else -%}
+    {%- set base_rows = run_query(base_query) -%}
+  {%- endif -%}
   {%- set base_map = {} -%}
   {%- set base_fp_map = {} -%}
   {%- if base_rows -%}
