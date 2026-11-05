@@ -401,6 +401,18 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     restored = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest` ORDER BY model")
     assert restored == [{"model": "inc_m", "d": "2026-11-01"}, {"model": "other", "d": "2026-01-01"}], restored
     print("[companion] state saved when the env left fp1, restored on return; other models' rows untouched.")
+
+    # Pilot finding: `promote` decided its default audit from the raw `base_environment`, so a Jinja
+    # value never matched `--to`. `virtual_print_base_environment` renders it like the macros do
+    # (the CLI parses this line); it must follow the target. `dbt` itself cannot run on the emulator,
+    # so the CLI half (`--select` vs REUSE, `DBT_EMPTY` on compile) is covered by
+    # tests/test_pilot_fixes_bigquery.py and tests/test_dbt_duckdb_pilot_fixes.py.
+    jinja_base = "{{ 'e2e_stg' if target.name == 'staging' else 'e2e_prod' }}"
+    for target_name, expected_base in (("staging", "e2e_stg"), ("prod", "e2e_prod")):
+        hb = make_harness(extra_cfg={"base_environment": jinja_base}, target_name=target_name)
+        hb.call_macro("virtual_print_base_environment")
+        assert f"DBT_VIRTUAL_BASE_ENV:{expected_base}" in hb.logs, hb.logs
+    print("[base_environment] a Jinja base_environment is rendered per target.")
     return skipped
 
 
