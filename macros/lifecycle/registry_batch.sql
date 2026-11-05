@@ -91,12 +91,12 @@
       {%- set alias = dbt_virtual.node_attr(node, 'alias', name) or name -%}
       {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
       {%- if mat in ['table', 'incremental'] -%}
-        {#- Same rule as `sync_env_view`: register the fingerprint that is in the physical name. -#}
+        {#- Same rule as `sync_env_view`: with CLI/env fingerprints, the one in the physical name; on a bare run, the run-time Merkle fingerprint. -#}
         {%- set fp_prefix = name ~ '__' -%}
-        {%- if alias.startswith(fp_prefix) -%}
+        {%- if alias.startswith(fp_prefix) and name in dbt_virtual.get_precomputed_fps() -%}
           {%- set fp = alias[(fp_prefix | length):] -%}
         {%- else -%}
-          {%- set fp = dbt_virtual.get_fingerprint(node) -%}
+          {%- set fp = dbt_virtual.runtime_fingerprint(node) -%}
         {%- endif -%}
         {%- do rows.append({
           'name': name, 'resource_type': 'model', 'fingerprint': fp,
@@ -201,7 +201,7 @@
 
 {% macro snapshot_models_map() -%}
   {#- Current virtual nodes as `{name: {fingerprint, materialized}}`, from the graph and `_dbt_virtual_fps`. -#}
-  {%- set fps = var('_dbt_virtual_fps', {}) -%}
+  {%- set fps = dbt_virtual.get_precomputed_fps() -%}
   {%- set out = {} -%}
   {%- if graph is defined and graph.nodes is defined -%}
     {%- for node in graph.nodes.values() -%}

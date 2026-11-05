@@ -22,3 +22,5 @@ in place, including one another environment points at. See
 | Reviewed | pending | | pending | |
 | Shipped | pending | | pending | |
 | Verified | pending | | pending | |
+| Built (2) | Agent: Claude (subagent of session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | `dbt-virtual dbt <args>` passthrough (cached `.dbt_virtual/fingerprints.json`), `plan --print-fps` + `DBT_VIRTUAL_FPS` env source in `get_precomputed_fps()`, `guard_shared_tables` (default true) in `assert_shared_tables_safe()`; bare runs register the run-time Merkle fingerprint | branch claude/dbt-virtual-dbt-passthrough | 2026-11-05 |
+| Proven (2) | pending CI | `tests/test_dbt_passthrough.py` 18 tests; full suite run 2026-11-05: 120 passed, 9 failed (mock harness lacked `env_var`, one registered-fp assertion); after fixing, the affected files re-ran green (69 + 8 passed); no single full rerun after the fix | L3: `test_guard_refuses_bare_run_that_would_rewrite_a_table_prod_points_at` (guard off = `test_guard_can_be_turned_off` runs through), `test_env_var_fingerprints_make_plain_dbt_run_use_merkle_names` | 2026-11-05 |

@@ -486,8 +486,12 @@ def compute_manifest_fingerprints(
 def write_fingerprints_file(
     fingerprints: dict[str, NodeFingerprint],
     output_path: Path,
+    cache: dict | None = None,
 ) -> None:
-    """Write computed fingerprints to `.dbt_virtual/fingerprints.json`."""
+    """Write computed fingerprints to `.dbt_virtual/fingerprints.json`.
+
+    `cache` (inputs hash + manifest checksum) lets `dbt-virtual dbt` skip `dbt compile` next time.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
@@ -495,4 +499,6 @@ def write_fingerprints_file(
         "nodes": {uid: fp.to_dict() for uid, fp in sorted(fingerprints.items())},
         "by_name": {fp.name: fp.fingerprint for fp in sorted(fingerprints.values(), key=lambda x: x.name)},
     }
+    if cache is not None:
+        data["cache"] = cache
     output_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

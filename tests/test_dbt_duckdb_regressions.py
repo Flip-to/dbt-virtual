@@ -312,6 +312,8 @@ def test_bare_dbt_run_renders_nested_config_and_registers_physical_fingerprint(m
     )
     assert [r[0] for r in rows] == ["staging", "staging"]
     for _env, name, fingerprint, physical_identifier in rows:
-        # The registered fingerprint is the one in the physical table name.
-        assert physical_identifier == f"analytics_physical.{name}__{fingerprint}"
+        # A bare run registers the run-time Merkle fingerprint (parents included), which
+        # `guard_shared_tables` compares; the physical name is the parse-time alias.
+        assert physical_identifier.startswith(f"analytics_physical.{name}__")
+        assert len(fingerprint) == 12
     assert proj.query("SELECT x FROM analytics_staging.down") == [(1,)]

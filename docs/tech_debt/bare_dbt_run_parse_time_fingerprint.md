@@ -1,7 +1,7 @@
 ---
 status: open
 area: fingerprinting
-impact: high
+impact: medium
 effort: m
 bean: dbt-virtual-0022
 ---
@@ -31,6 +31,29 @@ between): `up` moved to a new table (`up__04307bd8a7d7` → `up__6ae5353118e8`) 
 `down__82dcf1d23a15` and was rebuilt in place. If another environment (e.g. prod) points at that
 physical table, a bare run in staging changes the data prod reads.
 
+## Status 2026-11-05: still open, impact reduced
+
+A bare `dbt run` (no `_dbt_virtual_fps`, no `DBT_VIRTUAL_FPS`) still names `down__<own hash>`:
+dbt evaluates `generate_alias_name` at parse with `execute = False`, before `depends_on` is
+resolved, so no Jinja or hook can put parent fingerprints in that name. That cannot be fixed inside
+dbt. What exists now (tests in `tests/test_dbt_passthrough.py`, run 2026-11-05, dbt-core 1.12.6 +
+dbt-duckdb 1.11.1):
+
+- `dbt-virtual dbt <dbt args>` computes the fingerprints in Python and passes `_dbt_virtual_fps`:
+  `test_passthrough_builds_the_same_physical_names_as_dbt_virtual_build`.
+- `export DBT_VIRTUAL_FPS=$(dbt-virtual plan --print-fps)` then plain `dbt run` names tables with
+  parent fingerprints: `test_env_var_fingerprints_make_plain_dbt_run_use_merkle_names` (asserts the
+  same run without it does not).
+- `guard_shared_tables` (default true) refuses a bare run that would rewrite a table another
+  environment points at with a different fingerprint:
+  `test_guard_refuses_bare_run_that_would_rewrite_a_table_prod_points_at`; allowed when parents are
+  unchanged or only the current environment uses the table.
+
+It stays open because a bare run with no other environment pointing at the tables still misnames
+them (an in-place rebuild in dev, no data of another environment changes), and nothing forces users
+onto the passthrough or the env var except `require_cli_fingerprints`. Pay it by making
+`require_cli_fingerprints` the default.
+
 ## Fix
 
 Options, not decided: make bare runs refuse to rebuild a physical table that another environment
@@ -43,6 +66,8 @@ does not pay this item: with the default, a bare `dbt run` still behaves as desc
 Paying it means either turning the flag on by default or the first option.
 
 ## Workaround meanwhile
+
+Preferred: `dbt-virtual dbt <args>` or `DBT_VIRTUAL_FPS` (see docs/guides/cli_and_operations.md).
 
 Build virtual models only through `dbt-virtual build` (it passes `_dbt_virtual_fps`, so the alias
 includes upstream fingerprints). For a bare `dbt run`, bump `config(virtual_env_epoch=...)` on

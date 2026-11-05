@@ -25,6 +25,7 @@
   {#- The package's on-run-start hook: `on-run-start: ["{{ dbt_virtual.on_run_start() }}"]`.
       Checks `require_cli_fingerprints`, then seeds incremental clones for the selected models. -#}
   {%- do dbt_virtual.assert_cli_fingerprints() -%}
+  {%- do dbt_virtual.assert_shared_tables_safe() -%}
   {{ return(dbt_virtual.seed_incremental_clones()) }}
 {%- endmacro %}
 
@@ -53,7 +54,8 @@
   {%- if (required | string | trim | lower) not in ['true', '1', 'yes'] -%}
     {{ return('') }}
   {%- endif -%}
-  {%- if var('_dbt_virtual_fps', none) -%}
+  {#- `--vars '{_dbt_virtual_fps: ...}'` (`dbt-virtual build` / `dbt-virtual dbt`) or the DBT_VIRTUAL_FPS env var. -#}
+  {%- if dbt_virtual.get_precomputed_fps() -%}
     {{ return('') }}
   {%- endif -%}
 
@@ -75,11 +77,92 @@
   {%- set names = unguarded | sort -%}
   {%- set shown = (names[:5] | join(', ')) ~ (', ...' if (names | length) > 5 else '') -%}
   {{ exceptions.raise_compiler_error(
-    "dbt-virtual: require_cli_fingerprints is true but var('_dbt_virtual_fps') is not set, so "
+    "dbt-virtual: require_cli_fingerprints is true but neither var('_dbt_virtual_fps') nor the DBT_VIRTUAL_FPS env var is set, so "
     ~ (names | length) ~ " selected virtual table model(s) (" ~ shown ~ ") would get physical "
     ~ "names without upstream fingerprints and could rebuild a table another environment points "
-    ~ "at. Run `dbt-virtual build` (it passes _dbt_virtual_fps), or set "
+    ~ "at. Run `dbt-virtual build` or `dbt-virtual dbt <args>` (they pass _dbt_virtual_fps), export DBT_VIRTUAL_FPS=$(dbt-virtual plan --print-fps), or set "
     ~ "vars.dbt_virtual.require_cli_fingerprints to false."
+  ) }}
+{%- endmacro %}
+
+
+{% macro assert_shared_tables_safe() -%}
+  {#-
+    Narrow write guard (`vars.dbt_virtual.guard_shared_tables`, default true) for
+    TECH_DEBT(bare_dbt_run_parse_time_fingerprint). dbt names tables while parsing, so without
+    CLI/env fingerprints (`dbt-virtual dbt ...`, `DBT_VIRTUAL_FPS`) a virtual table's physical name
+    omits its parents' fingerprints. At execution the graph is available, so this computes the
+    run-time Merkle fingerprint of every selected virtual table / incremental model and refuses to
+    start the run when the physical table it is about to rewrite is registered in `_environments` for
+    ANOTHER environment with a different fingerprint: the rewrite would change data that environment
+    serves. A table only the current environment (or nobody) points at is never refused.
+  -#}
+  {%- if not execute -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- if flags.WHICH is not defined or flags.WHICH not in ['run', 'build', 'retry'] -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if (cfg.get('guard_shared_tables', true) | string | trim | lower) in ['false', '0', 'no', ''] -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set precomputed = dbt_virtual.get_precomputed_fps() -%}
+  {%- set selected = selected_resources if selected_resources is defined else none -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set runtime_fps = {} -%}
+  {%- set nodes_dict = graph.nodes if (graph is defined and graph.nodes is defined) else {} -%}
+  {%- for node in nodes_dict.values() -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+    {%- set node_name = dbt_virtual.node_attr(node, 'name', '') -%}
+    {#- Nodes named from CLI/env fingerprints already carry the Merkle fingerprint in their name. -#}
+    {%- if dbt_virtual.node_attr(node_cfg, 'materialized', '') in ['table', 'incremental']
+          and node_name not in precomputed
+          and (selected is none or dbt_virtual.node_attr(node, 'unique_id', '') in selected)
+          and dbt_virtual.is_virtual_node(node) -%}
+      {%- do runtime_fps.update({phys_schema ~ '.' ~ dbt_virtual.node_attr(node, 'alias', node_name): [node_name, dbt_virtual.get_fingerprint(node)]}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if (runtime_fps | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set env_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier='_environments') -%}
+  {%- if env_rel is none -%}
+    {{ return('') }}
+  {%- endif -%}
+
+  {%- set env_name = dbt_virtual.get_current_env() -%}
+  {%- set id_list = [] -%}
+  {%- for pid in runtime_fps.keys() -%}
+    {%- do id_list.append("'" ~ pid ~ "'") -%}
+  {%- endfor -%}
+  {%- set pointer_query -%}
+    SELECT physical_identifier, environment, fingerprint
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE resource_type = 'model'
+      AND environment <> '{{ env_name }}'
+      AND physical_identifier IN ({{ id_list | join(', ') }})
+  {%- endset -%}
+  {%- set pointer_rows = run_query(pointer_query) -%}
+  {%- set conflicts = [] -%}
+  {%- if pointer_rows -%}
+    {%- for row in pointer_rows.rows -%}
+      {%- set info = runtime_fps[row[0]] -%}
+      {%- if (row[2] | string) != (info[1] | string) -%}
+        {%- do conflicts.append(info[0] ~ ' (' ~ row[0] ~ '): environment ' ~ row[1] ~ ' registered fingerprint ' ~ row[2] ~ ', this run computes ' ~ info[1]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if (conflicts | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {{ exceptions.raise_compiler_error(
+    "dbt-virtual: refusing to rewrite physical table(s) another environment points at, because this run "
+    ~ "has no CLI fingerprints and a parent changed: "
+    ~ (conflicts | sort | join('; ')) ~ ". "
+    ~ "Run through `dbt-virtual dbt <args>` (or `dbt-virtual build`), or export "
+    ~ "DBT_VIRTUAL_FPS=$(dbt-virtual plan --print-fps) so tables are named with parent fingerprints; "
+    ~ "or set vars.dbt_virtual.guard_shared_tables to false."
   ) }}
 {%- endmacro %}
 
@@ -103,6 +186,7 @@
       CLI's run-operation passes `model_names` and its own `_dbt_virtual_fps`. -#}
   {%- if model_names is none -%}
     {%- do dbt_virtual.assert_cli_fingerprints() -%}
+    {%- do dbt_virtual.assert_shared_tables_safe() -%}
   {%- endif -%}
   {%- if not execute or flags.FULL_REFRESH -%}
     {{ return('') }}
@@ -304,10 +388,12 @@
       fingerprints, the alias is generated at parse time (`execute` is False, so no parent walk)
       while `get_fingerprint` at run time walks parents; the two differ for any model with parents. -#}
   {%- set fp_prefix = model.name ~ '__' -%}
-  {%- if this.identifier.startswith(fp_prefix) -%}
+  {%- if this.identifier.startswith(fp_prefix) and model.name in dbt_virtual.get_precomputed_fps() -%}
     {%- set fp = this.identifier[(fp_prefix | length):] -%}
   {%- else -%}
-    {%- set fp = dbt_virtual.get_fingerprint(model) -%}
+    {#- Bare run: register the run-time Merkle fingerprint (the alias suffix has no parents in it),
+        so `assert_shared_tables_safe` can tell a rebuild with unchanged parents from one with changed parents. -#}
+    {%- set fp = dbt_virtual.runtime_fingerprint(model) -%}
   {%- endif -%}
   {%- set release_id = var('_dbt_virtual_release', '') -%}
   {#- `batch` mode: only the view is created here; `flush_registry` (on-run-end) writes the rows. -#}

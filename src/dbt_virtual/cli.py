@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -91,10 +94,220 @@ def _state_args(ns: argparse.Namespace) -> list[str]:
     return args
 
 
+def _dbt_command() -> list[str]:
+    """The dbt executable, or `python -m dbt.cli.main` when `dbt` is not on PATH."""
+    return ["dbt"] if shutil.which("dbt") else [sys.executable, "-m", "dbt.cli.main"]
+
+
 def _run_dbt(args: list[str], project_dir: Path) -> int:
-    cmd = ["dbt", *args]
+    cmd = [*_dbt_command(), *args]
     result = subprocess.run(cmd, cwd=project_dir, check=False)
     return result.returncode
+
+
+def _compile_quietly(args: list[str], project_dir: Path) -> int:
+    """`dbt compile` whose output never reaches stdout (machine-readable output must stay clean)."""
+    result = subprocess.run(
+        [*_dbt_command(), *args],
+        cwd=project_dir,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stdout or "")
+    return result.returncode
+
+
+def _fps_by_name(fps: dict) -> dict[str, str]:
+    return {fp.name: fp.fingerprint for fp in fps.values()}
+
+
+# --- `dbt-virtual dbt <args>`: run any dbt command with CLI fingerprints -----------------------
+
+# dbt commands that neither need a compiled project nor build anything named by fingerprints.
+_NO_FINGERPRINT_COMMANDS = {"deps", "clean", "init", "debug", "parse"}
+_DBT_COMMANDS = {
+    "build", "run", "test", "compile", "ls", "list", "seed", "snapshot", "run-operation", "docs",
+    "show", "clone", "retry", "source",
+} | _NO_FINGERPRINT_COMMANDS  # fmt: skip
+_CACHE_SKIP_DIRS = {"target", "logs", ".dbt_virtual", ".git", ".venv", "venv", "node_modules", "__pycache__"}
+
+
+def _option_value(args: list[str], names: tuple[str, ...]) -> str | None:
+    """Value of the last `--name value` / `--name=value` among `args`, or None."""
+    value = None
+    for i, arg in enumerate(args):
+        for name in names:
+            if arg == name and i + 1 < len(args):
+                value = args[i + 1]
+            elif arg.startswith(name + "=") and name.startswith("--"):
+                value = arg.split("=", 1)[1]
+    return value
+
+
+def _strip_option(args: list[str], name: str) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == name:
+            skip = True
+        elif not arg.startswith(name + "="):
+            out.append(arg)
+    return out
+
+
+def _parse_vars_arg(raw: str | None) -> dict[str, object]:
+    if not raw:
+        return {}
+    import yaml
+
+    value = yaml.safe_load(raw)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise SystemExit("dbt-virtual: --vars must be a YAML/JSON mapping")
+    return value
+
+
+def _manifest_checksum(manifest: dict) -> str:
+    """Checksum of the parts of a manifest that fingerprints depend on (not timestamps/invocation ids)."""
+    nodes = manifest.get("nodes", {})
+    parts = {
+        uid: [node.get("checksum"), node.get("config"), node.get("depends_on"), node.get("columns")]
+        for uid, node in sorted(nodes.items())
+    }
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _inputs_hash(
+    project_dir: Path, target: str | None, user_vars: dict[str, object], profiles_dir: str | None
+) -> str:
+    """Hash of what `dbt compile` reads: project files (path, mtime, size), target, vars, profiles, DBT_* env."""
+    h = hashlib.sha256()
+    h.update(json.dumps([target, user_vars], sort_keys=True, default=str).encode("utf-8"))
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = sorted(d for d in dirs if d not in _CACHE_SKIP_DIRS)
+        for name in sorted(files):
+            path = Path(root) / name
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            h.update(f"{path.relative_to(project_dir).as_posix()}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    for base in (Path(profiles_dir) if profiles_dir else project_dir, Path.home() / ".dbt"):
+        profile_file = base / "profiles.yml"
+        if profile_file.is_file():
+            st = profile_file.stat()
+            h.update(f"profiles|{profile_file}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+    for key in sorted(os.environ):
+        if key.startswith("DBT_") and key != "DBT_VIRTUAL_FPS":
+            h.update(f"{key}={os.environ[key]}\n".encode())
+    return h.hexdigest()
+
+
+def _compute_fingerprints(
+    project_dir: Path,
+    dbt_args: list[str],
+    *,
+    target: str | None,
+    user_vars: dict[str, object],
+    use_cache: bool,
+) -> dict[str, str]:
+    """`{model_name: fingerprint}`, from `.dbt_virtual/fingerprints.json` while valid, else a fresh compile.
+
+    `dbt_args` carries the user's `--profiles-dir` / `--profile` / `--project-dir`; the compile uses the
+    same target and vars (so var-dependent SQL fingerprints like the real run) and no selection.
+    """
+    out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
+    manifest_path = project_dir / "target" / "manifest.json"
+    inputs = _inputs_hash(project_dir, target, user_vars, _option_value(dbt_args, ("--profiles-dir",)))
+
+    if use_cache and out_file.exists() and manifest_path.exists():
+        try:
+            cached = json.loads(out_file.read_text(encoding="utf-8"))
+            meta = cached.get("cache") or {}
+            if meta.get("inputs") == inputs and meta.get("manifest") == _manifest_checksum(
+                json.loads(manifest_path.read_text(encoding="utf-8"))
+            ):
+                sys.stderr.write(f"dbt-virtual: reusing cached fingerprints ({len(cached['by_name'])} node(s))\n")
+                return dict(cached["by_name"])
+        except (ValueError, KeyError, OSError):
+            pass
+
+    compile_args = ["compile"]
+    if target:
+        compile_args += ["--target", target]
+    if user_vars:
+        compile_args += ["--vars", json.dumps(user_vars)]
+    for flag in ("--profiles-dir", "--profile", "--project-dir"):
+        value = _option_value(dbt_args, (flag,))
+        if value:
+            compile_args += [flag, value]
+    rc = _compile_quietly(compile_args, project_dir)
+    if rc != 0:
+        raise SystemExit(rc)
+    manifest = _load_manifest(project_dir)
+    fps = compute_manifest_fingerprints(manifest, known_schemas=[])
+    write_fingerprints_file(
+        fps, out_file, cache={"inputs": inputs, "manifest": _manifest_checksum(manifest), "target": target}
+    )
+    sys.stderr.write(f"dbt-virtual: compiled and fingerprinted {len(fps)} node(s)\n")
+    return _fps_by_name(fps)
+
+
+def cmd_dbt_passthrough(project_dir_arg: str, argv: list[str]) -> int:
+    """`dbt-virtual dbt [--env NAME] [--no-cache] <dbt args...>`: run dbt with `_dbt_virtual_fps` (and env).
+
+    The fingerprints are computed in Python from a compile with the same target and vars, so physical
+    names include parent fingerprints even for plain `build` / `run` / `test` / `ls`. dbt's exit code is
+    returned unchanged.
+    """
+    env: str | None = None
+    use_cache = True
+    while argv and argv[0] in ("--env", "--no-cache"):
+        if argv[0] == "--no-cache":
+            use_cache = False
+            argv = argv[1:]
+        else:
+            if len(argv) < 2:
+                raise SystemExit("dbt-virtual dbt: --env needs a value")
+            env, argv = argv[1], argv[2:]
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        raise SystemExit("usage: dbt-virtual dbt [--env NAME] [--no-cache] <dbt args...>")
+
+    command = next((a for a in argv if a in _DBT_COMMANDS), None)
+    project_dir = Path(
+        _option_value(argv, ("--project-dir",)) or os.environ.get("DBT_PROJECT_DIR") or project_dir_arg
+    ).resolve()
+    if command is None or command in _NO_FINGERPRINT_COMMANDS or any(a in ("-h", "--help") for a in argv):
+        return _run_dbt(argv, project_dir)
+
+    target = _option_value(argv, ("--target", "-t")) or os.environ.get("DBT_TARGET")
+    user_vars = _parse_vars_arg(_option_value(argv, ("--vars",)))
+    by_name = _compute_fingerprints(project_dir, argv, target=target, user_vars=user_vars, use_cache=use_cache)
+    merged: dict[str, object] = {**user_vars, "_dbt_virtual_fps": by_name}
+    if env:
+        merged["_dbt_virtual_env"] = env
+    return _run_dbt([*_strip_option(argv, "--vars"), "--vars", json.dumps(merged)], project_dir)
+
+
+def _passthrough_index(args: list[str]) -> int | None:
+    """Index of the `dbt` subcommand when it is the one being run (after optional `--project-dir X`)."""
+    i = 0
+    while i < len(args):
+        if args[i] == "--project-dir":
+            i += 2
+        elif args[i].startswith("--project-dir="):
+            i += 1
+        else:
+            return i if args[i] == "dbt" else None
+    return None
 
 
 def cmd_plan(ns: argparse.Namespace) -> int:
@@ -103,7 +316,8 @@ def cmd_plan(ns: argparse.Namespace) -> int:
         compile_args = ["compile", "--target", _dbt_target(ns)]
         if _user_vars(ns):
             compile_args.extend(["--vars", json.dumps(_user_vars(ns))])
-        rc = _run_dbt(compile_args, project_dir)
+        # `--print-fps` output feeds `export DBT_VIRTUAL_FPS=$(...)`: keep dbt's output off stdout.
+        rc = (_compile_quietly if ns.print_fps else _run_dbt)(compile_args, project_dir)
         if rc != 0:
             return rc
 
@@ -111,6 +325,9 @@ def cmd_plan(ns: argparse.Namespace) -> int:
     fps = compute_manifest_fingerprints(manifest, known_schemas=ns.known_schemas)
     out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps, out_file)
+    if ns.print_fps:
+        print(json.dumps(_fps_by_name(fps), separators=(",", ":"), sort_keys=True))
+        return 0
 
     env_state, base_env_state, existing_tables, registered = _load_state_file(ns.state_file)
     actions = classify_plan_actions(
@@ -633,7 +850,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Extra dbt vars as a JSON object, merged under dbt-virtual's own vars (e.g. window vars).",
     )
+    p_plan.add_argument(
+        "--print-fps",
+        action="store_true",
+        help="Print only the compact JSON {model: fingerprint} to stdout, for "
+        "`export DBT_VIRTUAL_FPS=$(dbt-virtual plan --print-fps)` before a plain `dbt run`.",
+    )
     p_plan.set_defaults(func=cmd_plan)
+
+    # dbt passthrough: handled in main() before argparse so dbt's own flags are not parsed here.
+    sub.add_parser(
+        "dbt",
+        help="Run any dbt command with CLI fingerprints: dbt-virtual dbt [--env NAME] [--no-cache] <dbt args...>",
+        add_help=False,
+    )
 
     # build
     p_build = sub.add_parser("build", help="Seed clones, build physical tables, and sync virtual views.")
@@ -792,8 +1022,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    idx = _passthrough_index(args)
+    if idx is not None:
+        project_dir = _option_value(args[:idx], ("--project-dir",)) or "."
+        return cmd_dbt_passthrough(project_dir, args[idx + 1 :])
     parser = build_parser()
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(args)
     return ns.func(ns)
 
 

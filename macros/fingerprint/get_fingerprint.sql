@@ -4,6 +4,7 @@
     'physical_schema': 'dbt_virtual_physical',
     'environment': target.name,
     'base_environment': 'prod',
+    'guard_shared_tables': true,
     'ref_resolution': 'env_view',
     'env_schemas': {
       'staging': 'staging',
@@ -181,8 +182,40 @@
 {%- endmacro %}
 
 
+{% macro get_precomputed_fps() -%}
+  {#- CLI-computed Merkle fingerprints `{model_name: fp}`: `--vars '{_dbt_virtual_fps: ...}'` first, else
+      the JSON in the `DBT_VIRTUAL_FPS` environment variable (`dbt-virtual plan --print-fps`).
+      `env_var` is allowed while dbt parses, so a plain `dbt run` can name tables with them. -#}
+  {%- set from_var = var('_dbt_virtual_fps', none) -%}
+  {%- if from_var -%}
+    {{ return(from_var) }}
+  {%- endif -%}
+  {%- set raw = env_var('DBT_VIRTUAL_FPS', '') | trim -%}
+  {%- if raw == '' -%}
+    {{ return({}) }}
+  {%- endif -%}
+  {%- set parsed = fromjson(raw) -%}
+  {%- if parsed is not mapping -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual: DBT_VIRTUAL_FPS must be a JSON object {model_name: fingerprint}, as printed by `dbt-virtual plan --print-fps`.") }}
+  {%- endif -%}
+  {{ return(parsed) }}
+{%- endmacro %}
+
+
+{% macro runtime_fingerprint(node) -%}
+  {#- The Merkle fingerprint at execution time, always computed from the `graph` copy of the node:
+      the `model` object of a hook and the node of a result carry slightly different config values
+      (e.g. `partition_by` None vs unset), which would hash differently from the on-run-start guard. -#}
+  {%- set uid = dbt_virtual.node_attr(node, 'unique_id', none) -%}
+  {%- if uid is not none and graph is defined and graph.nodes is defined and graph.nodes.get(uid) is not none -%}
+    {{ return(dbt_virtual.get_fingerprint(graph.nodes.get(uid))) }}
+  {%- endif -%}
+  {{ return(dbt_virtual.get_fingerprint(node)) }}
+{%- endmacro %}
+
+
 {% macro get_fingerprint(node, depth=0) -%}
-  {%- set precomputed = var('_dbt_virtual_fps', {}) -%}
+  {%- set precomputed = dbt_virtual.get_precomputed_fps() -%}
   {%- set model_name = dbt_virtual.node_attr(node, 'name', '') -%}
   {%- if model_name in precomputed -%}
     {{ return(precomputed[model_name]) }}
