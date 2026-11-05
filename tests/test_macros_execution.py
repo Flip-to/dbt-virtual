@@ -251,7 +251,8 @@ class MacroTestHarness:
                     "check_schema_exists": staticmethod(lambda database, schema: True),
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
-                    **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
+                    # Recording stubs first, so a test (e.g. the emulator E2E) can replace them
+                    # through `adapter_extras` with ones that talk to a live warehouse.
                     "grant_access_to": staticmethod(
                         lambda entity, entity_type, role, target: self.grant_calls.append(
                             (entity, entity_type, role, target)
@@ -260,6 +261,7 @@ class MacroTestHarness:
                     "update_columns": staticmethod(
                         lambda rel, cols: self.column_updates.append((str(rel), cols))
                     ),
+                    **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
                 },
             )(),
             "builtins": type(
