@@ -191,7 +191,7 @@ dbt-virtual gc --dry-run
 | `physical_schema` | `str` | `"dbt_virtual_physical"` | Dataset/schema storing physical fingerprint tables (`<model>__<fp>`) and registry metadata (`_environments`, `_releases`, `_locks`, `_intervals`). |
 | `environment` | `str` | `target.name` | Current virtual environment being built (e.g., `staging`, `prod`, `pr_42`). Typically set via `"{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"`; Jinja is rendered, so several prod targets can map to `prod`. `dbt-virtual build --env` overrides it. |
 | `base_environment` | `str` | `"prod"` | Reference environment used by `seed_incremental_clones()` to seed new incremental table fingerprints via zero-copy `CLONE`, prefix of unlisted environments' schemas, and protected from `drop-env`. |
-| `ref_resolution` | `str` | `"env_view"` | Controls how `ref()` resolves virtualized models (with the `ref()` override): `"env_view"` (Option A, default), `"physical"` (Option B), `"hybrid"` (Option C), or `"explicit"` (Option D, currently same as `physical`). |
+| `ref_resolution` | `str` | `"env_view"` | Controls how `ref()` resolves virtualized models (with the `ref()` override): `"env_view"` (Option A, default), `"physical"` (Option B), `"hybrid"` (Option C). `"explicit"` is rejected with an error (it used to behave like `physical`). |
 | `env_schemas` | `dict[str, str \| dict]` | `{"staging": "staging", "prod": "prod"}` | Maps each environment to one schema, or to `{default: ..., <custom_schema>: ...}` (an unlisted custom schema `c` → `<default>_c`). An unlisted `<env>` gets `<base env default schema>_<env>`. |
 | `require_cli_fingerprints` | `bool` | `false` | When `true`, a bare `dbt run` / `build` / `retry` that selects a virtual table model fails in `on-run-start` unless `dbt-virtual build` supplied the fingerprints. |
 | `retention_releases` | `int` | `5` | Number of most-recent releases per environment whose physical tables are protected from `dbt-virtual gc`. |
@@ -231,7 +231,7 @@ All written documentation follows [`docs/conventions/docs_and_specs.md`](docs/co
 - **[Spec Index (`docs/specs/README.md`)](docs/specs/README.md)**
 - **[`20261027_dbt_virtual_architecture.md`](docs/specs/20261027_dbt_virtual_architecture.md)** — Master architecture, problem statement, alternatives, rollout, and verification.
 - **[`20261027_merkle_dag_fingerprinting.md`](docs/specs/20261027_merkle_dag_fingerprinting.md)** — Target-invariant SQL normalization and topological Merkle hashing.
-- **[`20261027_routing_ref_modes_and_clone_seeding.md`](docs/specs/20261027_routing_ref_modes_and_clone_seeding.md)** — Default `env_view` (Option A) resolution, alternative `physical` / `hybrid` / `explicit` modes, and incremental cloning.
+- **[`20261027_routing_ref_modes_and_clone_seeding.md`](docs/specs/20261027_routing_ref_modes_and_clone_seeding.md)** — Default `env_view` (Option A) resolution, alternative `physical` / `hybrid` modes (`explicit` is rejected), and incremental cloning.
 - **[`20261027_routine_virtualization_and_tvf_testing.md`](docs/specs/20261027_routine_virtualization_and_tvf_testing.md)** — Atomic promotion/rollback of BigQuery TVFs, scalar UDFs, and stored procedures.
 - **[`20261027_lifecycle_promote_rollback_and_gc.md`](docs/specs/20261027_lifecycle_promote_rollback_and_gc.md)** — `_environments` and `_releases` schemas, `plan`, `build`, `promote`, `rollback`, `diff`, and `gc`.
 - **[`20261027_adapter_dispatch_and_emulator_ci.md`](docs/specs/20261027_adapter_dispatch_and_emulator_ci.md)** — Multi-warehouse adapter dispatch & BigQuery emulator CI integration.

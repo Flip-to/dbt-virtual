@@ -15,7 +15,7 @@ vars:
     physical_schema: "analytics_physical"
     environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"
     base_environment: "prod"
-    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid', 'explicit'
+    ref_resolution: "env_view"   # Default Option A ('env_view'). Also supports 'physical', 'hybrid'
     env_schemas:
       staging: "analytics_staging"
       prod: "analytics"
@@ -92,7 +92,7 @@ Always set the keys you rely on: `vars` are not deep-merged, so a `vars.dbt_virt
 ---
 
 ### `ref_resolution`
-- **Type**: `string` (`"env_view"` | `"physical"` | `"hybrid"` | `"explicit"`)
+- **Type**: `string` (`"env_view"` | `"physical"` | `"hybrid"`)
 - **Default**: `"env_view"`
 - **What it does**:
   Controls how `{{ ref('upstream_model') }}` resolves when compiling a downstream model (requires the `ref()` override shown in [Getting Started](getting_started.md)).
@@ -102,7 +102,8 @@ Always set the keys you rely on: `vars` are not deep-merged, so a `vars.dbt_virt
 | **`"env_view"`** *(Default, Option A)* | `analytics_staging.orders` (the virtual environment view, in the schema of `orders`' custom schema) | **Recommended for almost all projects**, especially BigQuery projects with Table Functions (`TVF`), views, or external BI queries. When `orders` is promoted or updated, downstream views and TVFs automatically read the new table through the environment view without needing to be recompiled. |
 | **`"physical"`** *(Option B)* | `analytics_physical.orders__58cce796d2a1` (the exact physical table) | Pure table/incremental pipelines with no TVFs where you want every compiled table query pinned directly to its upstream physical table identifier at compile time. |
 | **`"hybrid"`** *(Option C)* | Routes routine/view callers (`table_function`, `virtual_function`, `function`, `procedure`, `view`) to `analytics_staging.orders`, and table/incremental callers to `analytics_physical.orders__58cce796d2a1` | Projects that mix incremental tables with BigQuery TVFs and want direct physical table reads during incremental builds while keeping TVFs bound to stable environment view names. |
-| **`"explicit"`** *(Option D)* | `analytics_physical.orders__58cce796d2a1`: the current `virtual_ref` only rewrites relations in `env_view` and `hybrid` mode, so `explicit` behaves like `physical` | Intended for gradual migration with per-query `dbt_virtual.virtual_ref(...)` calls; today it gives no per-query control beyond `physical`. |
+
+`"explicit"` (the former Option D) and unknown values are rejected with a compile error; `"explicit"` used to behave exactly like `"physical"` (see [the decision](../decisions/20261105_ref_resolution_explicit_is_rejected.md)).
 
 ---
 
