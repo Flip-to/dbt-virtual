@@ -20,6 +20,7 @@ Verified stages on each warehouse:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +28,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dbt_virtual.fingerprint import compute_node_fingerprint
 from tests.test_macros_execution import FakeRelation, FakeResult, MacroTestHarness
+
+
+def verify_pointer_upserts(harness: MacroTestHarness, run, fetch, label: str) -> None:
+    """Pointer upserts replace in place: one row per (environment, model), no duplicates.
+
+    Exercises `upsert_environment_pointer_sql` and the batched `upsert_environment_pointers_sql`
+    (MERGE on Snowflake, a single data-modifying-CTE statement on PostgreSQL) against the real warehouse.
+    Minimal repro if the Snowflake emulator rejects MERGE: `MERGE INTO t AS T USING (SELECT 'a' AS k, 1 AS v)
+    AS S ON T.k = S.k WHEN MATCHED THEN UPDATE SET v = S.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (S.k, S.v)`.
+    """
+    table = "analytics_physical._environments"
+    run(f"DELETE FROM {table} WHERE environment = 'upsert_probe'")
+    args = ("analytics_physical", "upsert_probe", "probe_a", "model")
+    try:
+        run(harness.call_macro("upsert_environment_pointer_sql", *args, "fp_a", "analytics_physical.probe_a__fp_a", "rel_a"))
+        run(harness.call_macro("upsert_environment_pointer_sql", *args, "fp_b", "analytics_physical.probe_a__fp_b", "rel_b", "marts"))
+    except RuntimeError as err:
+        raise RuntimeError(f"[{label}] registry upsert failed (see the repro in verify_pointer_upserts): {err}") from err
+    rows = fetch(f"SELECT model_name, fingerprint, release_id, schema_key FROM {table} WHERE environment = 'upsert_probe'")
+    assert [tuple(r) for r in rows] == [("probe_a", "fp_b", "rel_b", "marts")], rows
+
+    batch = [
+        {"name": name, "resource_type": "model", "fingerprint": f"fp_{name}", "physical_identifier": f"analytics_physical.{name}",
+         "release_id": "rel_c", "schema_key": None}
+        for name in ("probe_a", "probe_b", "probe_c")
+    ]
+    run(harness.call_macro("upsert_environment_pointers_sql", "analytics_physical", "upsert_probe", batch))
+    rows = fetch(
+        f"SELECT model_name, fingerprint, release_id, schema_key FROM {table} WHERE environment = 'upsert_probe' ORDER BY model_name"
+    )
+    expected = [(n, f"fp_{n}", "rel_c", None) for n in ("probe_a", "probe_b", "probe_c")]
+    assert [tuple(r) for r in rows] == expected, rows
+    run(f"DELETE FROM {table} WHERE environment = 'upsert_probe'")
+    print(f"[{label}] Registry pointer upserts replace in place (single + batched): verified")
 
 
 def run_snowflake_emulator_e2e(endpoint: str) -> None:
@@ -43,8 +78,37 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
         timeout=10,
     )
 
+    def emulator_merge(stmt: str) -> None:
+        """LIMITATION (nnnkkk7/snowflake-emulator): `MERGE INTO` is rejected with error 001007/42000.
+
+        Minimal repro: `MERGE INTO t AS T USING (SELECT 'a' AS k, 1 AS v) AS S ON T.k = S.k
+        WHEN MATCHED THEN UPDATE SET v = S.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (S.k, S.v)`.
+        Real Snowflake supports it, so `snowflake__` keeps MERGE. Here the rendered MERGE is shape-checked
+        and replayed as the equivalent DELETE + INSERT on the emulator only (counted and printed at the end).
+        """
+        assert "WHEN MATCHED THEN UPDATE SET" in stmt and "WHEN NOT MATCHED THEN INSERT" in stmt, stmt
+        table = re.match(r"MERGE INTO (\S+) AS T", stmt).group(1)
+        source = stmt.split("USING (", 1)[1].rsplit(") AS S", 1)[0].replace("CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP")
+        envs = re.findall(r"'((?:[^']|'')*)' AS environment", source)
+        models = re.findall(r"'((?:[^']|'')*)' AS model_name", source)
+        assert envs and len(envs) == len(models), stmt
+        for env_value, model_value in zip(envs, models):
+            sf_exec(f"DELETE FROM {table} WHERE environment = '{env_value}' AND model_name = '{model_value}'")
+        sf_exec(
+            f"INSERT INTO {table} (environment, model_name, resource_type, fingerprint, physical_identifier, "
+            f"release_id, updated_at, schema_key) SELECT environment, model_name, resource_type, fingerprint, "
+            f"physical_identifier, release_id, updated_at, schema_key FROM ({source})"
+        )
+        merges_translated.append(stmt)
+
+    merges_translated: list[str] = []
+
     def sf_exec(sql: str) -> list[list]:
+        rows: list[list] = []
         for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
+            if stmt.startswith("MERGE INTO"):
+                emulator_merge(stmt)
+                continue
             resp = requests.post(
                 f"{base_url}/statements",
                 json={"statement": stmt, "database": "TEST_DB", "schema": "PUBLIC"},
@@ -91,6 +155,7 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     # 1. Initialize registry tables (`_environments`, `_releases`) via `snowflake__ensure_registry_tables_sql`
     reg_sql = harness.call_macro("ensure_registry_tables_sql", "analytics_physical")
     sf_exec(reg_sql)
+    verify_pointer_upserts(harness, sf_exec, sf_exec, "snowflake-emulator")
 
     # 2. Compute v1 fingerprint & build physical table with Snowflake-specific SQL (`IFF`, `NVL`)
     node_v1 = {
@@ -232,6 +297,11 @@ def run_snowflake_emulator_e2e(endpoint: str) -> None:
     prod_rb = sf_exec("SELECT SUM(orders) FROM analytics.orders_metrics")
     assert int(float(prod_rb[0][0])) == 35, prod_rb
     print(f"[snowflake-emulator rollback] Instant view rollback to v1 verified: sum={prod_rb[0][0]}")
+    assert merges_translated, "snowflake__ rendered no MERGE for the registry pointers"
+    print(
+        f"[snowflake-emulator] NOTE: {len(merges_translated)} registry MERGE statement(s) were shape-checked and "
+        "replayed as DELETE + INSERT because the emulator rejects MERGE (001007/42000); see emulator_merge()."
+    )
 
 
 def run_postgres_e2e(dsn: str) -> None:
@@ -267,6 +337,12 @@ def run_postgres_e2e(dsn: str) -> None:
 
         # 1. Initialize registry tables
         pg_exec(harness.call_macro("ensure_registry_tables_sql", "analytics_physical"))
+
+        def pg_fetch(sql_text: str) -> list:
+            cur.execute(sql_text)
+            return cur.fetchall()
+
+        verify_pointer_upserts(harness, pg_exec, pg_fetch, "postgres")
 
         # 2. Build v1 in staging
         node_v1 = {
