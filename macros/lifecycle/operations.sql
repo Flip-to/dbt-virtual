@@ -303,6 +303,10 @@
   {%- set schema_exists = adapter.check_schema_exists(dbt_virtual.active_database(), phys_schema) -%}
   {%- set registry_exists = schema_exists and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_environments') is not none
       and adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_releases') is not none -%}
+  {#- A registry written by an older release lacks `build_quality` / `schema_key`; add them first. -#}
+  {%- if registry_exists -%}
+    {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
+  {%- endif -%}
   {%- set env_rows = run_query(env_query) if registry_exists else none -%}
 
   {%- set env_state = {} -%}
@@ -925,6 +929,7 @@
     {{ return('') }}
   {%- endif -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
   {%- set env_rel = dbt_virtual.registry_relation(phys_schema, '_environments') -%}
 
   {#- Every custom schema seen in the registry or the project, plus the default (none). -#}
@@ -1005,6 +1010,8 @@
   {%- endif -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {#- A registry written by an older release lacks `schema_key` / `build_quality`; migrate it first. -#}
+  {%- do dbt_virtual.migrate_registry_if_old(phys_schema=phys_schema) -%}
   {%- set ensured_schemas = [] -%}
   {%- set authorized_schemas = [] -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}

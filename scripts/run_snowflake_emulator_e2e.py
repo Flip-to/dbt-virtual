@@ -15,6 +15,10 @@ Verified stages on each warehouse:
 4. Ephemeral PR environment (`pr_42`) zero-compute initialization (`virtual_init_env`) & teardown (`virtual_drop_env`).
 5. Release v2 build in `staging` (`seed_incremental_clones` + incremental insert) & zero-rebuild promotion to `prod`.
 6. Instant rollback (`prod` -> release `v1`) via `virtual_rollback`.
+
+PostgreSQL also runs the concurrency scenarios (`tests/registry_concurrency.py`, one connection per
+thread): concurrent registry flushes, interleaved pointer upserts, the `_locks` lease and
+`virtual_promote(lock=True)`.
 """
 
 from __future__ import annotations
@@ -374,6 +378,28 @@ def run_postgres_e2e(dsn: str) -> None:
         print("[postgres rollback] Instant view rollback to v1 verified: sum=35")
 
 
+def run_postgres_concurrency(dsn: str) -> list[str]:
+    """Concurrency scenarios on PostgreSQL; returns the names of the scenarios that failed."""
+    from tests import registry_concurrency as rc
+
+    backend = rc.PostgresBackend(dsn)
+    return rc.run_checks(
+        [
+            ("flushes of different environments", lambda: rc.scenario_flushes_of_different_environments(backend, n=4)),
+            (
+                "interleaved pointer upserts",
+                lambda: rc.scenario_interleaved_pointer_upserts(backend),
+                rc.REGISTRY_MERGE_XFAIL,
+            ),
+            ("lock race: exactly one winner", lambda: rc.scenario_lock_race_has_exactly_one_winner(backend, n=4, rounds=3)),
+            ("lease lifecycle and expired takeover", lambda: rc.scenario_lease_lifecycle(backend)),
+            ("promote refused while lease held", lambda: rc.scenario_promote_is_refused_while_the_lease_is_held(backend)),
+            ("simultaneous promotes", lambda: rc.scenario_simultaneous_promotes(backend, rounds=2)),
+        ],
+        label="postgres concurrency",
+    )
+
+
 def main() -> int:
     sf_host = os.environ.get("SNOWFLAKE_EMULATOR_HOST", "http://127.0.0.1:8080")
     pg_dsn = os.environ.get("POSTGRES_DSN", "")
@@ -381,6 +407,10 @@ def main() -> int:
     run_snowflake_emulator_e2e(sf_host)
     if pg_dsn:
         run_postgres_e2e(pg_dsn)
+        failed = run_postgres_concurrency(pg_dsn)
+        if failed:
+            print(f"PostgreSQL concurrency scenarios FAILED: {', '.join(failed)}", file=sys.stderr)
+            return 1
 
     print("All multi-warehouse (Snowflake Emulator + Postgres) E2E checks PASSED.")
     return 0

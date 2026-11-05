@@ -115,7 +115,11 @@ def _base_environment(project_dir: Path) -> str:
 
 
 def _default_lock_owner() -> str:
-    """A lease owner that is stable for one user on one machine, so a failed promote can be retried."""
+    """A lease owner that is stable for one user on one machine, so a failed promote can be retried.
+
+    TECH_DEBT(cli_lock_owner_shared_per_user_host): two processes of one user on one host share it,
+    so they do not exclude each other (docs/tech_debt/cli_lock_owner_shared_per_user_host.md).
+    """
     import getpass
     import socket
 

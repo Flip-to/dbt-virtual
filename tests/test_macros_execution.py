@@ -82,6 +82,10 @@ class MacroTestHarness:
         # schema, identifier)` returns a FakeRelation or None and replaces `existing_relations`.
         self.query_executor: Any = None
         self.relation_lookup: Any = None
+        # When True, `{% call statement(...) %}` blocks run their body through `run_query` (like
+        # dbt) instead of being inlined into the macro output; needed for macros that migrate or
+        # create the registry inside a statement block.
+        self.run_statement_blocks = False
         self.grant_calls: list[tuple[Any, ...]] = []
         self.column_updates: list[tuple[str, dict[str, Any]]] = []
 
@@ -169,12 +173,14 @@ class MacroTestHarness:
         # Transform `{% call statement(...) %}` into a regular block for unit testing
         import re
 
-        src = re.sub(
-            r"\{%-?\s*call\s+statement\([^)]*\)\s*-?%\}",
-            "{% if true %}",
-            self.template_source,
-        )
-        src = re.sub(r"\{%-?\s*endcall\s*-?%\}", "{% endif %}", src)
+        src = self.template_source
+        if not self.run_statement_blocks:
+            src = re.sub(
+                r"\{%-?\s*call\s+statement\([^)]*\)\s*-?%\}",
+                "{% if true %}",
+                src,
+            )
+            src = re.sub(r"\{%-?\s*endcall\s*-?%\}", "{% endif %}", src)
 
         ns_dict: dict[str, Any] = {}
         mod_ref: list[Any] = []
@@ -282,6 +288,13 @@ class MacroTestHarness:
             )(),
         }
 
+        if self.run_statement_blocks:
+
+            def _statement(name: str, fetch_result: bool = False, auto_begin: bool = True, caller: Any = None) -> str:
+                _run_query(caller() if caller else "")
+                return ""
+
+            ctx["statement"] = _statement
         ctx["dbt_virtual"] = NamespaceProxy()
         tmpl = self.env.from_string(src, globals=ctx)
         mod = tmpl.make_module(ctx)
