@@ -104,7 +104,7 @@
   {%- if model_names is none -%}
     {%- do dbt_virtual.assert_cli_fingerprints() -%}
   {%- endif -%}
-  {%- if not execute or flags.FULL_REFRESH -%}
+  {%- if not execute -%}
     {{ return('') }}
   {%- endif -%}
   {#- `dbt compile` (and `dbt-virtual plan`) also run on-run-start hooks; only clone for runs that build. -#}
@@ -138,19 +138,41 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
+  {%- set env_name = dbt_virtual.get_current_env() -%}
+  {%- set tracked = dbt_virtual.companion_entries() | length > 0 -%}
+  {%- set full_builds = [] -%}
+  {%- if flags.FULL_REFRESH -%}
+    {#- `--full-refresh` rebuilds every selected incremental from scratch (unless the model sets
+        `full_refresh: false`): nothing is seeded, but companion state must still be checked. -#}
+    {%- if tracked -%}
+      {%- do dbt_virtual.ensure_companion_registry() -%}
+      {%- for node in candidates -%}
+        {%- if dbt_virtual.node_attr(dbt_virtual.node_attr(node, 'config', {}), 'full_refresh', none) != false
+              and dbt_virtual.companion_full_build(node, env_name) -%}
+          {%- do full_builds.append(dbt_virtual.node_attr(node, 'name', '')) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if (full_builds | length) > 0 -%}
+        {%- do dbt_virtual.raise_companion_full_build(full_builds, env_name) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {{ return('') }}
+  {%- endif -%}
   {%- do dbt_virtual.ensure_registry() -%}
 
   {%- set base_query -%}
-    SELECT model_name, physical_identifier
+    SELECT model_name, physical_identifier, fingerprint
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment = '{{ base_env }}'
       AND resource_type = 'model'
   {%- endset -%}
   {%- set base_rows = run_query(base_query) -%}
   {%- set base_map = {} -%}
+  {%- set base_fp_map = {} -%}
   {%- if base_rows -%}
     {%- for row in base_rows.rows -%}
       {%- do base_map.update({row[0]: row[1]}) -%}
+      {%- do base_fp_map.update({row[0]: row[2]}) -%}
     {%- endfor -%}
   {%- endif -%}
 
@@ -189,6 +211,7 @@
       {%- endif -%}
       {%- set existing_target = none -%}
     {%- endif -%}
+    {%- set cloned = false -%}
     {%- set base_ident = base_map.get(node_name, '') -%}
     {%- set base_table_name = base_ident.split('.')[-1] if base_ident else '' -%}
     {%- if base_table_name != '' and base_table_name != target_rel.identifier and existing_target is none -%}
@@ -227,9 +250,30 @@
         {#- dbt has already cached the schema listing; register the clone so the materialization
             and `is_incremental()` see it as an existing table. -#}
         {%- do adapter.cache_added(target_rel) -%}
+        {%- set cloned = true -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if tracked and target_rel.identifier.startswith(node_name ~ '__') -%}
+      {%- set new_fp = target_rel.identifier[((node_name ~ '__') | length):] -%}
+      {#- `depart` saves the state the environment holds for the table it leaves, before the
+          writes below replace it. It is true when this table is new to the environment. -#}
+      {%- set moving = dbt_virtual.companion_depart(node, env_name, new_fp) -%}
+      {%- if cloned -%}
+        {#- The clone holds what the base table holds; the environment's state must say so too. -#}
+        {%- do dbt_virtual.restore_companion_state(node_name, base_fp_map.get(node_name, ''), env_name, prefer_env=base_env) -%}
+      {%- elif existing_target is none -%}
+        {%- if dbt_virtual.companion_full_build(node, env_name) -%}
+          {%- do full_builds.append(node_name) -%}
+        {%- endif -%}
+      {%- elif moving -%}
+        {#- The table exists (another environment built it); this environment starts using it. -#}
+        {%- do dbt_virtual.restore_companion_state(node_name, new_fp, env_name, prefer_env=base_env) -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
+  {%- if (full_builds | length) > 0 -%}
+    {%- do dbt_virtual.raise_companion_full_build(full_builds, env_name) -%}
+  {%- endif -%}
   {{ return('') }}
 {%- endmacro %}
 
