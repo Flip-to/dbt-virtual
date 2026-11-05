@@ -77,6 +77,28 @@ def _load_partial_tables(state_path: str | None) -> set[str]:
     return set(raw.get("partial_physical_tables") or [])
 
 
+def _load_base_tables(state_path: str | None) -> set[str]:
+    """Physical tables in the base environment's own location (cross-project `physical_locations`)."""
+    if not state_path:
+        return set()
+    raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    return set(raw.get("base_physical_tables") or [])
+
+
+def _source_location_args(value: str | None) -> dict[str, object]:
+    """`--source-location DATABASE.SCHEMA` as macro arguments (empty: use `physical_locations`).
+
+    Split at the last dot: a BigQuery project id may contain dots (`example.com:proj`), a schema
+    name cannot.
+    """
+    if not value:
+        return {}
+    database, dot, schema = value.rpartition(".")
+    if not dot or not database or not schema:
+        raise SystemExit(f"--source-location must be DATABASE.SCHEMA, got {value!r}")
+    return {"source_database": database, "source_schema": schema}
+
+
 def _base_environment(project_dir: Path) -> str:
     """`vars.dbt_virtual.base_environment` from dbt_project.yml (default `prod`)."""
     try:
@@ -178,6 +200,7 @@ def cmd_plan(ns: argparse.Namespace) -> int:
         existing_physical_tables=existing_tables,
         registered_physical_tables=registered,
         partial_physical_tables=_load_partial_tables(ns.state_file),
+        base_physical_tables=_load_base_tables(ns.state_file),
     )
 
     counts: dict[str, int] = {}
@@ -238,6 +261,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
         full_refresh=ns.full_refresh,
         registered_physical_tables=registered,
         partial_physical_tables=_load_partial_tables(ns.state_file),
+        base_physical_tables=_load_base_tables(ns.state_file),
     )
     models_to_build, reused_models = compute_dbt_select_for_build(actions)
 
@@ -457,6 +481,7 @@ def cmd_promote(ns: argparse.Namespace) -> int:
         "require_sealed": bool(ns.require_sealed),
         "check_coverage": not ns.no_coverage_check,
         "coverage_ignore_before": ns.coverage_ignore_before or "",
+        **_source_location_args(ns.source_location),
     }
     if ns.skip_fingerprint_check:
         print(
@@ -865,6 +890,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--lock-owner",
         default=None,
         help="Lease owner name (default: dbt-virtual-cli:<user>@<host>).",
+    )
+    p_promote.add_argument(
+        "--source-location",
+        default=None,
+        metavar="DATABASE.SCHEMA",
+        help="Registry and tables of the source release, e.g. the CI project (default: "
+        "`physical_locations` of --from). When it differs from the location of --to, the release's "
+        "tables are CLONEd into --to's location first. Run with --target of the --to environment.",
     )
     p_promote.set_defaults(func=cmd_promote)
 

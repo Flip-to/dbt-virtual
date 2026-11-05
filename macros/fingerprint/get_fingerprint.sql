@@ -12,7 +12,8 @@
       'prod': 'prod'
     },
     'retention_releases': 5,
-    'retention_days': 7
+    'retention_days': 7,
+    'physical_locations': {}
   } -%}
   {%- set user_cfg = var('dbt_virtual', {}) or {} -%}
   {#- dbt renders a var only when its whole value is a string, so Jinja nested inside the
@@ -21,7 +22,52 @@
   {%- for key, value in user_cfg.items() -%}
     {%- do defaults.update({key: dbt_virtual.render_config_value(value)}) -%}
   {%- endfor -%}
+  {#- DECISION(cross_project_promote_by_clone): `physical_schema` / `physical_database` are where
+      the CURRENT environment's registry and physical tables live. Without `physical_locations`
+      they are `physical_schema` and `target.database`, as before. -#}
+  {%- set cli_env = var('_dbt_virtual_env', '') -%}
+  {%- set active_env = cli_env if cli_env != '' else defaults.get('environment', target.name) -%}
+  {%- set location = dbt_virtual.resolve_physical_location(defaults, active_env) -%}
+  {%- do defaults.update({
+    'physical_schema_default': defaults.get('physical_schema'),
+    'physical_schema': location['schema'],
+    'physical_database': location['database']
+  }) -%}
   {{ return(defaults) }}
+{%- endmacro %}
+
+
+{% macro resolve_physical_location(cfg, env_name) -%}
+  {#- `physical_locations.<env>` if listed, else `physical_locations.default`, else
+      `{database: target.database, schema: physical_schema}`. An entry may omit either key. -#}
+  {%- set locations = cfg.get('physical_locations', {}) or {} -%}
+  {%- set entry = locations.get(env_name) if env_name in locations else (locations.get('default') or {}) -%}
+  {%- set entry = entry if entry is mapping else {} -%}
+  {{ return({
+    'database': entry.get('database') or target.database,
+    'schema': entry.get('schema') or cfg.get('physical_schema_default', cfg.get('physical_schema'))
+  }) }}
+{%- endmacro %}
+
+
+{% macro physical_location(env_name=none) -%}
+  {#- Where `env_name`'s registry (`_environments`, `_releases`, ...) and physical tables live. -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if env_name is none -%}
+    {{ return({'database': cfg.get('physical_database'), 'schema': cfg.get('physical_schema')}) }}
+  {%- endif -%}
+  {{ return(dbt_virtual.resolve_physical_location(cfg, env_name)) }}
+{%- endmacro %}
+
+
+{% macro active_database() -%}
+  {#- Database of the current environment's physical location. -#}
+  {{ return(dbt_virtual.get_config().get('physical_database') or target.database) }}
+{%- endmacro %}
+
+
+{% macro same_location(a, b) -%}
+  {{ return((a['database'] | string | lower) == (b['database'] | string | lower) and (a['schema'] | string | lower) == (b['schema'] | string | lower)) }}
 {%- endmacro %}
 
 
