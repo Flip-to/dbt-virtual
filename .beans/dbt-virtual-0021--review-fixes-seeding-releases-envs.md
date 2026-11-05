@@ -1,7 +1,7 @@
 ---
 # dbt-virtual-0021
 title: 'Fix review findings: incremental seeding, partial releases, env schemas, adopt, BigQuery SQL'
-status: in-progress
+status: completed
 type: bug
 created_at: 2026-11-04T00:00:00Z
 updated_at: 2026-11-04T00:00:00Z
@@ -59,6 +59,6 @@ bean dbt-virtual-0022).
 | Asked | Developer: Yuri Olive | In-depth review of dbt-virtual (BigQuery focus), check it works in flipto-dbt, fix bugs, turn findings into tests | Chat request, 2026-11-04 | 2026-11-04 |
 | Built | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Fixes listed above; seeding moved before materialization, releases snapshot the env | PR #18 (commits 331e6ce, 99bb3ff) | 2026-11-04 |
 | Proven | CI | L3: `tests/test_dbt_duckdb_regressions.py` runs real dbt-duckdb; all 5 tests failed on 71a3fc4 and pass with the fix (local run 2026-11-04) | PR #18 CI run 41942958571 at 99bb3ff: unit 3.10/3.11/3.12, BigQuery emulator E2E, Snowflake emulator + Postgres E2E all pass | 2026-11-05 |
-| Reviewed | Reviewer: pending | | pending | |
-| Shipped | Developer: Yuri Olive | | pending | |
-| Verified | Developer: Yuri Olive | | pending: BigQuery emulator E2E + a flipto-dbt trial | |
+| Reviewed | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Diff reviewed; real BigQuery sandbox run found the parse bug fixed in 0f42ee9 | PR #18 final CI green; real dbt-duckdb regressions 6/6 at 0f42ee9; merge approved by Yuri Olive in chat 2026-11-05 | 2026-11-05 |
+| Shipped | Developer: Yuri Olive | Squash merge to main | PR #18 merge | 2026-11-05 |
+| Verified | Developer: Yuri Olive | | pending: post-merge main CI and the flipto-dbt pilot (bean dbt-virtual-0023) | |
