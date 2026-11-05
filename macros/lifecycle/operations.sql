@@ -459,7 +459,11 @@
         {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, to_env) -%}
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying routine " ~ to_schema ~ "." ~ model_name, info=True) }}
         {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
-        {%- do run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
+        {#- The check used to run without looking at its result. -#}
+        {%- set routine_check = run_query(dbt_virtual.validate_routine_exists_sql(to_schema, model_name)) -%}
+        {%- if routine_check is not none and routine_check.rows is defined and (routine_check.rows | length) == 0 -%}
+          {{ exceptions.raise_compiler_error("dbt-virtual promote [" ~ to_env ~ "]: routine " ~ to_schema ~ "." ~ model_name ~ " was not found after deployment.") }}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
 

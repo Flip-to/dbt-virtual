@@ -126,6 +126,15 @@ class MacroTestHarness:
             self.executed_queries.append(sql.strip())
             if self.query_responses:
                 return self.query_responses.pop(0)
+            # Routine existence checks see routines whose CREATE statement already ran, like a warehouse.
+            check = re.search(r"`([^`]+)`\.INFORMATION_SCHEMA\.ROUTINES\s+WHERE routine_name = '([^']+)'", sql)
+            if check:
+                schema_name, routine_name = check.groups()
+                created = any(
+                    re.search(rf"CREATE OR REPLACE (TABLE )?(FUNCTION|PROCEDURE) [^\n(]*`{re.escape(schema_name)}`\.`{re.escape(routine_name)}`", q)
+                    for q in self.executed_queries
+                )
+                return FakeResult([(routine_name,)] if created else [])
             return FakeResult([])
 
         def _raise_compiler_error(msg: str) -> None:

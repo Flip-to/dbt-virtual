@@ -167,3 +167,23 @@ def test_promote_and_rollback_take_the_lease_lock_when_asked() -> None:
     assert executed[2].startswith("INSERT INTO `test_proj`.`analytics_physical`._locks")
     assert executed[-1].startswith("DELETE FROM `test_proj`.`analytics_physical`._locks")
     assert "owner = 'cli@host'" in executed[-1]
+
+
+def test_promote_fails_when_routine_is_missing_after_deploy() -> None:
+    """The existence check after deploying a routine used to ignore its result."""
+    harness = MacroTestHarness(vars_dict={"dbt_virtual": {"physical_schema": "analytics_physical"}})
+    ddl = "CREATE OR REPLACE TABLE FUNCTION `test_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`() AS (SELECT 1)"
+    harness.query_responses.extend(
+        [
+            FakeResult([("tvf", "table_function", "fpt", "staging.tvf", ddl, 3)]),
+            FakeResult([]),  # existing prod pointers
+            FakeResult([]),  # create statement
+            FakeResult([]),  # INFORMATION_SCHEMA.ROUTINES: not found
+        ]
+    )
+    try:
+        harness.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="r1")
+    except RuntimeError as exc:
+        assert "was not found after deployment" in str(exc)
+    else:
+        raise AssertionError("promote must fail when the routine does not exist after deployment")
