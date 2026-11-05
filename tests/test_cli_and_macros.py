@@ -265,7 +265,8 @@ def test_state_file_without_catalog_snapshot_keeps_pointer_assumption(tmp_path: 
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"base_env_state": {"orders_metrics": "oldfp"}}))
 
-    _, base_state, existing_tables = _load_state_file(str(state_path))
+    _, base_state, existing_tables, registered = _load_state_file(str(state_path))
+    assert registered is None
 
     assert base_state == {"orders_metrics": "oldfp"}
     assert existing_tables is None

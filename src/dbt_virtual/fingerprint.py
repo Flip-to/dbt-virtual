@@ -16,6 +16,7 @@ from sqlglot.errors import SqlglotError
 
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
+METADATA_ONLY_CONFIG = frozenset({"forward_only", "on_schema_change"})
 # `virtual_function` is the scalar UDF materialization on dbt-core 1.11+ (core owns `function`).
 ROUTINE_MATERIALIZATIONS = frozenset({"table_function", "function", "virtual_function", "procedure"})
 
@@ -379,7 +380,9 @@ def compute_node_fingerprint(
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "resource_type": resource_type,
         "name": name,
-        "config": config_subset,
+        # How later runs treat the table, not what it contains (SQLMesh also keeps these out of
+        # the data hash), so changing them must not rebuild the physical table.
+        "config": {k: v for k, v in config_subset.items() if k not in METADATA_ONLY_CONFIG},
         "normalized_compiled_sql": norm_compiled,
         "normalized_raw_sql": norm_raw,
         "upstream_fingerprints": sorted_upstreams,

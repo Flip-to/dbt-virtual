@@ -547,17 +547,18 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     assert "AS $$" in sf_tvf
     sf_orphan = sf_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
     assert "REGEXP_LIKE" in sf_orphan
-    assert "MAX(created_at) AS release_created_at" in sf_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in sf_orphan
     assert "GROUP BY release_id" in sf_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= 5" in sf_orphan
+    # Retention is per environment, so PR candidates cannot push out prod's rollback targets.
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= 5" in sf_orphan
     assert "t.created < DATEADD(day, -7, CURRENT_TIMESTAMP())" in sf_orphan
     assert "LEFT JOIN protected_tables" in sf_orphan
 
     bq_harness = MacroTestHarness(adapter_type="bigquery")
     bq_orphan = bq_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
-    assert "MAX(created_at) AS release_created_at" in bq_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in bq_orphan
     assert "GROUP BY release_id" in bq_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= 5" in bq_orphan
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= 5" in bq_orphan
 
     for adapter_type, matcher in (
         ("duckdb", "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"),
@@ -581,9 +582,9 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
         assert "no safe fingerprint table matcher is configured" in str(exc)
 
     duckdb_orphan = harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
-    assert "MAX(created_at) AS release_created_at" in duckdb_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in duckdb_orphan
     assert "GROUP BY release_id" in duckdb_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC)" in duckdb_orphan
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC)" in duckdb_orphan
     assert "MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
 
     # Databricks dispatch: SHALLOW CLONE
@@ -753,6 +754,8 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
             ]
         )
     )
+    # Rollback checks that the release's physical tables still exist before re-pointing views.
+    harness.existing_relations.add(("test_proj", "analytics_physical", "orders_metrics__fp000"))
     harness.call_macro("virtual_rollback", env="prod", to_release="")
     rollback_queries = "\n".join(harness.executed_queries)
     assert "SELECT * FROM `test_proj`.`analytics_physical`.`orders_metrics__fp000`" in rollback_queries
@@ -829,22 +832,29 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
     # 2. Concurrency lock acquisition & conflict detection
     harness.executed_queries.clear()
     harness.query_responses.append(FakeResult([]))  # delete expired
-    harness.query_responses.append(FakeResult([]))  # check active lock -> none
-    harness.query_responses.append(FakeResult([]))  # delete self
-    harness.query_responses.append(FakeResult([]))  # insert lock
+    harness.query_responses.append(FakeResult([]))  # delete own lease
+    harness.query_responses.append(FakeResult([]))  # insert own lease
+    harness.query_responses.append(FakeResult([("ci_job_1", "2026-10-27T23:59:59Z")]))  # live leases
     harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
     lock_queries = "\n".join(harness.executed_queries)
     assert "INSERT INTO `test_proj`.`analytics_physical`._locks" in lock_queries
     assert "'ci_job_1'" in lock_queries
+    assert "ORDER BY acquired_at ASC, owner ASC" in lock_queries
 
-    # Active lock held by another owner raises RuntimeError
-    harness.query_responses.append(FakeResult([]))  # delete expired
-    harness.query_responses.append(FakeResult([("ci_job_other", "2026-10-27T23:59:59Z")]))
+    # An older live lease of another owner wins: this owner removes its lease and fails.
+    harness.executed_queries.clear()
+    harness.query_responses.extend([FakeResult([]), FakeResult([]), FakeResult([])])
+    harness.query_responses.append(
+        FakeResult([("ci_job_other", "2026-10-27T23:59:59Z"), ("ci_job_1", "2026-10-27T23:59:59Z")])
+    )
     try:
         harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
         raise AssertionError("Expected RuntimeError on lock conflict")
     except RuntimeError as exc:
         assert "dbt-virtual lock conflict" in str(exc)
+        assert "'ci_job_other'" in str(exc)
+    assert harness.executed_queries[-1].startswith("DELETE FROM `test_proj`.`analytics_physical`._locks")
+    assert "owner = 'ci_job_1'" in harness.executed_queries[-1]
 
     harness.executed_queries.clear()
     harness.call_macro("virtual_release_lock", env="prod", owner="ci_job_1")

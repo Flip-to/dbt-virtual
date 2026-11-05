@@ -430,16 +430,21 @@ $$
 
 {% macro bigquery__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
+    -- The last N releases of EACH environment: ranking across all environments let busy PR
+    -- candidates push prod's rollback targets out of retention.
     SELECT release_id
     FROM (
-      SELECT release_id, MAX(created_at) AS release_created_at
+      SELECT
+        release_id,
+        COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+        MAX(COALESCE(promoted_at, created_at)) AS release_ts
       FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
-      WHERE status IN ('promoted', 'candidate')
+      WHERE status IN ('promoted', 'candidate', 'rolled_back')
       GROUP BY release_id
     )
     -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
     WHERE TRUE
-    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
+    QUALIFY DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT SPLIT(physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
@@ -465,14 +470,16 @@ $$
   WITH protected_releases AS (
     SELECT release_id
     FROM (
-      SELECT release_id, MAX(created_at) AS release_created_at
+      SELECT
+        release_id,
+        COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+        MAX(COALESCE(promoted_at, created_at)) AS release_ts
       FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-      WHERE status IN ('promoted', 'candidate')
+      WHERE status IN ('promoted', 'candidate', 'rolled_back')
       GROUP BY release_id
     )
-    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
     WHERE TRUE
-    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
+    QUALIFY DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2)) AS table_name
@@ -527,11 +534,14 @@ $$
     SELECT release_id
     FROM (
       SELECT release_id,
-        DENSE_RANK() OVER (ORDER BY release_created_at DESC) AS release_rank
+        DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) AS release_rank
       FROM (
-        SELECT release_id, MAX(created_at) AS release_created_at
+        SELECT
+          release_id,
+          COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+          MAX(COALESCE(promoted_at, created_at)) AS release_ts
         FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-        WHERE status IN ('promoted', 'candidate')
+        WHERE status IN ('promoted', 'candidate', 'rolled_back')
         GROUP BY release_id
       ) AS release_times
     ) AS ranked_releases

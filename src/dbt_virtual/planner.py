@@ -152,6 +152,7 @@ def classify_plan_actions(
     base_env_state: dict[str, str] | None = None,
     existing_physical_tables: set[str] | None = None,
     full_refresh: bool = False,
+    registered_physical_tables: set[str] | None = None,
 ) -> dict[str, NodePlanAction]:
     """Classify each virtualized node into REUSE, SEED_INCREMENTAL, FULL_BUILD, or ROUTINE_DEPLOY.
 
@@ -167,10 +168,16 @@ def classify_plan_actions(
         Optional set of physical table names (`<model>__<fp>`) already materialized in `<physical_schema>`.
     full_refresh:
         When True, forces `FULL_BUILD` on all table/incremental models.
+    registered_physical_tables:
+        Optional set of physical tables referenced by `_environments` or `_releases`, i.e. written
+        by a build that finished. When given, an existing table that is not registered (e.g. a
+        clone whose `dbt build` failed) is rebuilt instead of reused.
     """
     env_map = env_state or {}
     base_map = base_env_state or {}
     phys_tables = set(existing_physical_tables or set())
+    if registered_physical_tables is not None:
+        phys_tables &= set(registered_physical_tables)
 
     # Without a catalog snapshot, treat state pointers as evidence that physical tables exist.
     # When a snapshot is supplied, it is authoritative and can reveal stale registry pointers.

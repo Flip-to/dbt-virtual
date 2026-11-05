@@ -36,16 +36,34 @@ def _load_manifest(project_dir: Path, manifest_override: str | None = None) -> d
 
 def _load_state_file(
     state_path: str | None,
-) -> tuple[dict[str, str], dict[str, str], set[str] | None]:
-    """Load optional warehouse state snapshot JSON (`env_state`, `base_env_state`, `existing_physical_tables`)."""
+) -> tuple[dict[str, str], dict[str, str], set[str] | None, set[str] | None]:
+    """Load an optional warehouse state snapshot (`dbt-virtual status --output`).
+
+    Returns `env_state`, `base_env_state`, `existing_physical_tables` and
+    `registered_physical_tables` (the last two are None when the snapshot lacks them).
+    """
     if not state_path:
-        return {}, {}, set()
+        return {}, {}, set(), None
     raw = json.loads(Path(state_path).read_text(encoding="utf-8"))
     env_state = dict(raw.get("env_state") or {})
     base_env_state = dict(raw.get("base_env_state") or {})
     existing_tables_raw = raw.get("existing_physical_tables")
     existing_tables = set(existing_tables_raw) if existing_tables_raw is not None else None
-    return env_state, base_env_state, existing_tables
+    registered_raw = raw.get("registered_physical_tables")
+    registered = set(registered_raw) if registered_raw is not None else None
+    return env_state, base_env_state, existing_tables, registered
+
+
+def _default_lock_owner() -> str:
+    """A lease owner that is stable for one user on one machine, so a failed promote can be retried."""
+    import getpass
+    import socket
+
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no login name in some CI containers
+        user = "unknown"
+    return f"dbt-virtual-cli:{user}@{socket.gethostname()}"
 
 
 def _run_dbt(args: list[str], project_dir: Path) -> int:
@@ -66,12 +84,13 @@ def cmd_plan(ns: argparse.Namespace) -> int:
     out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps, out_file)
 
-    env_state, base_env_state, existing_tables = _load_state_file(ns.state_file)
+    env_state, base_env_state, existing_tables, registered = _load_state_file(ns.state_file)
     actions = classify_plan_actions(
         fps,
         env_state=env_state,
         base_env_state=base_env_state,
         existing_physical_tables=existing_tables,
+        registered_physical_tables=registered,
     )
 
     counts: dict[str, int] = {}
@@ -120,13 +139,14 @@ def cmd_build(ns: argparse.Namespace) -> int:
     out_file = project_dir / ".dbt_virtual" / "fingerprints.json"
     write_fingerprints_file(fps, out_file)
 
-    env_state, base_env_state, existing_tables = _load_state_file(ns.state_file)
+    env_state, base_env_state, existing_tables, registered = _load_state_file(ns.state_file)
     actions = classify_plan_actions(
         fps,
         env_state=env_state,
         base_env_state=base_env_state,
         existing_physical_tables=existing_tables,
         full_refresh=ns.full_refresh,
+        registered_physical_tables=registered,
     )
     models_to_build, reused_models = compute_dbt_select_for_build(actions)
 
@@ -226,6 +246,8 @@ def cmd_promote(ns: argparse.Namespace) -> int:
         "release_id": ns.release,
         "audit": bool(ns.audit),
         "max_row_drop_pct": float(ns.max_row_drop_pct),
+        "lock": not ns.no_lock,
+        "lock_owner": ns.lock_owner or _default_lock_owner(),
     }
     return _run_dbt(
         ["run-operation", "virtual_promote", "--args", json.dumps(op_args)],
@@ -308,6 +330,8 @@ def cmd_rollback(ns: argparse.Namespace) -> int:
     op_args = {
         "env": ns.env,
         "to_release": ns.to_release or "",
+        "lock": not ns.no_lock,
+        "lock_owner": ns.lock_owner or _default_lock_owner(),
     }
     return _run_dbt(
         ["run-operation", "virtual_rollback", "--args", json.dumps(op_args)],
@@ -470,6 +494,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=100.0,
         help="Maximum allowed row drop percentage when --audit is enabled.",
     )
+    p_promote.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Do not take the environment lease lock in <physical_schema>._locks.",
+    )
+    p_promote.add_argument(
+        "--lock-owner",
+        default=None,
+        help="Lease owner name (default: dbt-virtual-cli:<user>@<host>).",
+    )
     p_promote.set_defaults(func=cmd_promote)
 
     # audit
@@ -497,6 +531,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rollback = sub.add_parser("rollback", help="Instant rollback of views and routines to a previous release.")
     p_rollback.add_argument("--env", default="prod", help="Environment to roll back.")
     p_rollback.add_argument("--to-release", default=None, help="Specific release ID (defaults to last good release).")
+    p_rollback.add_argument(
+        "--no-lock",
+        action="store_true",
+        help="Do not take the environment lease lock in <physical_schema>._locks.",
+    )
+    p_rollback.add_argument(
+        "--lock-owner",
+        default=None,
+        help="Lease owner name (default: dbt-virtual-cli:<user>@<host>).",
+    )
     p_rollback.set_defaults(func=cmd_rollback)
 
     # diff

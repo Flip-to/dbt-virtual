@@ -37,9 +37,11 @@
 
 {% macro virtual_acquire_lock(env='prod', owner='dbt-virtual', ttl_minutes=15) -%}
   {#-
-    Concurrency guard / lease lock:
-    Clears expired locks for `env`, verifies no active lock is held by another owner,
-    and acquires a lease in `<physical_schema>._locks`.
+    Lease lock on `env` in `<physical_schema>._locks`:
+    1. drop expired leases, 2. write (or refresh) this owner's lease, 3. read every live lease.
+    The live lease with the earliest `acquired_at` (then lowest owner) wins; every contender reads
+    the same rows and picks the same winner, so two runners can no longer both "acquire" the lock,
+    which the previous check-then-insert allowed. A loser removes its lease and fails.
   -#}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
@@ -48,23 +50,6 @@
   {%- do dbt_virtual.ensure_registry() -%}
 
   {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND expires_at <= " ~ dbt_virtual.current_timestamp_sql()) -%}
-
-  {%- set active_query -%}
-    SELECT owner, expires_at
-    FROM {{ locks_rel }}
-    WHERE environment = '{{ env }}'
-      AND owner != '{{ owner }}'
-      AND expires_at > {{ dbt_virtual.current_timestamp_sql() }}
-    LIMIT 1
-  {%- endset -%}
-
-  {%- set active_res = run_query(active_query) -%}
-  {%- if active_res and (active_res.rows | length) > 0 -%}
-    {%- set holder = active_res.rows[0][0] -%}
-    {%- set exp = active_res.rows[0][1] -%}
-    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "' is currently locked by '" ~ holder ~ "' (expires at " ~ exp ~ ").") }}
-  {%- endif -%}
-
   {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
   {%- do dbt_virtual.exec_ddl_dml(
     "INSERT INTO " ~ locks_rel ~ " (environment, owner, acquired_at, expires_at) VALUES ("
@@ -72,6 +57,19 @@
     ~ dbt_virtual.current_timestamp_sql() ~ ", "
     ~ dbt_virtual.timestamp_add_minutes_sql(ttl_minutes) ~ ")"
   ) -%}
+
+  {%- set live_query -%}
+    SELECT owner, expires_at
+    FROM {{ locks_rel }}
+    WHERE environment = '{{ env }}'
+      AND expires_at > {{ dbt_virtual.current_timestamp_sql() }}
+    ORDER BY acquired_at ASC, owner ASC
+  {%- endset -%}
+  {%- set live = run_query(live_query) -%}
+  {%- if live and (live.rows | length) > 0 and live.rows[0][0] != owner -%}
+    {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ locks_rel ~ " WHERE environment = '" ~ env ~ "' AND owner = '" ~ owner ~ "'") -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual lock conflict: Environment '" ~ env ~ "' is currently locked by '" ~ live.rows[0][0] ~ "' (expires at " ~ live.rows[0][1] ~ ").") }}
+  {%- endif -%}
   {{ log("dbt-virtual lock [" ~ env ~ "]: Acquired lock for owner='" ~ owner ~ "' (ttl=" ~ ttl_minutes ~ "m)", info=True) }}
 {%- endmacro %}
 
@@ -217,7 +215,23 @@
     {%- endfor -%}
   {%- endif -%}
 
+  {#- Physical tables some environment or release points at, i.e. written by a successful build.
+      A table that exists but is not registered (e.g. a clone whose build failed) must not be reused. -#}
+  {%- set registered_query -%}
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} WHERE resource_type = 'model'
+    UNION DISTINCT
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
+  {%- endset -%}
+  {%- set registered_rows = run_query(registered_query | replace('UNION DISTINCT', 'UNION') if target.type != 'bigquery' else registered_query) -%}
+  {%- set registered_tables = [] -%}
+  {%- if registered_rows -%}
+    {%- for r in registered_rows.rows -%}
+      {%- do registered_tables.append(r[0].split('.')[-1]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
   {%- set payload = {
+    'registered_physical_tables': registered_tables | unique | list | sort,
     'env': env,
     'base_env': base_env,
     'physical_schema': phys_schema,
@@ -229,7 +243,68 @@
 {%- endmacro %}
 
 
-{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0) -%}
+{% macro routine_depths() -%}
+  {#- Depth of each virtual node in the project's DAG (0 = no virtual parents), used to deploy a
+      routine after the routines and views it reads instead of alphabetically within its tier. -#}
+  {%- set uid_names = {} -%}
+  {%- set parents = {} -%}
+  {%- if graph is defined and graph.nodes is defined -%}
+    {%- for uid, node in graph.nodes.items() -%}
+      {%- if dbt_virtual.is_virtual_node(node) -%}
+        {%- do uid_names.update({uid: dbt_virtual.node_attr(node, 'name', '')}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- for uid, node in graph.nodes.items() -%}
+      {%- if uid in uid_names -%}
+        {%- set names = [] -%}
+        {%- for parent_uid in (dbt_virtual.node_attr(dbt_virtual.node_attr(node, 'depends_on', {}), 'nodes', []) or []) -%}
+          {%- if parent_uid in uid_names -%}
+            {%- do names.append(uid_names[parent_uid]) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- do parents.update({uid_names[uid]: names}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set depths = {} -%}
+  {%- for _ in range(16) -%}
+    {%- for name, names in parents.items() -%}
+      {%- set depth = namespace(value=0) -%}
+      {%- for parent in names -%}
+        {%- if depths.get(parent, 0) + 1 > depth.value -%}
+          {%- set depth.value = depths.get(parent, 0) + 1 -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- do depths.update({name: depth.value}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{ return(depths) }}
+{%- endmacro %}
+
+
+{% macro ordered_registry_rows(rows, schema_key_index) -%}
+  {#- Registry rows as dicts in deployment order: environment views first (they are `SELECT *`
+      over physical tables), then routines by DAG depth, then UDFs before TVFs before procedures. -#}
+  {%- set depths = dbt_virtual.routine_depths() -%}
+  {%- set items = [] -%}
+  {%- for row in rows -%}
+    {%- do items.append({
+      'model_name': row[0],
+      'resource_type': row[1],
+      'fingerprint': row[2],
+      'physical_identifier': row[3],
+      'routine_ddl': row[4],
+      'schema_key': dbt_virtual.row_value(row, schema_key_index),
+      'group': 0 if row[1] == 'model' else 1,
+      'depth': depths.get(row[0], 0),
+      'rank': {'function': 1, 'virtual_function': 1, 'table_function': 2}.get(row[1], 3)
+    }) -%}
+  {%- endfor -%}
+  {{ return(items | sort(attribute='model_name') | sort(attribute='rank') | sort(attribute='depth') | sort(attribute='group')) }}
+{%- endmacro %}
+
+
+{% macro virtual_promote(from_env='staging', to_env='prod', release_id='', audit=false, max_row_drop_pct=100.0, lock=false, lock_owner='') -%}
   {#-
     Zero-rebuild promotion:
     1. Optionally runs `virtual_audit` quality gate when `audit=true`.
@@ -246,6 +321,10 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set ensured_schemas = [] -%}
+  {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
+  {%- if lock -%}
+    {%- do dbt_virtual.virtual_acquire_lock(env=to_env, owner=owner) -%}
+  {%- endif -%}
 
   {%- if audit -%}
     {%- do dbt_virtual.virtual_audit(from_env=from_env, to_env=to_env, release_id=release_id, allow_empty=false, max_row_drop_pct=max_row_drop_pct) -%}
@@ -300,11 +379,13 @@
     {{ exceptions.raise_compiler_error("dbt-virtual promote: No models found for env=" ~ from_env ~ " release=" ~ release_id) }}
   {%- endif -%}
 
+  {%- set ordered = dbt_virtual.ordered_registry_rows(rows.rows, 6) -%}
+
   {#- Phase 1: Pre-flight verification that every referenced physical table exists -#}
-  {%- for row in rows.rows -%}
-    {%- set model_name = row[0] -%}
-    {%- set resource_type = row[1] -%}
-    {%- set phys_ident = row[3] -%}
+  {%- for item in ordered -%}
+    {%- set model_name = item['model_name'] -%}
+    {%- set resource_type = item['resource_type'] -%}
+    {%- set phys_ident = item['physical_identifier'] -%}
     {%- if resource_type == 'model' -%}
       {%- set phys_table = phys_ident.split('.')[-1] -%}
       {%- set exists_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) -%}
@@ -337,13 +418,13 @@
   {%- set promoted_names = [] -%}
 
   {#- Phase 2: Ordered promotion (views -> UDFs -> TVFs -> procedures), by resource type, not the stored tier. -#}
-  {%- for row in rows.rows -%}
-    {%- set model_name = row[0] -%}
-    {%- set resource_type = row[1] -%}
-    {%- set fp = row[2] -%}
-    {%- set phys_ident = row[3] -%}
-    {%- set routine_ddl = row[4] -%}
-    {%- set schema_key = dbt_virtual.row_value(row, 6) -%}
+  {%- for item in ordered -%}
+    {%- set model_name = item['model_name'] -%}
+    {%- set resource_type = item['resource_type'] -%}
+    {%- set fp = item['fingerprint'] -%}
+    {%- set phys_ident = item['physical_identifier'] -%}
+    {%- set routine_ddl = item['routine_ddl'] -%}
+    {%- set schema_key = item['schema_key'] -%}
     {%- set to_schema = dbt_virtual.env_schema_for(to_env, schema_key) -%}
     {%- do promoted_names.append(model_name) -%}
 
@@ -422,6 +503,9 @@
 
   {%- if release_id != '' -%}
     {%- do dbt_virtual.exec_ddl_dml("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
+  {%- endif -%}
+  {%- if lock -%}
+    {%- do dbt_virtual.virtual_release_lock(env=to_env, owner=owner) -%}
   {%- endif -%}
 {%- endmacro %}
 
@@ -550,7 +634,7 @@
 {%- endmacro %}
 
 
-{% macro virtual_rollback(env='prod', to_release='') -%}
+{% macro virtual_rollback(env='prod', to_release='', lock=false, lock_owner='') -%}
   {#-
     Instant rollback:
     Repoints all views in `env` back to `to_release` (or the most recent prior `promoted` release in `_releases`).
@@ -558,6 +642,10 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set ensured_schemas = [] -%}
+  {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
+  {%- if lock -%}
+    {%- do dbt_virtual.virtual_acquire_lock(env=env, owner=owner) -%}
+  {%- endif -%}
 
   {%- set target_release = to_release -%}
   {%- if target_release == '' -%}
@@ -612,14 +700,25 @@
   {%- if not rows or (rows.rows | length) == 0 -%}
     {{ exceptions.raise_compiler_error("dbt-virtual rollback: No models found for release " ~ target_release) }}
   {%- endif -%}
+  {%- set ordered = dbt_virtual.ordered_registry_rows(rows.rows, 5) -%}
+  {#- Pre-flight: every physical table of the target release must still exist (GC may have
+      dropped it), otherwise the rollback would stop halfway with views re-pointed. -#}
+  {%- for item in ordered -%}
+    {%- if item['resource_type'] == 'model' -%}
+      {%- set phys_table = item['physical_identifier'].split('.')[-1] -%}
+      {%- if adapter.get_relation(database=target.database, schema=phys_schema, identifier=phys_table) is none -%}
+        {{ exceptions.raise_compiler_error("dbt-virtual rollback pre-flight failed: physical table " ~ phys_schema ~ "." ~ phys_table ~ " of release " ~ target_release ~ " (model " ~ item['model_name'] ~ ") does not exist.") }}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- set rollback_names = [] -%}
-  {%- for row in rows.rows -%}
-    {%- set model_name = row[0] -%}
-    {%- set resource_type = row[1] -%}
-    {%- set fp = row[2] -%}
-    {%- set phys_ident = row[3] -%}
-    {%- set routine_ddl = row[4] -%}
-    {%- set schema_key = dbt_virtual.row_value(row, 5) -%}
+  {%- for item in ordered -%}
+    {%- set model_name = item['model_name'] -%}
+    {%- set resource_type = item['resource_type'] -%}
+    {%- set fp = item['fingerprint'] -%}
+    {%- set phys_ident = item['physical_identifier'] -%}
+    {%- set routine_ddl = item['routine_ddl'] -%}
+    {%- set schema_key = item['schema_key'] -%}
     {%- set env_schema = dbt_virtual.env_schema_for(env, schema_key) -%}
     {%- do rollback_names.append(model_name) -%}
     {%- if env_schema not in ensured_schemas -%}
@@ -681,6 +780,9 @@
       ) -%}
     {%- endif -%}
   {%- endfor -%}
+  {%- if lock -%}
+    {%- do dbt_virtual.virtual_release_lock(env=env, owner=owner) -%}
+  {%- endif -%}
 {%- endmacro %}
 
 
