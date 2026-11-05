@@ -30,7 +30,7 @@ Exercises the full virtual data environment lifecycle against a running BigQuery
 8. Janitor GC protection query:
    - Verifies active and retained release tables are protected while unreferenced tables are flagged as orphans.
 
-Steps 11-19 (`run_feature_steps`) run the real rendered macros against the emulator through the harness's
+Steps 11-25 (`run_feature_steps`) run the real rendered macros against the emulator through the harness's
 `query_executor` / `relation_lookup` hooks:
    11. Registry DDL (`ensure_registry_tables_sql`) and `registry_migrations_sql` on an old-shape registry.
    12. Batched registry flush (`flush_registry`): one MERGE for several objects, `build_quality` stamped.
@@ -41,7 +41,16 @@ Steps 11-19 (`run_feature_steps`) run the real rendered macros against the emula
    17. Regions: `CREATE SCHEMA ... OPTIONS (location = ...)`, per-location registry.
    18. GC per-environment retention (`find_orphan_tables_sql`, `virtual_gc`) with releases in two environments.
    19. Companion state save / restore (`companion_depart`, `restore_companion_state`) on a fake manifest table.
-   20. `virtual_data_diff` and `virtual_audit` run from a CI target read prod from its own `physical_locations` entry.
+   20-25 (`emulator_e2e_gap_steps.py`, features that were tested only on DuckDB or the mock harness):
+   20. Data diff (`virtual_data_diff`): BIT_XOR(FARM_FINGERPRINT(TO_JSON_STRING(...))) per partition, exact counts.
+   21. Cross-location / cross-project promote-by-clone (`physical_locations`, `source_database` / `source_schema`).
+   22. `authorize_env_views`: authorized-dataset access entry added once (datasets.get / datasets.patch).
+   23. Env view metadata: `OPTIONS(description, labels)` and column descriptions (tables.get / tables.patch).
+   24. `gc --expire-env-days` (`virtual_expire_envs`, `DROP SCHEMA ... CASCADE`).
+   25. Shared-table write guard (`assert_shared_tables_safe`) and `DBT_VIRTUAL_FPS`.
+   Steps 20-25 need the emulator changes of Flip-to/googlesqlite#36 and Flip-to/bigquery-emulator#32
+   (`CREATE TABLE ... CLONE`, `DROP SCHEMA`, persisted `datasets.patch` with `access`, view OPTIONS as table metadata).
+   26. `virtual_data_diff` and `virtual_audit` run from a CI target read prod from its own `physical_locations` entry.
 Emulator limitations are listed in the final "Skipped" summary; the script is not re-runnable on one emulator
 instance (restart it between runs).
 """
@@ -53,6 +62,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from emulator_e2e_gap_steps import run_bigquery_gap_steps
 
 from dbt_virtual.fingerprint import compute_manifest_fingerprints, compute_node_fingerprint
 from dbt_virtual.planner import classify_plan_actions, compute_dbt_select_for_build
@@ -402,7 +413,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     restored = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.manifest` ORDER BY model")
     assert restored == [{"model": "inc_m", "d": "2026-11-01"}, {"model": "other", "d": "2026-01-01"}], restored
     print("[companion] state saved when the env left fp1, restored on return; other models' rows untouched.")
-    # 20. Gates across `physical_locations`: from the CI target, prod's registry and tables are in
+    # 26. Gates across `physical_locations`: from the CI target, prod's registry and tables are in
     # another dataset. Found on real BigQuery: both gates read prod from the CI registry and passed
     # without comparing anything (docs/findings/20261105_bigquery_sandbox_verification.md).
     for ds in ("e2e_loc_ci", "e2e_loc_prod"):
@@ -439,6 +450,8 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         hb.call_macro("virtual_print_base_environment")
         assert f"DBT_VIRTUAL_BASE_ENV:{expected_base}" in hb.logs, hb.logs
     print("[base_environment] a Jinja base_environment is rendered per target.")
+
+    run_bigquery_gap_steps(client, q, project, requests, endpoint)
     return skipped
 
 
