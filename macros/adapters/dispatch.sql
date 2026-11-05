@@ -54,19 +54,128 @@
 {%- endmacro %}
 
 
-{% macro create_or_replace_view_sql(view_relation, physical_relation) -%}
-  {{ return(adapter.dispatch('create_or_replace_view_sql', 'dbt_virtual')(view_relation, physical_relation)) }}
+{% macro create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
+  {#- `node` (optional) is the dbt node of the model; BigQuery puts its description and labels in the view's OPTIONS. -#}
+  {{ return(adapter.dispatch('create_or_replace_view_sql', 'dbt_virtual')(view_relation, physical_relation, node)) }}
 {%- endmacro %}
 
-{% macro postgres__create_or_replace_view_sql(view_relation, physical_relation) -%}
+{% macro postgres__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
   DROP VIEW IF EXISTS {{ view_relation }} CASCADE;
   CREATE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
 {%- endmacro %}
 
-{% macro default__create_or_replace_view_sql(view_relation, physical_relation) -%}
+{% macro bigquery__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
+  CREATE OR REPLACE VIEW {{ view_relation }}{{ dbt_virtual.bigquery_env_view_options(node) }} AS
+  SELECT * FROM {{ physical_relation }}
+{%- endmacro %}
+
+{% macro default__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
   CREATE OR REPLACE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
+{%- endmacro %}
+
+
+{% macro bigquery_env_view_options(node) -%}
+  {#-
+    ` OPTIONS(description=..., labels=[...])` for an env view, or ''. Mirrors dbt-bigquery's
+    `get_common_options`: the description only when `persist_docs.relation` is on, `labels` always
+    (and `labels_from_meta`). Metadata is not part of the fingerprint.
+  -#}
+  {%- if node is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
+  {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
+  {%- set opts = [] -%}
+  {%- set description = dbt_virtual.node_attr(node, 'description', '') -%}
+  {%- if persist is mapping and persist.get('relation') and description -%}
+    {%- do opts.append('description=' ~ dbt_virtual.sql_string_literal(description)) -%}
+  {%- endif -%}
+  {%- set labels = dbt_virtual.node_attr(node_cfg, 'labels', {}) or {} -%}
+  {%- if dbt_virtual.node_attr(node_cfg, 'labels_from_meta', false) -%}
+    {%- set merged = {} -%}
+    {%- for meta_key, meta_val in (dbt_virtual.node_attr(node_cfg, 'meta', {}) or {}).items() -%}
+      {%- do merged.update({meta_key: meta_val}) -%}
+    {%- endfor -%}
+    {%- do merged.update(labels) -%}
+    {%- set labels = merged -%}
+  {%- endif -%}
+  {%- if labels -%}
+    {%- set pairs = [] -%}
+    {%- for label_key, label_val in labels.items() -%}
+      {%- do pairs.append('(' ~ dbt_virtual.sql_string_literal(label_key) ~ ', ' ~ dbt_virtual.sql_string_literal(label_val) ~ ')') -%}
+    {%- endfor -%}
+    {%- do opts.append('labels=[' ~ (pairs | join(', ')) ~ ']') -%}
+  {%- endif -%}
+  {%- if (opts | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {{ return(' OPTIONS(' ~ (opts | join(', ')) ~ ')') }}
+{%- endmacro %}
+
+
+{% macro env_view_column_docs(node) -%}
+  {#- `{column: {name, description}}` to persist on an env view: only with `persist_docs.columns`. -#}
+  {%- set described = {} -%}
+  {%- if node is not none -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
+    {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
+    {%- if persist is mapping and persist.get('columns') -%}
+      {%- for col_name, col in (dbt_virtual.node_attr(node, 'columns', {}) or {}).items() -%}
+        {%- set col_description = dbt_virtual.node_attr(col, 'description', '') -%}
+        {%- if col_description -%}
+          {%- do described.update({col_name: {'name': col_name, 'description': col_description}}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {{ return(described) }}
+{%- endmacro %}
+
+
+{% macro apply_env_view_metadata(view_relation, node) -%}
+  {#- Metadata that `CREATE VIEW` cannot carry. BigQuery: column descriptions, set the way
+      dbt-bigquery's own view materialization does (`adapter.update_columns`). -#}
+  {{ return(adapter.dispatch('apply_env_view_metadata', 'dbt_virtual')(view_relation, node)) }}
+{%- endmacro %}
+
+{% macro default__apply_env_view_metadata(view_relation, node) -%}
+{%- endmacro %}
+
+{% macro bigquery__apply_env_view_metadata(view_relation, node) -%}
+  {%- if node is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set described = dbt_virtual.env_view_column_docs(node) -%}
+  {%- if described -%}
+    {%- do adapter.update_columns(view_relation, described) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {#- Lets the views of `env_schema` read `physical_schema` without granting readers access to it. -#}
+  {{ return(adapter.dispatch('authorize_env_dataset', 'dbt_virtual')(database, env_schema, physical_schema)) }}
+{%- endmacro %}
+
+{% macro default__authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {{ log("dbt-virtual: authorize_env_views is a BigQuery feature; ignoring it on " ~ target.type ~ ".", info=False) }}
+{%- endmacro %}
+
+{% macro bigquery__authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {#- ONE authorized-dataset entry (`targetTypes: [VIEWS]`) on the physical dataset covers every
+      current and future view of the env dataset. `adapter.grant_access_to` reads the dataset and
+      only calls `update_dataset` when the entry is missing (dbt-bigquery 1.12 impl.py), and
+      serializes the update behind a lock. -#}
+  {%- if env_schema != physical_schema -%}
+    {%- do adapter.grant_access_to(
+      {'dataset': {'projectId': database, 'datasetId': env_schema}, 'targetTypes': ['VIEWS']},
+      'dataset',
+      none,
+      {'project': database, 'dataset': physical_schema}
+    ) -%}
+  {%- endif -%}
 {%- endmacro %}
 
 
@@ -487,6 +596,44 @@ AS $$
 {{ body_sql }}
 $$
   {%- endif -%}
+{%- endmacro %}
+
+
+{% macro expired_environments_sql(physical_schema, expire_days) -%}
+  {#- Environments whose newest `_environments.updated_at` is older than `expire_days` days. -#}
+  {{ return(adapter.dispatch('expired_environments_sql', 'dbt_virtual')(physical_schema, expire_days)) }}
+{%- endmacro %}
+
+{% macro bigquery__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {{ expire_days | int }} DAY)
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro snowflake__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < DATEADD(day, -{{ expire_days | int }}, CURRENT_TIMESTAMP())
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro databricks__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < DATEADD(DAY, -{{ expire_days | int }}, CURRENT_TIMESTAMP())
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro default__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < CURRENT_TIMESTAMP - INTERVAL '{{ expire_days | int }} days'
+  ORDER BY environment
 {%- endmacro %}
 
 

@@ -82,6 +82,8 @@ class MacroTestHarness:
         # schema, identifier)` returns a FakeRelation or None and replaces `existing_relations`.
         self.query_executor: Any = None
         self.relation_lookup: Any = None
+        self.grant_calls: list[tuple[Any, ...]] = []
+        self.column_updates: list[tuple[str, dict[str, Any]]] = []
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -249,6 +251,14 @@ class MacroTestHarness:
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
                     **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
+                    "grant_access_to": staticmethod(
+                        lambda entity, entity_type, role, target: self.grant_calls.append(
+                            (entity, entity_type, role, target)
+                        )
+                    ),
+                    "update_columns": staticmethod(
+                        lambda rel, cols: self.column_updates.append((str(rel), cols))
+                    ),
                 },
             )(),
             "builtins": type(

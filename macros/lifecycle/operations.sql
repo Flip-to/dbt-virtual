@@ -40,6 +40,31 @@
 {%- endmacro %}
 
 
+{% macro create_env_view(view_rel, phys_rel, node, phys_schema, authorized_schemas) -%}
+  {#- Creates `view_rel` over `phys_rel`, then applies the node's metadata and authorization.
+      A description may contain `;`, so a single statement must not go through `exec_ddl_dml`'s split. -#}
+  {%- set view_sql = dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel, node) -%}
+  {%- if target.type == 'postgres' -%}
+    {%- do dbt_virtual.exec_ddl_dml(view_sql) -%}
+  {%- else -%}
+    {%- do dbt_virtual.exec_sql_statement(view_sql) -%}
+  {%- endif -%}
+  {%- do dbt_virtual.finalize_env_view(view_rel, node, phys_schema, authorized_schemas) -%}
+{%- endmacro %}
+
+
+{% macro finalize_env_view(view_rel, node, phys_schema, authorized_schemas) -%}
+  {#- After an env view is created: its metadata (column descriptions) and, with
+      `authorize_env_views`, the env dataset's authorization on the physical dataset, once per
+      env dataset (`authorized_schemas` is the caller's list; dataset updates are rate limited). -#}
+  {%- do dbt_virtual.apply_env_view_metadata(view_rel, node) -%}
+  {%- if dbt_virtual.get_config().get('authorize_env_views', false) and view_rel.schema not in authorized_schemas -%}
+    {%- do dbt_virtual.authorize_env_dataset(view_rel.database, view_rel.schema, phys_schema) -%}
+    {%- do authorized_schemas.append(view_rel.schema) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
 {% macro virtual_acquire_lock(env='prod', owner='dbt-virtual', ttl_minutes=15, location=none) -%}
   {#-
     Lease lock on `env` in `<physical_schema>._locks`:
@@ -449,6 +474,7 @@
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
   {%- set ensured_schemas = [] -%}
   {%- do dbt_virtual.ensure_registry() -%}
+  {%- set authorized_schemas = [] -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
   {%- if lock -%}
     {%- do dbt_virtual.virtual_acquire_lock(env=to_env, owner=owner, location=location) -%}
@@ -603,7 +629,8 @@
         {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
 
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
-        {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+        {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
+        {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
       {%- elif routine_ddl is not none and routine_ddl != '' -%}
         {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, to_env) -%}
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying " ~ resource_type ~ " " ~ to_schema ~ "." ~ model_name, info=True) }}
@@ -696,6 +723,7 @@
   {%- set models_map = fromjson(models_json) if models_json is string else models_json -%}
   {%- set ensured_schemas = [] -%}
   {%- set ensured_registries = [] -%}
+  {%- set authorized_schemas = [] -%}
 
   {%- for model_name, fp in models_map.items() -%}
     {#- A model's table and registry are in the location of its node. -#}
@@ -717,7 +745,8 @@
     {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
 
     {{ log("dbt-virtual reuse [" ~ env ~ "]: Pointing " ~ view_rel ~ " -> " ~ phys_rel ~ " (zero compute)", info=True) }}
-    {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+    {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
+    {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
 
     {%- set moving = dbt_virtual.companion_depart(dbt_virtual.virtual_node_by_name(model_name), env, fp) -%}
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.upsert_environment_pointer_sql(
@@ -852,6 +881,7 @@
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
   {%- set ensured_schemas = [] -%}
+  {%- set authorized_schemas = [] -%}
   {%- set owner = lock_owner if lock_owner != '' else ('dbt-virtual:' ~ (invocation_id if invocation_id is defined else 'run')) -%}
   {%- if lock -%}
     {%- do dbt_virtual.virtual_acquire_lock(env=env, owner=owner, location=location) -%}
@@ -955,7 +985,8 @@
       {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
       {%- set phys_rel = api.Relation.create(database=target.database, schema=phys_schema, identifier=phys_table, type='table') -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Re-pointing " ~ view_rel ~ " -> " ~ phys_rel, info=True) }}
-      {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+      {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
+      {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
     {%- elif routine_ddl is not none and routine_ddl != '' -%}
       {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, env) -%}
       {{ log("dbt-virtual rollback [" ~ env ~ "]: Redeploying " ~ resource_type ~ " " ~ env_schema ~ "." ~ model_name, info=True) }}
@@ -1017,9 +1048,47 @@
 {%- endmacro %}
 
 
-{% macro virtual_gc(dry_run=true, retention_releases=5, retention_days=7, location=none) -%}
+{% macro virtual_expire_envs(expire_env_days, dry_run=true) -%}
   {#-
-    Janitor GC:
+    Drops abandoned environments (e.g. a PR env nobody dropped) whose newest `_environments.updated_at`
+    is older than `expire_env_days` days, so their physical tables stop being protected by GC.
+    NEVER expires `base_environment` or an environment listed in `env_schemas`. Their unpromoted
+    `candidate` releases are marked `expired` (kept as history, no longer protected): GC protects
+    the last N releases of every environment, and non-BigQuery table age comes from release rows.
+    `dry_run` only logs. Returns the list of expired (or, in a dry run, expirable) environments.
+  -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set base_env = cfg.get('base_environment', 'prod') -%}
+  {%- set mapped = (cfg.get('env_schemas', {}) or {}).keys() | list -%}
+  {%- set expired = [] -%}
+  {%- set rows = run_query(dbt_virtual.expired_environments_sql(phys_schema, expire_env_days)) -%}
+  {%- if rows -%}
+    {%- for row in rows.rows -%}
+      {%- if row[0] != base_env and row[0] not in mapped -%}
+        {%- do expired.append(row[0]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- for env in expired -%}
+    {%- if dry_run -%}
+      {{ log("dbt-virtual gc [DRY-RUN]: Would drop expired environment " ~ env ~ " (no update in " ~ expire_env_days ~ " days)", info=True) }}
+    {%- else -%}
+      {{ log("dbt-virtual gc: Dropping expired environment " ~ env ~ " (no update in " ~ expire_env_days ~ " days)", info=True) }}
+      {%- do dbt_virtual.virtual_drop_env(env) -%}
+      {%- do dbt_virtual.exec_ddl_dml(
+        "UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases')
+        ~ " SET status = 'expired' WHERE status = 'candidate' AND target_environment IS NULL AND source_environment = '" ~ env ~ "'"
+      ) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{ return(expired) }}
+{%- endmacro %}
+
+
+{% macro virtual_gc(dry_run=true, retention_releases=5, retention_days=7, location=none, expire_env_days=none) -%}
+  {#-
+    Janitor GC (first drops environments expired by `expire_env_days`, see `virtual_expire_envs`):
     Identifies `<model>__<fp>` tables in `<physical_schema>` older than `retention_days`
     that are not referenced by any environment in `_environments` or by the last `retention_releases`
     releases in `_releases`.
@@ -1032,6 +1101,11 @@
   {%- endif -%}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+
+  {%- set expire_days = expire_env_days if expire_env_days is not none else cfg.get('expire_env_days') -%}
+  {%- if expire_days is not none and (expire_days | int) > 0 -%}
+    {%- do dbt_virtual.virtual_expire_envs(expire_days, dry_run) -%}
+  {%- endif -%}
 
   {%- set orphan_query = dbt_virtual.find_orphan_tables_sql(phys_schema, retention_releases, retention_days) -%}
   {%- set orphans = run_query(orphan_query) -%}
@@ -1080,6 +1154,7 @@
     {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.ensure_registry_tables_sql(phys_schema)) -%}
     {%- do adopted_registries.append(phys_schema) -%}
   {%- endif -%}
+  {%- set authorized_schemas = [] -%}
 
   {%- set nodes_dict = graph.get('nodes', {}) if graph is mapping else {} -%}
   {%- for unique_id, node in nodes_dict.items() -%}
@@ -1117,7 +1192,7 @@
               {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.drop_object_if_exists_sql(existing_rel, 'table')) -%}
             {%- endif -%}
             {%- set view_rel = api.Relation.create(database=target.database, schema=env_schema, identifier=model_name, type='view') -%}
-            {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.create_or_replace_view_sql(view_rel, phys_rel)) -%}
+            {%- do dbt_virtual.create_env_view(view_rel, phys_rel, node, phys_schema, authorized_schemas) -%}
           {%- endif -%}
           {%- set phys_exists = true -%}
         {%- else -%}

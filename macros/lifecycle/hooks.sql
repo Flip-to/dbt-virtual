@@ -451,9 +451,23 @@
     type='view'
   ) -%}
 
+  {#- Column descriptions are set through the adapter, which needs the view to exist: only then
+      create the view now. Otherwise the view DDL stays in the returned hook SQL. -#}
+  {%- set create_now = target.type == 'bigquery' and (dbt_virtual.env_view_column_docs(model) | length) > 0 -%}
+  {%- if create_now -%}
+    {%- if (drop_legacy_tbl_stmt | trim) != '' -%}
+      {%- do dbt_virtual.exec_sql_statement(drop_legacy_tbl_stmt) -%}
+    {%- endif -%}
+    {%- do dbt_virtual.create_env_view(view_rel, this, model, phys_schema, []) -%}
+  {%- else -%}
+    {%- do dbt_virtual.finalize_env_view(view_rel, model, phys_schema, []) -%}
+  {%- endif -%}
+
   {%- set sql_statements -%}
-    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this) }}
-    {%- if not batched %};
+    {%- if not create_now %}
+    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this, model) }}{% if not batched %};{% endif %}
+    {%- endif %}
+    {%- if not batched %}
 
     {{ dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,

@@ -857,6 +857,8 @@ def cmd_gc(ns: argparse.Namespace) -> int:
         "retention_releases": ns.retention_releases,
         "retention_days": ns.retention_days,
     }
+    if ns.expire_env_days is not None:
+        op_args["expire_env_days"] = ns.expire_env_days
     return _run_dbt(
         ["run-operation", "virtual_gc", "--args", json.dumps(op_args)],
         project_dir,
@@ -1167,6 +1169,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--dry-run", action="store_true", help="Print tables to drop without dropping them.")
     p_gc.add_argument("--retention-releases", type=int, default=5)
     p_gc.add_argument("--retention-days", type=int, default=7)
+    p_gc.add_argument(
+        "--expire-env-days",
+        type=int,
+        default=None,
+        help="First drop environments not in env_schemas (and not the base environment) "
+        "with no registry update for N days. Default: the `expire_env_days` config (off when unset).",
+    )
     p_gc.set_defaults(func=cmd_gc)
 
     # adopt

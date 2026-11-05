@@ -39,3 +39,5 @@ vars:
       prod: "prod"
     retention_releases: 5
     retention_days: 7
+    authorize_env_views: false  # BigQuery: authorize each env dataset (views) on the physical dataset
+    expire_env_days: null       # gc drops unmapped envs idle for N days (null = off)
