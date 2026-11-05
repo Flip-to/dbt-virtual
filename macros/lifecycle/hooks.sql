@@ -261,7 +261,8 @@
     before the run, dbt's own `is_incremental()` is already True. Returning True for a table that
     does not exist yet made BigQuery's `create or replace table` keep only the incremental delta.
   -#}
-  {{ return(builtins.is_incremental()) }}
+  {#- `builtins` has no `is_incremental` (it raised "'dict object' has no attribute 'is_incremental'"). -#}
+  {{ return(dbt.is_incremental()) }}
 {%- endmacro %}
 
 
