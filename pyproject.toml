@@ -32,7 +32,7 @@ dependencies = [
 dev = [
   "dbt-core>=1.8.0",
   "dbt-duckdb>=1.8.0",
-  "duckdb>=1.0.0",
+  "duckdb>=1.4.0",
   "hypothesis>=6.100.0",
   "jinja2>=3.1.0",
   "pytest>=8.0.0",
@@ -43,7 +43,7 @@ docs = [
   "zensical>=0.0.1",
 ]
 emulator = [
-  "duckdb>=1.0.0",
+  "duckdb>=1.4.0",
   "google-cloud-bigquery>=3.20.0",
   "psycopg[binary]>=3.1.0",
   "requests>=2.31.0",

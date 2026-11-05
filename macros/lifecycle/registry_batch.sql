@@ -198,13 +198,13 @@
       {%- for row in chunk -%}
         {%- do names.append(dbt_virtual.sql_string_literal(row['name'])) -%}
       {%- endfor -%}
-      {%- do dbt_virtual.exec_sql_statement(
+      {%- do dbt_virtual.exec_atomic([
         "DELETE FROM " ~ dbt_virtual.registry_relation(phys_schema, '_releases')
         ~ " WHERE release_id = " ~ dbt_virtual.sql_string_literal(release_id)
         ~ " AND source_environment = " ~ dbt_virtual.sql_string_literal(env_name)
-        ~ " AND status = 'candidate' AND model_name IN (" ~ (names | join(', ')) ~ ")"
-      ) -%}
-      {%- do dbt_virtual.exec_sql_statement(dbt_virtual.release_insert_sql(phys_schema, values)) -%}
+        ~ " AND status = 'candidate' AND model_name IN (" ~ (names | join(', ')) ~ ")",
+        dbt_virtual.release_insert_sql(phys_schema, values)
+      ]) -%}
     {%- endif -%}
 
     {%- if start_ts != '' and end_ts != '' -%}

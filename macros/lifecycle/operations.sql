@@ -1,9 +1,10 @@
-{% macro exec_sql_statement(sql_text) -%}
+{% macro exec_sql_statement(sql_text, commit=true) -%}
+  {#- `commit=false` leaves the statement in the open transaction (see `exec_atomic`). -#}
   {%- if statement is defined -%}
     {%- call statement('dbt_virtual_ddl_dml', fetch_result=False, auto_begin=True) -%}
       {{ sql_text }}
     {%- endcall -%}
-    {%- if adapter.commit is defined -%}
+    {%- if commit and adapter.commit is defined -%}
       {%- do adapter.commit() -%}
     {%- endif -%}
   {%- else -%}
@@ -31,12 +32,27 @@
 {%- endmacro %}
 
 
-{% macro exec_ddl_dml(sql_text) -%}
-  {%- for stmt in sql_text.split(';') -%}
+{% macro exec_atomic(statements) -%}
+  {#-
+    DECISION(atomic_registry_upserts): runs `statements` (a list of SQL texts) in ONE transaction:
+    committed together at the end, rolled back by dbt when one fails. Atomic where DML is
+    transactional through dbt: PostgreSQL, DuckDB, Snowflake. Databricks and BigQuery run each
+    statement as its own job (TECH_DEBT(registry_delete_insert_non_atomic)).
+  -#}
+  {%- for stmt in statements -%}
     {%- if (stmt | trim) != '' -%}
-      {%- do dbt_virtual.exec_sql_statement(stmt) -%}
+      {%- do dbt_virtual.exec_sql_statement(stmt, commit=false) -%}
     {%- endif -%}
   {%- endfor -%}
+  {%- if statement is defined and adapter.commit is defined -%}
+    {%- do adapter.commit() -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro exec_ddl_dml(sql_text) -%}
+  {#- A `;`-separated script runs in one transaction (`exec_atomic`), so DELETE + INSERT pairs do not half-apply. -#}
+  {%- do dbt_virtual.exec_atomic(sql_text.split(';')) -%}
 {%- endmacro %}
 
 
@@ -176,9 +192,11 @@
     {{ return('') }}
   {%- endif -%}
 
+  {#- `to_env` is read from its own location (it differs from this run's under `physical_locations`). -#}
+  {%- set base_loc = dbt_virtual.registry_location_for(to_env, phys_schema) -%}
   {%- set base_query -%}
     SELECT model_name, physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    FROM {{ dbt_virtual.registry_relation(base_loc['schema'], '_environments', base_loc['database']) }}
     WHERE environment = '{{ to_env }}'
       AND resource_type = 'model'
   {%- endset -%}
@@ -201,7 +219,7 @@
     {%- set base_ident = base_map.get(model_name, '') -%}
     {%- if base_ident != '' -%}
       {%- set base_tbl = base_ident.split('.')[-1] -%}
-      {%- set base_rel = api.Relation.create(database=dbt_virtual.active_database(), schema=phys_schema, identifier=base_tbl, type='table') -%}
+      {%- set base_rel = api.Relation.create(database=base_loc['database'], schema=base_loc['schema'], identifier=base_tbl, type='table') -%}
       {%- set base_cnt_res = run_query(dbt_virtual.row_count_sql(base_rel)) -%}
       {%- set base_cnt = base_cnt_res.rows[0][0] | int if (base_cnt_res and (base_cnt_res.rows | length) > 0) else 0 -%}
 
@@ -260,6 +278,13 @@
       {{ log("dbt-virtual audit [" ~ model_name ~ "]: OK (new model, candidate=" ~ cand_cnt ~ " rows)", info=True) }}
     {%- endif -%}
   {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro virtual_print_base_environment() -%}
+  {#- Logs the rendered `base_environment` (it may be Jinja, e.g. on `target.name`), so the CLI can
+      decide whether `promote --to <env>` audits by default. -#}
+  {{ log("DBT_VIRTUAL_BASE_ENV:" ~ dbt_virtual.get_config().get('base_environment', 'prod'), info=True) }}
 {%- endmacro %}
 
 
@@ -521,7 +546,7 @@
 
   {%- if data_diff -%}
     {#- Row-level diff against `to_env`; fails above `data_diff_max_mismatch_pct` (report only when none). -#}
-    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct) -%}
+    {%- do dbt_virtual.virtual_data_diff(from_env=from_env, to_env=to_env, release_id=release_id, max_mismatch_pct=data_diff_max_mismatch_pct, source_database=(src_db if cross else ''), source_schema=(src_schema if cross else '')) -%}
   {%- endif -%}
 
   {%- if release_id != '' -%}
@@ -764,13 +789,14 @@
   {%- if cross and release_id != '' -%}
     {#- The source registry belongs to another service account: record the release in the target registry. -#}
     {%- set releases_rel = dbt_virtual.registry_relation(phys_schema, '_releases') -%}
-    {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ releases_rel ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
+    {%- set cross_statements = ["DELETE FROM " ~ releases_rel ~ " WHERE release_id = '" ~ release_id ~ "'"] -%}
     {%- for batch in cross_release_values | batch(100) -%}
-      {%- do dbt_virtual.exec_sql_statement(
+      {%- do cross_statements.append(
         "INSERT INTO " ~ releases_rel ~ " (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, routine_ddl_template, status, created_at, promoted_at, rolled_back_at, schema_key, build_quality, sealed_at) VALUES "
         ~ (batch | join(', '))
       ) -%}
     {%- endfor -%}
+    {%- do dbt_virtual.exec_atomic(cross_statements) -%}
   {%- elif release_id != '' -%}
     {%- do dbt_virtual.exec_ddl_dml("UPDATE " ~ dbt_virtual.registry_relation(phys_schema, '_releases') ~ " SET status = 'promoted', target_environment = '" ~ to_env ~ "', promoted_at = " ~ dbt_virtual.current_timestamp_sql() ~ " WHERE release_id = '" ~ release_id ~ "'") -%}
   {%- endif -%}

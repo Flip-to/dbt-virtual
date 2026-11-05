@@ -102,8 +102,13 @@ def _source_location_args(value: str | None) -> dict[str, object]:
     return {"source_database": database, "source_schema": schema}
 
 
-def _base_environment(project_dir: Path) -> str:
-    """`vars.dbt_virtual.base_environment` from dbt_project.yml (default `prod`)."""
+def _base_environment(project_dir: Path) -> str | None:
+    """`vars.dbt_virtual.base_environment` (default `prod`), rendered like the macros render it.
+
+    The value may be Jinja (`"{{ 'x' if target.name == 'y' else 'prod' }}"`); that is rendered with
+    `dbt run-operation virtual_print_base_environment` (same target the promote operation uses).
+    Returns None when a Jinja value cannot be rendered.
+    """
     try:
         import yaml
 
@@ -111,7 +116,25 @@ def _base_environment(project_dir: Path) -> str:
         value = ((project.get("vars") or {}).get("dbt_virtual") or {}).get("base_environment")
     except Exception:  # noqa: BLE001 - no project file / unparsable: use the default
         value = None
-    return value if isinstance(value, str) and value and "{{" not in value else "prod"
+    if not isinstance(value, str) or not value:
+        return "prod"
+    if "{{" not in value and "{%" not in value:
+        return value
+    args = ["run-operation", "virtual_print_base_environment"]
+    if _DEFAULT_TARGET:
+        args += ["--target", _DEFAULT_TARGET]
+    result = subprocess.run(
+        [*_dbt_command(), *args], cwd=project_dir, check=False, capture_output=True, text=True
+    )
+    for line in (result.stdout or "").splitlines():
+        if _BASE_ENV_MARKER in line:
+            rendered = line.split(_BASE_ENV_MARKER, 1)[1].strip()
+            if result.returncode == 0 and rendered:
+                return rendered
+    return None
+
+
+_BASE_ENV_MARKER = "DBT_VIRTUAL_BASE_ENV:"
 
 
 def _default_lock_owner() -> str:
@@ -159,13 +182,26 @@ def _dbt_command() -> list[str]:
     return ["dbt"] if shutil.which("dbt") else [sys.executable, "-m", "dbt.cli.main"]
 
 
+def _dbt_env(args: list[str]) -> dict[str, str] | None:
+    """Environment for a dbt call. `compile` runs without `DBT_EMPTY`.
+
+    `dbt compile --empty` (or `DBT_EMPTY=true`) wraps every `ref()` in
+    `(select * from <ref> where false limit 0)`, so the compiled SQL, and with it every fingerprint,
+    would depend on the flag. A build run with `--empty` must still target the fingerprints of the
+    full build.
+    """
+    if args and args[0] == "compile" and "DBT_EMPTY" in os.environ:
+        return {k: v for k, v in os.environ.items() if k != "DBT_EMPTY"}
+    return None
+
+
 def _run_dbt(args: list[str], project_dir: Path) -> int:
     # Commands without their own target (promote, rollback, status, gc, adopt, init/drop-env)
     # used the profile's default target, which is prod in some projects.
     if _DEFAULT_TARGET and "--target" not in args:
         args = [*args, "--target", _DEFAULT_TARGET]
     cmd = [*_dbt_command(), *args]
-    result = subprocess.run(cmd, cwd=project_dir, check=False)
+    result = subprocess.run(cmd, cwd=project_dir, check=False, env=_dbt_env(args))
     return result.returncode
 
 
@@ -175,6 +211,7 @@ def _compile_quietly(args: list[str], project_dir: Path) -> int:
         [*_dbt_command(), *args],
         cwd=project_dir,
         check=False,
+        env=_dbt_env(args),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -512,7 +549,16 @@ def cmd_build(ns: argparse.Namespace) -> int:
     # If the plan has nothing to build and no explicit selector overrides it, do not fall through
     # to an unscoped `dbt build` (which would build the whole project). `dbt build` of an empty
     # selection runs no hooks, so REUSE sync and the snapshot take one `run-operation` instead.
-    if not models_to_build and not ns.select:
+    # A user `--select` narrows the plan, it never widens it: REUSE nodes only get a view pointer,
+    # whatever the selector matches. Resolve the selector with `dbt ls` and intersect.
+    if ns.select:
+        selected = _selected_model_names(
+            project_dir, _dbt_target(ns), ns.select, user_vars=_user_vars(ns)
+        )
+        if selected is None:
+            return 1
+        models_to_build = sorted(n for n in models_to_build if n in selected)
+    if not models_to_build:
         if reused_models:
             print(f"dbt-virtual build: All {len(reused_models)} model(s) reused with zero compute.")
         else:
@@ -548,28 +594,33 @@ def cmd_build(ns: argparse.Namespace) -> int:
         "--vars",
         json.dumps(dbt_vars),
     ]
-    if ns.select:
-        build_args.extend(["--select", ns.select])
-    elif models_to_build:
-        build_args.extend(["--select", " ".join(models_to_build)])
+    # Select exactly the planned models the user's selector matched (`dbt ls` above), not the raw
+    # selector: `--select tag:x` matches REUSE tables too, and building them overwrites them.
+    build_args.extend(["--select", " ".join(models_to_build)])
     if ns.full_refresh:
         build_args.append("--full-refresh")
     return _run_dbt(build_args, project_dir)
 
 
-def _selected_model_names(project_dir: Path, env: str, select: str) -> set[str] | None:
+def _selected_model_names(
+    project_dir: Path,
+    env: str,
+    select: str,
+    *,
+    exclude: Sequence[str] = (),
+    user_vars: dict[str, object] | None = None,
+) -> set[str] | None:
     """Names of the models a dbt `--select` expression matches (via `dbt ls`), or None on failure."""
-    result = subprocess.run(
-        [
-            "dbt", "ls", "--quiet", "--target", env,
-            "--resource-type", "model", "--select", select,
-            "--output", "json", "--output-keys", "name",
-        ],
-        cwd=project_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    args = [
+        *_dbt_command(), "ls", "--quiet", "--target", env,
+        "--resource-type", "model", "--select", select,
+        "--output", "json", "--output-keys", "name",
+    ]  # fmt: skip
+    if exclude:
+        args.extend(["--exclude", *exclude])
+    if user_vars:
+        args.extend(["--vars", json.dumps(user_vars)])
+    result = subprocess.run(args, cwd=project_dir, check=False, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stdout, end="")
         print(result.stderr, file=sys.stderr, end="")
@@ -685,7 +736,17 @@ def cmd_run(ns: argparse.Namespace) -> int:
 def cmd_promote(ns: argparse.Namespace) -> int:
     project_dir = Path(ns.project_dir).resolve()
     # Auditing is on by default when promoting into the base environment (usually prod).
-    audit = ns.audit if ns.audit is not None else ns.to_env == _base_environment(project_dir)
+    if ns.audit is not None:
+        audit = ns.audit
+    else:
+        base_env = _base_environment(project_dir)
+        if base_env is None:
+            print(
+                "dbt-virtual promote: WARNING could not render vars.dbt_virtual.base_environment; "
+                "auditing (pass --no-audit to skip).",
+                file=sys.stderr,
+            )
+        audit = base_env is None or ns.to_env == base_env
     op_args: dict[str, object] = {
         "from_env": ns.from_env,
         "to_env": ns.to_env,
