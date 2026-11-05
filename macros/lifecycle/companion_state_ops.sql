@@ -14,11 +14,12 @@
 {%- endmacro %}
 
 
-{% macro companion_envs_at(model_name, fp) -%}
-  {#- Environments whose pointer for the model is `fp`. -#}
-  {%- set phys_schema = dbt_virtual.get_config().get('physical_schema') -%}
+{% macro companion_envs_at(model_name, fp, source_database=none, source_schema=none) -%}
+  {#- Environments whose pointer for the model is `fp`, in this location's registry or, with
+      `source_schema`, in the registry of another location. -#}
+  {%- set phys_schema = source_schema or dbt_virtual.get_config().get('physical_schema') -%}
   {%- set res = run_query(
-    "SELECT environment FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments')
+    "SELECT environment FROM " ~ dbt_virtual.registry_relation(phys_schema, '_environments', source_database)
     ~ " WHERE model_name = " ~ dbt_virtual.sql_string_literal(model_name)
     ~ " AND fingerprint = " ~ dbt_virtual.sql_string_literal(fp)
     ~ " AND resource_type = 'model' ORDER BY environment"
@@ -81,20 +82,33 @@
 {%- endmacro %}
 
 
-{% macro restore_companion_state(model_name, fp, env, prefer_env=none) -%}
+{% macro restore_companion_state(model_name, fp, env, prefer_env=none, source_database=none, source_schema=none) -%}
   {#-
     Makes `env`'s state for the model describe `<model>__<fp>`. Sources, first non-empty wins:
     the live rows of an environment that points at `fp` (`prefer_env` first), then the rows saved
     when an environment last left `fp`. A holder whose table is the same as `env`'s needs nothing.
     All sources empty: the table has no state, so `env`'s rows are deleted. No source at all:
     warns and leaves `env`'s rows alone.
+    A cross-location promote passes `source_database` / `source_schema`: the registry holding the
+    release is another one than this location's, so the holders and the saved rows are looked up
+    there first (`prefer_env` is the source environment).
   -#}
   {%- set node = dbt_virtual.virtual_node_by_name(model_name) -%}
   {%- for entry in dbt_virtual.companion_entries() -%}
     {%- if dbt_virtual.companion_applies(entry, node) -%}
       {%- do dbt_virtual.ensure_companion_registry() -%}
       {%- set own = dbt_virtual.companion_relation(entry, env) | string -%}
-      {%- set at_fp = dbt_virtual.companion_envs_at(model_name, fp) -%}
+      {%- set at_fp = [] -%}
+      {%- if source_schema is not none -%}
+        {%- for holder in dbt_virtual.companion_envs_at(model_name, fp, source_database, source_schema) -%}
+          {%- do at_fp.append(holder) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- for holder in dbt_virtual.companion_envs_at(model_name, fp) -%}
+        {%- if holder not in at_fp -%}
+          {%- do at_fp.append(holder) -%}
+        {%- endif -%}
+      {%- endfor -%}
       {%- set holders = [] -%}
       {%- if prefer_env is not none and prefer_env in at_fp -%}
         {%- do holders.append(prefer_env) -%}
@@ -121,7 +135,13 @@
         {%- endif -%}
       {%- endfor -%}
       {%- if picked.rows is none and not picked.shared -%}
-        {%- set saved = dbt_virtual.companion_snapshot_load(entry, model_name, fp) -%}
+        {%- set saved = none -%}
+        {%- if source_schema is not none -%}
+          {%- set saved = dbt_virtual.companion_snapshot_load(entry, model_name, fp, source_database, source_schema) -%}
+        {%- endif -%}
+        {%- if saved is none -%}
+          {%- set saved = dbt_virtual.companion_snapshot_load(entry, model_name, fp) -%}
+        {%- endif -%}
         {%- if saved is not none and ((saved | length) > 0 or not picked.known) -%}
           {%- set picked.rows = saved -%}
           {%- set picked.source = 'rows saved when an environment left it' -%}
@@ -136,6 +156,69 @@
         {%- do dbt_virtual.companion_write(entry, env, model_name, picked.rows, like_env=picked.like_env) -%}
       {%- elif not picked.shared -%}
         {{ log("dbt-virtual WARNING: no state is known for " ~ model_name ~ "__" ~ fp ~ " in " ~ entry['table'] ~ " (no environment points at it and nothing was saved), so env " ~ env ~ " keeps whatever it holds for " ~ model_name ~ ".", info=True) }}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro companion_forget_tables(phys_schema, table_names, dry_run=false) -%}
+  {#- `virtual_gc`: deletes the rows saved in `_companion_state` for `<model>__<fp>` tables that were
+      dropped (or, with `dry_run`, only says how many). Runs whenever the table exists, even when
+      `companion_state` is no longer configured. -#}
+  {%- if (table_names | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- if adapter.get_relation(database=dbt_virtual.active_database(), schema=phys_schema, identifier='_companion_state') is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set literals = [] -%}
+  {%- for name in table_names -%}
+    {%- do literals.append(dbt_virtual.sql_string_literal(name)) -%}
+  {%- endfor -%}
+  {%- set snap_rel = dbt_virtual.registry_relation(phys_schema, '_companion_state') -%}
+  {%- set predicate = "CONCAT(model_name, '__', fingerprint) IN (" ~ (literals | join(', ')) ~ ")" -%}
+  {%- if dry_run -%}
+    {%- set counted = run_query("SELECT COUNT(*) FROM " ~ snap_rel ~ " WHERE " ~ predicate) -%}
+    {{ log("dbt-virtual gc [DRY-RUN]: Would delete " ~ (counted.rows[0][0] if counted else 0) ~ " saved companion state row(s) of the tables above.", info=True) }}
+  {%- else -%}
+    {%- do dbt_virtual.exec_ddl_dml("DELETE FROM " ~ snap_rel ~ " WHERE " ~ predicate) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro companion_repair_failed(results, env) -%}
+  {#-
+    `on-run-end` (called by `flush_registry`): the seed hook writes a new table's state rows into
+    `env` in on-run-start, before the build. For a tracked model whose build did not succeed the
+    environment's pointer stays on the old table, so its rows are put back to what that table's
+    state was (the rows `companion_depart` saved when the seed moved them). A model that never had
+    a pointer in `env` is left alone: nothing describes it yet.
+  -#}
+  {%- set entries = dbt_virtual.companion_entries() -%}
+  {%- if (entries | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- for r in results -%}
+    {%- set node = r.node -%}
+    {%- set status = (r.status | string | lower) -%}
+    {%- if not (status == 'success' or status.endswith('.success')) and (dbt_virtual.node_attr(node, 'resource_type', '') | string) == 'model' -%}
+      {%- set model_name = dbt_virtual.node_attr(node, 'name', '') -%}
+      {%- set alias = dbt_virtual.node_attr(node, 'alias', model_name) or model_name -%}
+      {%- set attempted_fp = alias[((model_name ~ '__') | length):] if alias.startswith(model_name ~ '__') else '' -%}
+      {%- set applies = [] -%}
+      {%- for entry in entries -%}
+        {%- if dbt_virtual.companion_applies(entry, node) -%}
+          {%- do applies.append(entry) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if (applies | length) > 0 and attempted_fp != '' -%}
+        {%- do dbt_virtual.ensure_companion_registry() -%}
+        {%- set pointer = dbt_virtual.companion_pointer(env, model_name) -%}
+        {%- if pointer is not none and pointer['fingerprint'] != attempted_fp -%}
+          {{ log("dbt-virtual companion [" ~ env ~ "]: " ~ model_name ~ " did not build; its state goes back to " ~ model_name ~ "__" ~ pointer['fingerprint'] ~ ", the table " ~ env ~ " still points at.", info=True) }}
+          {%- do dbt_virtual.restore_companion_state(model_name, pointer['fingerprint'], env) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
   {%- endfor -%}

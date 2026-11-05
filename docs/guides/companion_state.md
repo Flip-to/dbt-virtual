@@ -40,6 +40,9 @@ environment they act on, or when environments keep separate manifests. Add
 | Promote | rows of the promoted fingerprint are written to the target environment |
 | Rollback | rows of the restored fingerprint are written back |
 | Reuse sync | rows are copied in when the environment moves to the table |
+| Promote from another location (`physical_locations`, `--source-location`) | rows of the promoted fingerprint are written from the source environment's live rows, else from the rows saved in the source registry |
+| Build that fails after the seed | `flush_registry` (on-run-end) puts the rows back to the table the environment still points at |
+| `gc` drops a table | the rows saved for that table in `_companion_state` are deleted |
 
 When an environment's pointer leaves a fingerprint, its rows are saved in
 `<physical_schema>._companion_state`. While an environment points at a fingerprint, its live rows
