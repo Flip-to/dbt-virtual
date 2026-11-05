@@ -266,7 +266,8 @@ def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
     )
     assert "0123456789ab" not in cleaned
     assert "__DBT_VIRTUAL_THIS__" in cleaned
-    assert "__DBT_VIRTUAL_SCHEMA__." in cleaned
+    # The node's own three-part name collapses to one token (its project and dataset differ per target).
+    assert "FROM __DBT_VIRTUAL_THIS__ WHERE" in cleaned
 
 
 def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
