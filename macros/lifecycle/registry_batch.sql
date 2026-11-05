@@ -90,6 +90,9 @@
       {%- set name = dbt_virtual.node_attr(node, 'name', '') -%}
       {%- set alias = dbt_virtual.node_attr(node, 'alias', name) or name -%}
       {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
+      {#- Each location has its own registry and physical schema (see macros/routing/locations.sql). -#}
+      {%- set node_loc = dbt_virtual.node_location(node) -%}
+      {%- set node_phys = dbt_virtual.physical_schema_for(node_loc) -%}
       {%- if mat in ['table', 'incremental'] -%}
         {#- Same rule as `sync_env_view`: register the fingerprint that is in the physical name. -#}
         {%- set fp_prefix = name ~ '__' -%}
@@ -100,8 +103,8 @@
         {%- endif -%}
         {%- do rows.append({
           'name': name, 'resource_type': 'model', 'fingerprint': fp,
-          'physical_identifier': phys_schema ~ '.' ~ alias, 'schema_key': schema_key,
-          'tier': 2, 'routine_ddl_template': none
+          'physical_identifier': node_phys ~ '.' ~ alias, 'schema_key': schema_key,
+          'tier': 2, 'routine_ddl_template': none, 'location': node_loc
         }) -%}
       {%- elif mat in routine_types -%}
         {%- set routine_type = routine_types[mat] -%}
@@ -123,7 +126,8 @@
           'name': name, 'resource_type': routine_type, 'fingerprint': dbt_virtual.get_fingerprint(node),
           'physical_identifier': target_rel.schema ~ '.' ~ target_rel.identifier, 'schema_key': schema_key,
           'tier': tiers[routine_type],
-          'routine_ddl_template': dbt_virtual.env_placeholders_sql(full_ddl, env_name)
+          'routine_ddl_template': dbt_virtual.env_placeholders_sql(full_ddl, env_name),
+          'location': node_loc
         }) -%}
       {%- endif -%}
     {%- endif -%}
@@ -133,11 +137,26 @@
 
 
 {% macro write_registry_rows(rows, env_name, release_id, start_ts='', end_ts='', chunk_size=200) -%}
-  {#- Writes `rows` (see `collect_registry_rows`): per chunk one MERGE (or DELETE+INSERT) into
-      `_environments`, one INSERT into `_releases` and one into `_intervals`. -#}
-  {%- set cfg = dbt_virtual.get_config() -%}
-  {%- set phys_schema = cfg.get('physical_schema') -%}
-  {%- do dbt_virtual.ensure_registry() -%}
+  {#- Writes `rows` (see `collect_registry_rows`) into the registry of each row's location. -#}
+  {%- set by_location = {} -%}
+  {%- for row in rows -%}
+    {%- set loc_key = row.get('location') or '' -%}
+    {%- if loc_key not in by_location -%}
+      {%- do by_location.update({loc_key: []}) -%}
+    {%- endif -%}
+    {%- do by_location[loc_key].append(row) -%}
+  {%- endfor -%}
+  {%- for loc_key, loc_rows in by_location.items() -%}
+    {%- do dbt_virtual.write_location_registry_rows(loc_rows, (loc_key or none), env_name, release_id, start_ts, end_ts, chunk_size) -%}
+  {%- endfor -%}
+{%- endmacro %}
+
+
+{% macro write_location_registry_rows(rows, location, env_name, release_id, start_ts='', end_ts='', chunk_size=200) -%}
+  {#- Per chunk: one MERGE (or DELETE+INSERT) into `_environments`, one INSERT into `_releases`
+      and one into `_intervals`, all in `location`'s registry. -#}
+  {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
+  {%- do dbt_virtual.ensure_registry(location) -%}
   {%- for chunk in rows | batch(chunk_size) -%}
     {%- set env_rows = [] -%}
     {%- for row in chunk -%}

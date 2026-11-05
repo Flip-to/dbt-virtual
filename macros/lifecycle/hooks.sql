@@ -516,13 +516,13 @@
   {%- if not execute or not dbt_virtual.is_virtual_node(node) -%}
     {{ return('') }}
   {%- endif -%}
-  {%- set cfg = dbt_virtual.get_config() -%}
-  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set view_loc = dbt_virtual.node_location(node) -%}
+  {%- set phys_schema = dbt_virtual.physical_schema_for(view_loc) -%}
   {%- set env_name = dbt_virtual.get_current_env() -%}
   {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
   {%- set fp = dbt_virtual.get_fingerprint(node) -%}
   {%- set release_id = var('_dbt_virtual_release', '') -%}
-  {%- do dbt_virtual.ensure_registry() -%}
+  {%- do dbt_virtual.ensure_registry(view_loc) -%}
 
   {%- set body = body_sql if body_sql is not none else (dbt_virtual.node_attr(node, 'compiled_code', '') or dbt_virtual.node_attr(node, 'compiled_sql', '')) -%}
   {%- set body = (body | string | trim).rstrip(';') -%}
