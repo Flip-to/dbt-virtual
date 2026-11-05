@@ -43,7 +43,7 @@ without touching `macros/` or `src/`), so there is no regression test to add on 
 | Step | Who | Why | Evidence | When |
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | Features tested only on DuckDB or the mock harness had no BigQuery emulator coverage | Chat request 2026-11-05 | 2026-11-05 |
-| Built | Agent: Claude (subagent of session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Steps 20-25 plus the emulator fixes they needed | branch claude/dbt-virtual-bq-e2e-new-features; Flip-to/googlesqlite#36; Flip-to/bigquery-emulator#32 | 2026-11-05 |
+| Built | Agent: Claude (subagent of session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Steps 20-25 plus the emulator fixes they needed | PR #27 (draft, branch claude/dbt-virtual-bq-e2e-new-features); Flip-to/googlesqlite#36; Flip-to/bigquery-emulator#32 | 2026-11-05 |
 | Proven | pending | L3: `uv run --extra dev --extra emulator python scripts/run_emulator_e2e.py` passed locally against a build of Flip-to/bigquery-emulator#32 (no skipped steps); the missing emulator behaviour failed before the fixes (CLONE, DROP SCHEMA, `access`, view OPTIONS); CI not yet run, it needs both emulator PRs merged | local run 2026-11-05, CI pending | |
 | Reviewed | pending | | pending | |
 | Shipped | pending | | pending | |
