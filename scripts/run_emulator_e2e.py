@@ -37,7 +37,7 @@ Steps 11-19 (`run_feature_steps`) run the real rendered macros against the emula
    13. Multi-dataset environments: `env_schemas` custom-schema mapping, per-object placeholders in a TVF template.
    14. Virtual view promotion (`register_view_deployment` -> `virtual_promote`).
    15. Promotion guards: unsealed release refused, `seal_release_sql`, partial `build_quality` refused.
-   16. Partition coverage audit (`virtual_audit`): skipped on this emulator (no INFORMATION_SCHEMA.PARTITIONS).
+   16. Partition coverage audit (`partition_coverage_sql`, `virtual_audit`).
    17. Regions: `CREATE SCHEMA ... OPTIONS (location = ...)`, per-location registry.
    18. GC per-environment retention (`find_orphan_tables_sql`, `virtual_gc`) with releases in two environments.
    19. Companion state save / restore (`companion_depart`, `restore_companion_state`) on a fake manifest table.
@@ -67,7 +67,6 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     limitation (each one is documented where it is skipped; nothing is faked).
     """
     import json
-    import re
 
     from google.api_core.exceptions import NotFound
 
@@ -82,34 +81,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
             timeout=10,
         )
 
-    routines_note = (
-        "validate_routine_exists_sql: emulator has no INFORMATION_SCHEMA.ROUTINES (and no routines.get API); "
-        "a routine counts as existing once its CREATE statement ran without error"
-    )
-    created_routines: set[tuple[str, str]] = set()
-    sql_rewrites: dict[str, str] = {}  # per-step: metadata views the emulator lacks -> populated tables
-
-    def sql_rewrites_apply(sql: str, rewrites: dict[str, str]) -> str:
-        for old, new in rewrites.items():
-            sql = sql.replace(old, new)
-        return sql
-
     def run_sql(sql: str):
-        created = re.search(r"CREATE OR REPLACE (?:TABLE )?FUNCTION\s+([^\s(]+)\s*\(", sql)
-        for old, new in sql_rewrites.items():
-            sql = sql.replace(old, new)
-        match = re.search(r"`[^`]+`\.`([^`]+)`\.INFORMATION_SCHEMA\.ROUTINES\s+WHERE routine_name = '([^']+)'", sql)
-        if match:
-            # EMULATOR LIMITATION: INFORMATION_SCHEMA.ROUTINES is not implemented (see the report).
-            if routines_note not in skipped:
-                skipped.append(routines_note)
-            found = (match.group(1), match.group(2)) in created_routines
-            return ([(match.group(2),)] if found else []), ["routine_name"]
-        if created:
-            q(sql)
-            parts = created.group(1).replace("`", "").split(".")
-            created_routines.add((parts[-2], parts[-1]))
-            return [], []
         result = client.query(sql).result()
         names = [f.name for f in (result.schema or [])]
         return [tuple(row.values()) for row in result], names
@@ -221,16 +193,10 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     q(f"INSERT INTO `{project}.e2e_old._releases` (release_id, model_name) VALUES ('legacy', 'm')")
     exec_script(h.call_macro("registry_migrations_sql", "e2e_old"))
     exec_script(h.call_macro("registry_migrations_sql", "e2e_old"))  # idempotent: IF NOT EXISTS
-    if table_columns("e2e_old", "_releases")[-3:] == ["schema_key", "build_quality", "sealed_at"]:
-        assert table_columns("e2e_old", "_environments")[-2:] == ["schema_key", "build_quality"]
-        legacy = q(f"SELECT release_id, sealed_at, build_quality FROM `{project}.e2e_old._releases`")
-        assert legacy == [{"release_id": "legacy", "sealed_at": None, "build_quality": None}], legacy
-    else:
-        # EMULATOR LIMITATION: the migration statements execute without error but add no column.
-        skipped.append(
-            "registry_migrations_sql: emulator accepts `ALTER TABLE ... ADD COLUMN [IF NOT EXISTS]` but does not add the column "
-            f"(columns after migration: {table_columns('e2e_old', '_releases')[-3:]}); only the SQL being accepted is verified"
-        )
+    assert table_columns("e2e_old", "_releases")[-3:] == ["schema_key", "build_quality", "sealed_at"], table_columns("e2e_old", "_releases")
+    assert table_columns("e2e_old", "_environments")[-2:] == ["schema_key", "build_quality"]
+    legacy = q(f"SELECT release_id, sealed_at, build_quality FROM `{project}.e2e_old._releases`")
+    assert legacy == [{"release_id": "legacy", "sealed_at": None, "build_quality": None}], legacy
     print("[registry] ensure_registry_tables_sql + registry_migrations_sql (old-shape registry, idempotent) verified.")
 
     # 12. Batched registry flush: one MERGE for several objects, build_quality stamped
@@ -351,23 +317,15 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     cand_rel = FakeRelation(project, "e2e_reg", "cov_m__aaaaaaaaaaaa")
     base_rel = FakeRelation(project, "e2e_reg", "cov_m__bbbbbbbbbbbb")
     coverage_sql = hc.call_macro("partition_coverage_sql", cand_rel, base_rel)
-    try:
-        missing = [r["partition_id"] for r in q(coverage_sql)]
-    except Exception as exc:  # noqa: BLE001 - classify the emulator's answer, do not hide it
-        skipped.append(
-            "partition coverage audit + virtual_audit row counts: emulator has no INFORMATION_SCHEMA.PARTITIONS and no "
-            f"`__TABLES__` (row_count_sql), so virtual_audit cannot run; not faked ({str(exc)[:120]})"
-        )
-        print(f"[audit] SKIPPED partition coverage (emulator limitation): {str(exc)[:200]}")
-    else:
-        assert missing == ["20261002"], missing
-        refused(
-            lambda: hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov"),
-            "lacks 1 partition",
-        )
-        # Ignoring partitions before the cutoff makes the same pair pass.
-        hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov", coverage_ignore_before="2026-10-15")
-        print("[audit] partition coverage: missing partition 20261002 refused; coverage_ignore_before lets it pass.")
+    missing = [r["partition_id"] for r in q(coverage_sql)]
+    assert missing == ["20261002"], missing
+    refused(
+        lambda: hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov"),
+        "lacks 1 partition",
+    )
+    # Ignoring partitions before the cutoff makes the same pair pass.
+    hc.call_macro("virtual_audit", from_env="staging", to_env="prod", release_id="rel_cov", coverage_ignore_before="2026-10-15")
+    print("[audit] partition coverage: missing partition 20261002 refused; coverage_ignore_before lets it pass.")
 
     # 17. Regions: CREATE SCHEMA ... OPTIONS(location=...) from the regions macros
     hr = make_harness(extra_cfg={"physical_schemas_by_location": {"EU": "e2e_reg_eu", "US": "e2e_reg_us"}, "physical_schema": "e2e_reg"})
@@ -375,27 +333,14 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     assert hr.call_macro("create_location_for", "US") == "US"
     schema_sql = hr.call_macro("create_schema_if_not_exists_sql", "e2e_reg_eu", hr.call_macro("create_location_for", "EU"))
     assert "OPTIONS (location = 'EU')" in schema_sql, schema_sql
-    q(schema_sql)  # must be accepted (it is a BigQuery statement); the emulator does not act on it, see below
-    try:
-        client.get_dataset(f"{project}.e2e_reg_eu")
-    except NotFound:
-        # EMULATOR LIMITATION: `CREATE SCHEMA IF NOT EXISTS ... [OPTIONS (location = ...)]` succeeds but creates no dataset.
-        skipped.append(
-            "regions: emulator accepts CREATE SCHEMA IF NOT EXISTS `p`.`d` OPTIONS (location = 'EU') but creates no dataset "
-            "(later DDL fails 'dataset d is not found'); dataset created through the REST API instead"
-        )
-        requests.post(
-            f"{endpoint}/bigquery/v2/projects/{project}/datasets",
-            json={"datasetReference": {"projectId": project, "datasetId": "e2e_reg_eu"}, "location": "EU"},
-            timeout=10,
-        ).raise_for_status()
+    q(schema_sql)
+    client.get_dataset(f"{project}.e2e_reg_eu")  # CREATE SCHEMA must create the dataset
     exec_script(hr.call_macro("ensure_registry_tables_sql", hr.call_macro("physical_schema_for", "EU")))
     assert lookup(project, "e2e_reg_eu", "_releases") is not None
     print("[regions] CREATE SCHEMA ... OPTIONS (location = 'EU') rendered and accepted; per-location registry created in e2e_reg_eu")
     location = client.get_dataset(f"{project}.e2e_reg_eu").location
     print(f"[regions] emulator reports dataset location: {location!r}")
-    if location != "EU":
-        skipped.append(f"regions: emulator does not report the dataset location (got {location!r}, real BigQuery: 'EU')")
+    assert location == "EU", location
 
     # 18. GC retention per environment (`find_orphan_tables_sql`) with releases in two environments
     gc_tables = [
@@ -423,25 +368,12 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     q(f"INSERT INTO `{project}.e2e_gc._releases` (release_id, source_environment, target_environment, model_name, resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at, promoted_at) VALUES {values}")
     hg = make_harness(extra_cfg={"physical_schema": "e2e_gc"})
     orphan_sql = hg.call_macro("find_orphan_tables_sql", "e2e_gc", 1, 0)
-    try:
-        q(orphan_sql)
-    except Exception as exc:  # noqa: BLE001
-        # EMULATOR LIMITATION: INFORMATION_SCHEMA.TABLES.creation_time is a STRING here (TIMESTAMP in BigQuery), so
-        # `creation_time < TIMESTAMP_SUB(...)` fails to analyze. Everything else in the query runs as rendered.
-        assert "STRING, TIMESTAMP" in str(exc), exc
-        skipped.append(
-            "gc retention: emulator's INFORMATION_SCHEMA.TABLES.creation_time is STRING, not TIMESTAMP; "
-            "the query runs with `t.creation_time` wrapped in TIMESTAMP() (the only change)"
-        )
-        sql_rewrites["t.creation_time <"] = "TIMESTAMP(t.creation_time) <"
-    if True:
-        orphans = [r["table_name"] for r in q(sql_rewrites_apply(orphan_sql, sql_rewrites))]
-        assert orphans == ["m__2222222222bb", "m__4444444444dd"], orphans
-        hg.call_macro("virtual_gc", dry_run=False, retention_releases=1, retention_days=0)
-        sql_rewrites.pop("t.creation_time <", None)
-        left = sorted(t.table_id for t in client.list_tables(f"{project}.e2e_gc") if "__" in t.table_id)
-        assert left == ["m__0123456789ab", "m__1111111111aa", "n__3333333333cc"], left
-        print("[gc] per-environment retention: orphans", orphans, "dropped; pr_7's only release and prod's newest kept.")
+    orphans = [r["table_name"] for r in q(orphan_sql)]
+    assert orphans == ["m__2222222222bb", "m__4444444444dd"], orphans
+    hg.call_macro("virtual_gc", dry_run=False, retention_releases=1, retention_days=0)
+    left = sorted(t.table_id for t in client.list_tables(f"{project}.e2e_gc") if "__" in t.table_id)
+    assert left == ["m__0123456789ab", "m__1111111111aa", "n__3333333333cc"], left
+    print("[gc] per-environment retention: orphans", orphans, "dropped; pr_7's only release and prod's newest kept.")
 
     # 19. Companion state save/restore on a fake manifest table
     q(f"CREATE OR REPLACE TABLE `{project}.e2e_cmp.manifest` (model STRING, last_success TIMESTAMP)")
