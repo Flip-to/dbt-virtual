@@ -1,13 +1,27 @@
+{% macro virtual_database_name(custom_database_name, node) -%}
+  {#- DECISION(cross_project_promote_by_clone): a virtual node is built in the database of the
+      current environment's location (`physical_locations`), e.g. the CI project for `pr_42`.
+      Use from `generate_database_name`; without `physical_locations` it is `target.database`. -#}
+  {%- if dbt_virtual.is_virtual_node(node) -%}
+    {{ return(dbt_virtual.active_database()) }}
+  {%- endif -%}
+  {{ return(custom_database_name if custom_database_name is not none else target.database) }}
+{%- endmacro %}
+
+
 {% macro virtual_schema_name(custom_schema_name, node) -%}
   {%- if dbt_virtual.is_virtual_node(node) -%}
     {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
     {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', 'view') -%}
     {%- set cfg = dbt_virtual.get_config() -%}
+    {%- do dbt_virtual.assert_node_location(node) -%}
     {%- if mat in ['table', 'incremental'] -%}
-      {{ return(cfg.get('physical_schema')) }}
+      {#- The physical schema of the node's location (`physical_schemas_by_location`). -#}
+      {{ return(dbt_virtual.physical_schema_for_node(node)) }}
     {%- else -%}
-      {#- Routines (table_function, function, procedure) and views deploy to the environment schema -#}
-      {{ return(dbt_virtual.get_env_schema()) }}
+      {#- Routines (table_function, function, procedure) and views deploy to the environment
+          schema of their custom schema (see `env_schema_for`). -#}
+      {{ return(dbt_virtual.env_schema_for(none, custom_schema_name)) }}
     {%- endif -%}
   {%- endif -%}
 
@@ -51,17 +65,33 @@
     - Mode C ('hybrid'): physical tables bind to <physical_schema>.<model_name>__<fp>, routines/views bind to <env_schema>.<model_name>.
   -#}
   {%- set raw_rel = builtins.ref(*varargs, **kwargs) -%}
-  {%- if not execute -%}
-    {{ return(raw_rel) }}
-  {%- endif -%}
-
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- if not cfg.get('enabled', true) -%}
     {{ return(raw_rel) }}
   {%- endif -%}
 
   {%- set mode = cfg.get('ref_resolution', 'env_view') -%}
+  {#- Validate at parse time too, so a bad value fails `dbt parse` and not only `dbt run`.
+      `explicit` was documented as "ref() untouched, call virtual_ref yourself", but
+      virtual_ref is also what the project's `ref()` override calls, so a call site cannot be told
+      apart from an override call; it silently behaved like `physical`. See
+      docs/decisions/20261105_ref_resolution_explicit_is_rejected.md. -#}
+  {%- if mode == 'explicit' -%}
+    {{ exceptions.raise_compiler_error(
+      "dbt-virtual: ref_resolution 'explicit' is not supported (it used to behave exactly like 'physical'). "
+      ~ "Use 'env_view' (default), 'physical', or 'hybrid'. To keep today's behaviour, set ref_resolution: 'physical'."
+    ) }}
+  {%- elif mode not in ['env_view', 'physical', 'hybrid'] -%}
+    {{ exceptions.raise_compiler_error(
+      "dbt-virtual: unknown ref_resolution '" ~ mode ~ "'. Supported values: 'env_view' (default), 'physical', 'hybrid'."
+    ) }}
+  {%- endif -%}
+  {%- if not execute -%}
+    {{ return(raw_rel) }}
+  {%- endif -%}
+
   {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set phys_schemas = dbt_virtual.physical_schemas() -%}
 
   {#- Only fingerprint-shaped suffixes identify virtual tables; arbitrary names may contain `__`. -#}
   {%- set identifier_parts = raw_rel.identifier.rsplit('__', 1) -%}
@@ -79,7 +109,7 @@
     logical_name=(identifier_parts[0] if suffix_check.valid else '')
   ) -%}
   {#- physical_version may be an explicit non-hex suffix; only trust it when a manifest node declares it. -#}
-  {%- if raw_rel.schema == phys_schema and not virtual_relation.valid and graph is defined and graph.nodes is defined -%}
+  {%- if raw_rel.schema in phys_schemas and not virtual_relation.valid and graph is defined and graph.nodes is defined -%}
     {%- for candidate in graph.nodes.values() -%}
       {%- if dbt_virtual.is_virtual_node(candidate) -%}
         {%- set candidate_cfg = dbt_virtual.node_attr(candidate, 'config', {}) -%}
@@ -93,22 +123,23 @@
       {%- endif -%}
     {%- endfor -%}
   {%- endif -%}
-  {%- if raw_rel.schema == phys_schema and virtual_relation.valid -%}
+  {%- if raw_rel.schema in phys_schemas and virtual_relation.valid -%}
     {%- set logical_name = virtual_relation.logical_name -%}
+    {%- set ref_env_schema = dbt_virtual.env_schema_for(none, dbt_virtual.node_schema_key(dbt_virtual.virtual_node_by_name(logical_name))) -%}
     {%- if mode == 'env_view' -%}
       {{ return(api.Relation.create(
         database=raw_rel.database,
-        schema=dbt_virtual.get_env_schema(),
+        schema=ref_env_schema,
         identifier=logical_name,
         type='view'
       )) }}
     {%- elif mode == 'hybrid' -%}
       {%- set caller_cfg = dbt_virtual.node_attr(model, 'config', {}) if model is defined else {} -%}
       {%- set caller_mat = dbt_virtual.node_attr(caller_cfg, 'materialized', 'view') -%}
-      {%- if caller_mat in ['table_function', 'function', 'procedure', 'view'] -%}
+      {%- if caller_mat in ['table_function', 'function', 'virtual_function', 'procedure', 'view'] -%}
         {{ return(api.Relation.create(
           database=raw_rel.database,
-          schema=dbt_virtual.get_env_schema(),
+          schema=ref_env_schema,
           identifier=logical_name,
           type='view'
         )) }}

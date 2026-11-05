@@ -88,7 +88,9 @@ def _table_model(sql: str) -> str:
 class Project:
     """A throwaway dbt project wired to the local dbt_virtual macros and a DuckDB file."""
 
-    def __init__(self, root: Path, models: dict[str, str]) -> None:
+    def __init__(
+        self, root: Path, models: dict[str, str], project_yml: str = PROJECT_YML, threads: int = 1
+    ) -> None:
         self.dir = root / "proj"
         self.db_path = (root / "warehouse.duckdb").as_posix()
         (self.dir / "models").mkdir(parents=True)
@@ -101,11 +103,11 @@ class Project:
         (self.dir / "packages.yml").write_text(
             f'packages:\n  - local: "{pkg_dir.as_posix()}"\n', encoding="utf-8"
         )
-        (self.dir / "dbt_project.yml").write_text(PROJECT_YML, encoding="utf-8")
+        (self.dir / "dbt_project.yml").write_text(project_yml, encoding="utf-8")
         (self.dir / "macros" / "routing.sql").write_text(ROUTING_SHIM, encoding="utf-8")
         outputs = "".join(
             f'    {name}:\n      type: duckdb\n      path: "{self.db_path}"\n'
-            f"      schema: {schema}\n      threads: 1\n"
+            f"      schema: {schema}\n      threads: {threads}\n"
             for name, schema in TARGETS.items()
         )
         (self.dir / "profiles.yml").write_text(
@@ -148,15 +150,18 @@ class Project:
         if select:
             args += ["--select", *select]
         self.dbt(*args)
+        if release:
+            # `dbt-virtual build --release` seals the release after a successful `dbt build`.
+            self.operation("virtual_seal_release", {"release_id": release}, env=env)
         return fps
 
     def cli(self, *args: str) -> int:
         return dbt_virtual_main(["--project-dir", str(self.dir), *args])
 
-    def operation(self, name: str, args: dict, *, expect_ok: bool = True) -> subprocess.CompletedProcess:
-        return self.dbt(
-            "run-operation", name, "--target", "staging", "--args", json.dumps(args), expect_ok=expect_ok
-        )
+    def operation(
+        self, name: str, args: dict, *, expect_ok: bool = True, env: str = "staging"
+    ) -> subprocess.CompletedProcess:
+        return self.dbt("run-operation", name, "--target", env, "--args", json.dumps(args), expect_ok=expect_ok)
 
     def query(self, sql: str) -> list[tuple]:
         con = duckdb.connect(self.db_path, read_only=True)
@@ -310,6 +315,8 @@ def test_bare_dbt_run_renders_nested_config_and_registers_physical_fingerprint(m
     )
     assert [r[0] for r in rows] == ["staging", "staging"]
     for _env, name, fingerprint, physical_identifier in rows:
-        # The registered fingerprint is the one in the physical table name.
-        assert physical_identifier == f"analytics_physical.{name}__{fingerprint}"
+        # A bare run registers the run-time Merkle fingerprint (parents included), which
+        # `guard_shared_tables` compares; the physical name is the parse-time alias.
+        assert physical_identifier.startswith(f"analytics_physical.{name}__")
+        assert len(fingerprint) == 12
     assert proj.query("SELECT x FROM analytics_staging.down") == [(1,)]

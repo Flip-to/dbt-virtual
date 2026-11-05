@@ -58,13 +58,13 @@ You can migrate your existing dbt project either **gradually (one folder or mode
        # Start with one folder (e.g. metrics) or enable across your marts:
        metrics:
          +virtual_env: true
-         +pre-hook:
-           - "{{ dbt_virtual.clone_if_new_fp() }}"
          +post-hook:
            - "{{ dbt_virtual.sync_env_view() }}"
    ```
 
-3. Add the routing overrides in `macros/virtual_routing_overrides.sql`:
+   If production publishes to several datasets, use the mapping form of `env_schemas` instead (see [Section 3](#3-projects-with-several-datasets-and-their-own-routine-materializations)).
+
+3. Add the routing overrides in `macros/virtual_routing_overrides.sql` (if you already have a custom `generate_schema_name`, keep its body and only add the `is_virtual_node` guard at the top):
    ```sql
    {% macro generate_schema_name(custom_schema_name, node) -%}
      {%- if dbt_virtual.is_virtual_node(node) -%}
@@ -85,7 +85,7 @@ You can migrate your existing dbt project either **gradually (one folder or mode
 
 ### Step 2: Adopt Existing Production Tables in Zero Compute (`dbt-virtual adopt`)
 
-Instead of rebuilding your existing huge tables in `analytics`, run **`dbt-virtual adopt`** against `prod`:
+Instead of rebuilding your existing huge tables in `analytics`, run **`dbt-virtual adopt`** against `prod`. It compiles the project with your default target, computes fingerprints, and handles every virtual `table` / `incremental` model; routines are not adopted (the first `build` + `promote` registers them). Fingerprints no longer depend on the target that compiled the project, so the tables adopted here are `REUSE` in later staging and PR builds; if your SQL hard-codes per-target schema names outside `ref()`, pass them with `--known-schema` (see [How It Works](how_it_works.md)).
 
 === "Option A: Full Cutover (`dbt-virtual adopt`)"
 
@@ -139,11 +139,60 @@ dbt-virtual status --env staging --base-env prod --output state.json
 dbt-virtual plan --env staging --state-file state.json
 ```
 
-Every single unchanged model will show **`REUSE` (0 compute)**!
+Every unchanged `table` / `incremental` model should show **`REUSE` (0 compute)**. Routines show `ROUTINE_DEPLOY` until the first staging build registers them. A model that shows `FULL_BUILD` although its SQL did not change usually reads a per-target schema that is not a `ref()`; see `--known-schema`.
 
 ---
 
-## 3. Frequently Asked Questions (FAQ) for Existing Projects
+## 3. Projects with Several Datasets and Their Own Routine Materializations
+
+A common BigQuery layout: the prod target writes marts to `analytics` and `analytics_gold` (custom schema `gold`), and table functions that applications call to a `spacetime` dataset, often through the project's own `table_function` materialization; dev and staging targets put everything in one dataset. dbt-virtual can keep that layout as is.
+
+### Step A: Describe each environment's datasets in `env_schemas`
+
+```yaml
+vars:
+  dbt_virtual:
+    physical_schema: "analytics_physical"
+    # Every production target builds into the `prod` environment.
+    environment: "{{ 'prod' if target.name in ['prod', 'prod_scheduler'] else env_var('DBT_VIRTUAL_ENV', target.name) }}"
+    base_environment: "prod"
+    env_schemas:
+      prod:
+        default: "analytics"        # models without config(schema=...)
+        spacetime: "spacetime"      # listed: the dataset applications already query
+        # gold is not listed, so config(schema='gold') -> "analytics_gold"
+      staging: "analytics_staging"  # one dataset for everything
+```
+
+Write the mapping so it produces the same datasets your `generate_schema_name` produces for the prod target today; consumers keep querying `analytics_gold.orders` and `spacetime.tvf_bookings`. `dbt-virtual adopt --env prod` then clones `analytics_gold.orders` (not `analytics.orders`) for a model with `config(schema='gold')`. PR environments still get one dataset each (`analytics_pr_42`). Full rules: [`env_schemas`](configuration_reference.md).
+
+### Step B: Keep your routine materializations, add one call
+
+If your project defines its own `table_function` (or `function`, `procedure`) materialization, keep it and call `dbt_virtual.register_routine_deployment(model, target_relation, 'table_function', sql, ddl=<the statement you ran>)` right after the `CREATE` statement. The call records the routine and its DDL so `promote` and `rollback` can replay it in another environment with every reference to a virtual object re-pointed (`analytics_staging.orders` → `analytics_gold.orders`). It is a no-op for non-virtual models. Full example and argument table: [Routines → Your Own Routine Materializations](routines_and_tvf_testing.md).
+
+Two details decide which materialization dbt runs:
+- Declare yours with `adapter='bigquery'`. The package ships `table_function, adapter='bigquery'`, and dbt prefers an adapter-specific materialization over a `default` one before it looks at which project defines it.
+- On dbt-core 1.11+ a package can no longer override the built-in `function` materialization, but the root project can. A root-project `function` declared with `adapter='bigquery'` is chosen over both the package's and dbt-core's (dbt-core 1.12.6 `dbt/contracts/graph/manifest.py`, `find_materialization_macro_by_name`); a `default` one only beats dbt-core's `function, default` if your adapter ships no `function` of its own (not verified for dbt-bigquery). Models that used the package's `function` switch to `materialized='virtual_function'`.
+
+### Step C: Adopt, build, promote
+
+```bash
+# 1. Adopt prod tables in place (keep them as tables until the first promote)
+dbt-virtual adopt --env prod --release v_initial_adopt --keep-existing-table
+
+# 2. Build staging: tables are REUSE, routines are deployed into analytics_staging and registered
+dbt-virtual status --env staging --base-env prod --output state.json
+dbt-virtual build --env staging --state-file state.json --release v1
+
+# 3. Promote: views into analytics / analytics_gold, routines into spacetime with re-pointed references
+dbt-virtual promote --from staging --to prod --release v1 --audit
+```
+
+A virtual routine that reads a **non-virtual** model in a custom schema keeps the location it had in staging after promotion (only references to virtual objects, and to the environment's default schema, are re-pointed). Make the models your routines read virtual, or read them through sources. `view` models with `virtual_env: true` are not promoted (no registry pointer is recorded for them); see [How It Works → Known Limitations](how_it_works.md).
+
+---
+
+## 4. Frequently Asked Questions (FAQ) for Existing Projects
 
 ### Q1: What if we only want to virtualize our 10 largest incremental tables first?
 Because `dbt-virtual` is **opt-in** via `virtual_env: true`, you can enable it on just a single model (`{{ config(virtual_env=true) }}`) or a single subdirectory in `dbt_project.yml`. Non-virtualized models continue to build in place in `analytics_staging` / `analytics` and can freely `{{ ref() }}` virtualized models (and vice versa) because virtualized models expose `<env_schema>.<model>` views at the exact same relation path as before!

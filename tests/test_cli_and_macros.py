@@ -265,7 +265,8 @@ def test_state_file_without_catalog_snapshot_keeps_pointer_assumption(tmp_path: 
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({"base_env_state": {"orders_metrics": "oldfp"}}))
 
-    _, base_state, existing_tables = _load_state_file(str(state_path))
+    _, base_state, existing_tables, registered = _load_state_file(str(state_path))
+    assert registered is None
 
     assert base_state == {"orders_metrics": "oldfp"}
     assert existing_tables is None
@@ -312,9 +313,9 @@ def test_cli_build_skips_dbt_when_all_models_reused(tmp_path: Path, capsys) -> N
             ]
         )
     assert rc == 0
-    # Only `run-operation virtual_sync_reused_views` is called; `dbt build` is skipped!
+    # One `run-operation virtual_finalize_plan` (REUSE sync + snapshot); `dbt build` is skipped!
     assert len(recorded_cmds) == 1
-    assert recorded_cmds[0][:2] == ["run-operation", "virtual_sync_reused_views"]
+    assert recorded_cmds[0][:2] == ["run-operation", "virtual_finalize_plan"]
     assert "zero compute" in capsys.readouterr().out
 
 
@@ -434,6 +435,7 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
                     "prod",
                     "--release",
                     "v2026.10.27",
+                    "--skip-compile",
                 ]
             )
             == 0
@@ -526,7 +528,7 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
             == 0
         )
 
-    assert len(recorded_cmds) == 9
+    assert len(recorded_cmds) == 8
     build_cmd = recorded_cmds[0]
     assert build_cmd[:3] == ["build", "--target", "staging"]
     assert "--full-refresh" in build_cmd
@@ -537,21 +539,18 @@ def test_cli_build_promote_rollback_gc_init_drop_subcommands(tmp_path: Path) -> 
     assert vars_payload["_dbt_virtual_end"] == "2026-10-27"
     assert "orders_metrics" in vars_payload["_dbt_virtual_fps"]
 
-    # A release build records the whole environment in the release, so promote/rollback of
-    # that release do not demote models the build reused or did not select.
-    snapshot_cmd = recorded_cmds[1]
-    assert snapshot_cmd[:4] == ["run-operation", "virtual_snapshot_release", "--target", "staging"]
-    snapshot_args = json.loads(snapshot_cmd[snapshot_cmd.index("--args") + 1])
-    assert snapshot_args["release_id"] == "v2026.10.27"
-    assert "orders_metrics" in json.loads(snapshot_args["models_json"])
+    # A release build records the whole environment in the release (done by the build's own
+    # on-run-end hook, not a second dbt invocation), so promote/rollback of that release do not
+    # demote models the build reused or did not select.
+    assert vars_payload["_dbt_virtual_snapshot"] is True
 
-    assert recorded_cmds[2][:2] == ["run-operation", "virtual_promote"]
-    assert recorded_cmds[3][:2] == ["run-operation", "virtual_rollback"]
-    assert recorded_cmds[4][:2] == ["run-operation", "virtual_init_env"]
-    assert recorded_cmds[5][:2] == ["run-operation", "virtual_drop_env"]
-    assert recorded_cmds[6][:2] == ["run-operation", "virtual_gc"]
-    assert recorded_cmds[7][:2] == ["run-operation", "virtual_audit"]
-    assert recorded_cmds[8][:2] == ["run-operation", "virtual_export_state"]
+    assert recorded_cmds[1][:2] == ["run-operation", "virtual_promote"]
+    assert recorded_cmds[2][:2] == ["run-operation", "virtual_rollback"]
+    assert recorded_cmds[3][:2] == ["run-operation", "virtual_init_env"]
+    assert recorded_cmds[4][:2] == ["run-operation", "virtual_drop_env"]
+    assert recorded_cmds[5][:2] == ["run-operation", "virtual_gc"]
+    assert recorded_cmds[6][:2] == ["run-operation", "virtual_audit"]
+    assert recorded_cmds[7][:2] == ["run-operation", "virtual_export_state"]
 
 
 def test_schema_diff_and_cli_diff_subcommand(tmp_path: Path, capsys) -> None:
@@ -730,9 +729,10 @@ def test_jinja_sql_macros_parse_cleanly() -> None:
         env.parse(sanitized)
 
 
-def test_cli_build_seeds_incremental_clones_before_dbt_build(tmp_path: Path) -> None:
-    """dbt's incremental materialization loads `existing_relation` before model pre-hooks run,
-    so SEED_INCREMENTAL clones must exist before `dbt build` starts."""
+def test_cli_build_seeds_incremental_clones_in_the_build_run_start_hook(tmp_path: Path) -> None:
+    """dbt's incremental materialization loads `existing_relation` before model pre-hooks run, so
+    SEED_INCREMENTAL clones must exist before the models run: `dbt_virtual.run_start()` (the
+    package's on-run-start hook) clones the models the CLI passes in `_dbt_virtual_seed`."""
     manifest = _sample_manifest()
     target_dir = tmp_path / "target"
     target_dir.mkdir(parents=True)
@@ -756,14 +756,53 @@ def test_cli_build_seeds_incremental_clones_before_dbt_build(tmp_path: Path) -> 
             ]
         )
     assert rc == 0
-    ops = [cmd[:2] for cmd in recorded_cmds]
-    seed_idx = ops.index(["run-operation", "virtual_seed_incremental_clones"])
-    build_idx = next(i for i, cmd in enumerate(recorded_cmds) if cmd[0] == "build")
-    assert seed_idx < build_idx
-    seed_cmd = recorded_cmds[seed_idx]
-    assert json.loads(seed_cmd[seed_cmd.index("--args") + 1]) == {"model_names": ["orders_metrics"]}
-    # Same target and fingerprints as the build, so the clone lands on the alias dbt builds.
-    assert seed_cmd[seed_cmd.index("--target") + 1] == "staging"
-    seed_vars = json.loads(seed_cmd[seed_cmd.index("--vars") + 1])
-    build_cmd = recorded_cmds[build_idx]
-    assert seed_vars == json.loads(build_cmd[build_cmd.index("--vars") + 1])
+    # No separate seed `run-operation` (each one parses the whole project).
+    assert [cmd[0] for cmd in recorded_cmds] == ["build"]
+    build_cmd = recorded_cmds[0]
+    assert build_cmd[build_cmd.index("--target") + 1] == "staging"
+    assert json.loads(build_cmd[build_cmd.index("--vars") + 1])["_dbt_virtual_seed"] == [
+        "orders_metrics"
+    ]
+
+
+def test_cli_build_target_vars_and_defer_are_separate_from_env(tmp_path: Path) -> None:
+    """CI builds env pr_42 with profile target `ci`, extra window vars, and --defer/--state."""
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(json.dumps(_sample_manifest()), encoding="utf-8")
+    recorded: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir", str(tmp_path), "build", "--env", "pr_42", "--target", "ci",
+                "--vars", json.dumps({"enable_prod_hooks": False, "_dbt_virtual_env": "spoofed"}),
+                "--defer", "--state", "/tmp/prodstate", "--skip-compile",
+            ]
+        )
+    assert rc == 0
+    build_cmd = next(cmd for cmd in recorded if cmd[0] == "build")
+    assert build_cmd[build_cmd.index("--target") + 1] == "ci"
+    assert "--defer" in build_cmd and build_cmd[build_cmd.index("--state") + 1] == "/tmp/prodstate"
+    build_vars = json.loads(build_cmd[build_cmd.index("--vars") + 1])
+    assert build_vars["enable_prod_hooks"] is False
+    # dbt-virtual's own vars cannot be overridden by --vars.
+    assert build_vars["_dbt_virtual_env"] == "pr_42"
+
+
+def test_cli_operations_pass_the_requested_target(tmp_path: Path) -> None:
+    """promote/rollback/status/gc used the profile's default target (prod in some projects)."""
+    recorded: list[list[str]] = []
+
+    def fake_run_dbt_cmd(args, **_kwargs):
+        recorded.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    with patch("dbt_virtual.cli.subprocess.run", side_effect=fake_run_dbt_cmd):
+        assert main(["--project-dir", str(tmp_path), "gc", "--dry-run", "--target", "ci"]) == 0
+        assert main(["--project-dir", str(tmp_path), "drop-env", "--env", "pr_1", "--target", "ci"]) == 0
+    assert all(cmd[cmd.index("--target") + 1] == "ci" for cmd in recorded)

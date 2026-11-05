@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,8 +35,9 @@ class FakeRelation:
 
 
 class FakeResult:
-    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+    def __init__(self, rows: list[tuple[Any, ...]], column_names: list[str] | None = None) -> None:
         self.rows = rows
+        self.column_names = column_names or []
 
 
 class MacroTestHarness:
@@ -49,6 +52,7 @@ class MacroTestHarness:
         target_database: str = "test_proj",
         adapter_type: str = "bigquery",
         execute: bool = True,
+        target_location: str | None = None,
     ) -> None:
         self.vars_dict = vars_dict or {}
         self.target = {
@@ -57,6 +61,8 @@ class MacroTestHarness:
             "database": target_database,
             "type": adapter_type,
         }
+        if target_location is not None:
+            self.target["location"] = target_location
         self.adapter_type = adapter_type
         self.execute = execute
         self.existing_relations: set[tuple[str, str, str]] = set()
@@ -69,6 +75,15 @@ class MacroTestHarness:
         self.model: dict[str, Any] = {}
         self.this: FakeRelation | None = None
         self.ref_relations: dict[str, FakeRelation] = {}
+        # Extra adapter methods for one test (e.g. BigQuery-only `is_replaceable`).
+        self.adapter_extras: dict[str, Any] = {}
+        # Optional live warehouse (e.g. the BigQuery emulator E2E): `query_executor(sql)` returns
+        # `(rows, column_names)` and replaces the canned `query_responses`; `relation_lookup(db,
+        # schema, identifier)` returns a FakeRelation or None and replaces `existing_relations`.
+        self.query_executor: Any = None
+        self.relation_lookup: Any = None
+        self.grant_calls: list[tuple[Any, ...]] = []
+        self.column_updates: list[tuple[str, dict[str, Any]]] = []
 
         self.env = jinja2.Environment(
             extensions=["jinja2.ext.do"],
@@ -85,9 +100,15 @@ class MacroTestHarness:
         macro_files = [
             REPO / "macros" / "fingerprint" / "get_fingerprint.sql",
             REPO / "macros" / "routing" / "virtual_routing.sql",
+            REPO / "macros" / "routing" / "locations.sql",
             REPO / "macros" / "adapters" / "dispatch.sql",
             REPO / "macros" / "lifecycle" / "hooks.sql",
+            REPO / "macros" / "lifecycle" / "registry_batch.sql",
+            REPO / "macros" / "lifecycle" / "guards.sql",
             REPO / "macros" / "lifecycle" / "operations.sql",
+            REPO / "macros" / "lifecycle" / "companion_state.sql",
+            REPO / "macros" / "lifecycle" / "companion_state_ops.sql",
+            REPO / "macros" / "lifecycle" / "data_diff.sql",
             REPO / "macros" / "testing" / "tvf_test_ref.sql",
         ]
         combined_source = "\n\n".join(f.read_text(encoding="utf-8") for f in macro_files)
@@ -96,14 +117,11 @@ class MacroTestHarness:
 
     def call_macro(self, macro_name: str, *args: Any, **kwargs: Any) -> str:
         """Render a macro call with the current harness context."""
-        # In dbt, `{{ return(x) }}` short-circuits the macro and returns `x`.
-        # We emulate `return` by recording the first `return(...)` value if called, else returning rendered text.
-        returned: list[Any] = []
-
+        # In dbt, `{{ return(x) }}` short-circuits the macro and returns `x` (dbt raises
+        # MacroReturn). Raise too: recording the value and rendering on ran the rest of the macro,
+        # where nested macro calls then returned rendered text instead of their values.
         def _ret(val: Any) -> str:
-            if not returned:
-                returned.append(val)
-            return ""
+            raise _MacroReturn(val)
 
         def _var(key: str, default: Any = None) -> Any:
             return self.vars_dict.get(key, default)
@@ -112,6 +130,8 @@ class MacroTestHarness:
             return hashlib.md5(s.encode("utf-8")).hexdigest()
 
         def _get_relation(database: str, schema: str, identifier: str) -> FakeRelation | None:
+            if self.relation_lookup is not None:
+                return self.relation_lookup(database, schema, identifier)
             if (database, schema, identifier) in self.existing_relations:
                 return FakeRelation(database, schema, identifier)
             return None
@@ -127,8 +147,20 @@ class MacroTestHarness:
 
         def _run_query(sql: str) -> FakeResult:
             self.executed_queries.append(sql.strip())
+            if self.query_executor is not None:
+                rows, column_names = self.query_executor(sql)
+                return FakeResult(rows, column_names)
             if self.query_responses:
                 return self.query_responses.pop(0)
+            # Routine existence checks see routines whose CREATE statement already ran, like a warehouse.
+            check = re.search(r"`([^`]+)`\.INFORMATION_SCHEMA\.ROUTINES\s+WHERE routine_name = '([^']+)'", sql)
+            if check:
+                schema_name, routine_name = check.groups()
+                created = any(
+                    re.search(rf"CREATE OR REPLACE (TABLE )?(FUNCTION|PROCEDURE) [^\n(]*`{re.escape(schema_name)}`\.`{re.escape(routine_name)}`", q)
+                    for q in self.executed_queries
+                )
+                return FakeResult([(routine_name,)] if created else [])
             return FakeResult([])
 
         def _raise_compiler_error(msg: str) -> None:
@@ -152,12 +184,10 @@ class MacroTestHarness:
                 fn = getattr(mod_ref[0], item)
 
                 def _wrapped(*a: Any, **kw: Any) -> Any:
-                    prev_len = len(returned)
-                    rendered = fn(*a, **kw)
-                    if len(returned) > prev_len:
-                        val = returned.pop()
-                        return val
-                    return rendered
+                    try:
+                        return fn(*a, **kw)
+                    except _MacroReturn as macro_return:
+                        return macro_return.value
 
                 return _wrapped
 
@@ -166,10 +196,11 @@ class MacroTestHarness:
             "var": _var,
             "local_md5": _local_md5,
             "fromjson": json.loads,
+            "env_var": lambda name, default="": os.environ.get(name, default),
             "tojson": json.dumps,
             "log": lambda msg, info=False: self.logs.append(str(msg)) or "",
             "execute": self.execute,
-            "modules": type("ModulesObj", (), {"re": re})(),
+            "modules": type("ModulesObj", (), {"re": re, "datetime": datetime})(),
             # dbt's `render()` renders a string in the current context.
             "render": lambda text: self.env.from_string(text).render(**ctx),
             "target": self.target,
@@ -217,8 +248,18 @@ class MacroTestHarness:
                 (),
                 {
                     "get_relation": staticmethod(_get_relation),
+                    "check_schema_exists": staticmethod(lambda database, schema: True),
                     "cache_added": staticmethod(_cache_added),
                     "dispatch": staticmethod(_dispatch),
+                    **{name: staticmethod(fn) for name, fn in self.adapter_extras.items()},
+                    "grant_access_to": staticmethod(
+                        lambda entity, entity_type, role, target: self.grant_calls.append(
+                            (entity, entity_type, role, target)
+                        )
+                    ),
+                    "update_columns": staticmethod(
+                        lambda rel, cols: self.column_updates.append((str(rel), cols))
+                    ),
                 },
             )(),
             "builtins": type(
@@ -560,17 +601,18 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
     assert "AS $$" in sf_tvf
     sf_orphan = sf_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
     assert "REGEXP_LIKE" in sf_orphan
-    assert "MAX(created_at) AS release_created_at" in sf_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in sf_orphan
     assert "GROUP BY release_id" in sf_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= 5" in sf_orphan
+    # Retention is per environment, so PR candidates cannot push out prod's rollback targets.
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= 5" in sf_orphan
     assert "t.created < DATEADD(day, -7, CURRENT_TIMESTAMP())" in sf_orphan
     assert "LEFT JOIN protected_tables" in sf_orphan
 
     bq_harness = MacroTestHarness(adapter_type="bigquery")
     bq_orphan = bq_harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
-    assert "MAX(created_at) AS release_created_at" in bq_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in bq_orphan
     assert "GROUP BY release_id" in bq_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= 5" in bq_orphan
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= 5" in bq_orphan
 
     for adapter_type, matcher in (
         ("duckdb", "regexp_matches(LOWER(t.table_name), '__[0-9a-f]{8,64}$')"),
@@ -594,9 +636,9 @@ def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:
         assert "no safe fingerprint table matcher is configured" in str(exc)
 
     duckdb_orphan = harness.call_macro("find_orphan_tables_sql", "analytics_physical", 5, 7)
-    assert "MAX(created_at) AS release_created_at" in duckdb_orphan
+    assert "MAX(COALESCE(promoted_at, created_at)) AS release_ts" in duckdb_orphan
     assert "GROUP BY release_id" in duckdb_orphan
-    assert "DENSE_RANK() OVER (ORDER BY release_created_at DESC)" in duckdb_orphan
+    assert "DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC)" in duckdb_orphan
     assert "MAX(age_r.created_at) < CURRENT_TIMESTAMP - INTERVAL '7 days'" in duckdb_orphan
 
     # Databricks dispatch: SHALLOW CLONE
@@ -766,6 +808,8 @@ def test_virtual_promote_rollback_init_drop_and_gc_operations() -> None:
             ]
         )
     )
+    # Rollback checks that the release's physical tables still exist before re-pointing views.
+    harness.existing_relations.add(("test_proj", "analytics_physical", "orders_metrics__fp000"))
     harness.call_macro("virtual_rollback", env="prod", to_release="")
     rollback_queries = "\n".join(harness.executed_queries)
     assert "SELECT * FROM `test_proj`.`analytics_physical`.`orders_metrics__fp000`" in rollback_queries
@@ -827,6 +871,8 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
             "_dbt_virtual_end": "2026-10-27",
         }
     )
+    for registry in ("_environments", "_releases"):
+        harness.existing_relations.add(("test_proj", "analytics_physical", registry))
 
     # 1. Interval tracking in sync_env_view when _dbt_virtual_start / _dbt_virtual_end are set
     harness.model = {
@@ -842,22 +888,29 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
     # 2. Concurrency lock acquisition & conflict detection
     harness.executed_queries.clear()
     harness.query_responses.append(FakeResult([]))  # delete expired
-    harness.query_responses.append(FakeResult([]))  # check active lock -> none
-    harness.query_responses.append(FakeResult([]))  # delete self
-    harness.query_responses.append(FakeResult([]))  # insert lock
+    harness.query_responses.append(FakeResult([]))  # delete own lease
+    harness.query_responses.append(FakeResult([]))  # insert own lease
+    harness.query_responses.append(FakeResult([("ci_job_1", "2026-10-27T23:59:59Z")]))  # live leases
     harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
     lock_queries = "\n".join(harness.executed_queries)
     assert "INSERT INTO `test_proj`.`analytics_physical`._locks" in lock_queries
     assert "'ci_job_1'" in lock_queries
+    assert "ORDER BY acquired_at ASC, owner ASC" in lock_queries
 
-    # Active lock held by another owner raises RuntimeError
-    harness.query_responses.append(FakeResult([]))  # delete expired
-    harness.query_responses.append(FakeResult([("ci_job_other", "2026-10-27T23:59:59Z")]))
+    # An older live lease of another owner wins: this owner removes its lease and fails.
+    harness.executed_queries.clear()
+    harness.query_responses.extend([FakeResult([]), FakeResult([]), FakeResult([])])
+    harness.query_responses.append(
+        FakeResult([("ci_job_other", "2026-10-27T23:59:59Z"), ("ci_job_1", "2026-10-27T23:59:59Z")])
+    )
     try:
         harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
         raise AssertionError("Expected RuntimeError on lock conflict")
     except RuntimeError as exc:
         assert "dbt-virtual lock conflict" in str(exc)
+        assert "'ci_job_other'" in str(exc)
+    assert harness.executed_queries[-1].startswith("DELETE FROM `test_proj`.`analytics_physical`._locks")
+    assert "owner = 'ci_job_1'" in harness.executed_queries[-1]
 
     harness.executed_queries.clear()
     harness.call_macro("virtual_release_lock", env="prod", owner="ci_job_1")
@@ -1005,7 +1058,9 @@ def test_bigquery_audit_counts_rows_from_table_metadata() -> None:
             FakeResult([(100,)]),
         ]
     )
-    harness.call_macro("virtual_audit", from_env="staging", to_env="prod", max_row_drop_pct=20.0)
+    harness.call_macro(
+        "virtual_audit", from_env="staging", to_env="prod", max_row_drop_pct=20.0, check_coverage=False
+    )
     count_queries = harness.executed_queries[2:]
     assert len(count_queries) == 2
     assert all("COUNT(*)" not in q for q in count_queries)

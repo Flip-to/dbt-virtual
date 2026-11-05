@@ -16,6 +16,9 @@ from sqlglot.errors import SqlglotError
 
 FINGERPRINT_SCHEMA_VERSION = 1
 DEFAULT_FINGERPRINT_LENGTH = 12
+METADATA_ONLY_CONFIG = frozenset({"forward_only", "on_schema_change"})
+# `virtual_function` is the scalar UDF materialization on dbt-core 1.11+ (core owns `function`).
+ROUTINE_MATERIALIZATIONS = frozenset({"table_function", "function", "virtual_function", "procedure"})
 
 _WHITESPACE_RUN_RE = re.compile(r"[ \t]+")
 _FINGERPRINT_SUFFIX_RE = re.compile(r"__[0-9a-f]{8,64}\b")
@@ -180,11 +183,38 @@ def extract_sql_output_columns(sql: str, dialect: str = "bigquery") -> dict[str,
         return {}
 
 
+def _strip_dependency_qualifiers(
+    sql: str,
+    identifiers: set[str],
+    *,
+    replacement: str = "__DBT_VIRTUAL_REF__.{ident}",
+) -> str:
+    """Replace `database.schema.<dependency>` references with `__DBT_VIRTUAL_REF__.<dependency>`.
+
+    dbt renders every `ref()` as a three-part name whose database and schema depend on the target
+    (a dev or PR dataset vs prod datasets). The dependency's own fingerprint is already part of the
+    Merkle payload, so its location only made fingerprints differ between environments. Only
+    three-part names are rewritten: two-part names may be `alias.column`.
+    """
+    for ident in sorted(identifiers, key=len, reverse=True):
+        e = re.escape(ident)
+        patterns = (
+            rf"`[^`\n]+`\.`[^`\n]+`\.`{e}`",  # `project`.`dataset`.`ident`
+            rf"`[^`.\n]+\.[^`.\n]+\.{e}`",  # `project.dataset.ident`
+            rf'"[^"\n]+"\."[^"\n]+"\."{e}"',  # "database"."schema"."ident"
+            rf"(?<![\w.$`\"])[A-Za-z_][\w$-]*\.[A-Za-z_][\w$-]*\.{e}(?![\w$])",  # db.schema.ident
+        )
+        for pattern in patterns:
+            sql = re.sub(pattern, replacement.format(ident=ident), sql, flags=re.IGNORECASE)
+    return sql
+
+
 def normalize_sql(
     sql: str,
     *,
     self_identifier: str | None = None,
     known_schemas: list[str] | None = None,
+    dependency_identifiers: set[str] | None = None,
     use_ast: bool = True,
     dialect: str = "bigquery",
 ) -> str:
@@ -196,6 +226,19 @@ def normalize_sql(
         sql.replace("\r\n", "\n").replace("\r", "\n"),
         dialect=dialect,
     )
+
+    if dependency_identifiers:
+        normalized = _strip_dependency_qualifiers(normalized, dependency_identifiers)
+
+    # The node's own `{{ this }}` is a three-part name too, and its database and schema differ per
+    # target (prod dataset vs the environment's physical dataset), so drop the qualifier before the
+    # identifier itself is tokenized below.
+    if self_identifier:
+        normalized = _strip_dependency_qualifiers(
+            normalized,
+            {_FINGERPRINT_SUFFIX_RE.sub("", self_identifier)},
+            replacement="__DBT_VIRTUAL_THIS__",
+        )
 
     # Replace known environment / physical schemas with a canonical schema token
     if known_schemas:
@@ -290,15 +333,102 @@ def extract_relevant_config(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+class MissingCompiledCodeError(ValueError):
+    """A virtual node's raw SQL has Jinja but the manifest holds no compiled SQL for it."""
+
+
+# Macros shipped with dbt itself, the adapters and dbt-virtual change with a dbt upgrade or a
+# dbt-virtual release, not with the project's SQL: they would rebuild every table.
+_ENGINE_MACRO_PACKAGES = frozenset(
+    {
+        "dbt",
+        "dbt_virtual",
+        "dbt_bigquery",
+        "dbt_snowflake",
+        "dbt_postgres",
+        "dbt_duckdb",
+        "dbt_databricks",
+        "dbt_spark",
+        "dbt_redshift",
+    }
+)
+_JINJA_MARKERS = ("{{", "{%")
+
+
+def macro_closure_hash(node: dict[str, Any], macros: Any) -> tuple[list[str], str]:
+    """Hash the macros a node calls (transitively), minus dbt, adapter and dbt-virtual macros.
+
+    Returns `(macro unique_ids, sha256 hex)`. It stands in for the compiled SQL of ancestors that
+    dbt-virtual does not build: their compiled SQL reads the warehouse (`is_incremental()`,
+    `load_relation`, `run_query`) and the clock, so it differs between a fresh environment and
+    prod for the same code. The raw SQL plus the code of the macros it calls does not.
+    """
+    index = macros if isinstance(macros, MacroIndex) else MacroIndex(macros or {})
+    seen: set[str] = set()
+    stack = list(index.referenced_ids(str(node.get("raw_code") or node.get("raw_sql") or "")))
+    while stack:
+        macro_id = stack.pop()
+        if macro_id in seen:
+            continue
+        seen.add(macro_id)
+        stack.extend(index.referenced_ids(index.body(macro_id)))
+    hashed = {m: hashlib.sha256(index.body(m).encode("utf-8")).hexdigest() for m in sorted(seen)}
+    digest = hashlib.sha256(json.dumps(hashed, sort_keys=True).encode("utf-8")).hexdigest()
+    return list(hashed), digest
+
+
+_CALLED_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_DISPATCHED_NAME_RE = re.compile(r"dispatch\(\s*['\"]([A-Za-z_]\w*)['\"]")
+
+
+class MacroIndex:
+    """Finds the project and package macros a piece of Jinja calls, by scanning its text.
+
+    The manifest's own `depends_on.macros` is no use here: dbt records only the macros a node's
+    *rendered* branches called, so it changes with `is_incremental()`, the adapter and which
+    packages are enabled (measured on the flipto-dbt pilot: 7 macros differed between prod and a
+    sandbox for the same model). Scanning the text over-approximates, and is the same everywhere.
+    """
+
+    def __init__(self, macros: dict[str, Any]) -> None:
+        self._bodies: dict[str, str] = {}
+        self._by_name: dict[str, list[str]] = {}
+        for macro_id, macro in macros.items():
+            package = macro_id.split(".")[1] if macro_id.count(".") >= 2 else ""
+            if package in _ENGINE_MACRO_PACKAGES:
+                continue
+            self._bodies[macro_id] = str(macro.get("macro_sql") or "").replace("\r\n", "\n")
+            name = str(macro.get("name") or macro_id.rsplit(".", 1)[-1])
+            self._by_name.setdefault(name, []).append(macro_id)
+            if "__" in name:  # `bigquery__x` / `default__x` implement `adapter.dispatch('x')`
+                self._by_name.setdefault(name.split("__", 1)[1], []).append(macro_id)
+
+    def body(self, macro_id: str) -> str:
+        return self._bodies.get(macro_id, "")
+
+    def referenced_ids(self, text: str) -> set[str]:
+        names = set(_CALLED_NAME_RE.findall(text)) | set(_DISPATCHED_NAME_RE.findall(text))
+        return {macro_id for name in names for macro_id in self._by_name.get(name, ())}
+
+
 def compute_node_fingerprint(
     node: dict[str, Any],
     *,
     upstream_fingerprints: dict[str, str] | None = None,
     known_schemas: list[str] | None = None,
+    dependency_identifiers: set[str] | None = None,
     fp_length: int = DEFAULT_FINGERPRINT_LENGTH,
     dialect: str = "bigquery",
+    macros: dict[str, Any] | MacroIndex | None = None,
+    hash_compiled: bool = True,
+    details: dict[str, Any] | None = None,
 ) -> NodeFingerprint:
-    """Compute the deterministic Merkle-DAG fingerprint for a single dbt manifest node."""
+    """Compute the deterministic Merkle-DAG fingerprint for a single dbt manifest node.
+
+    `hash_compiled=False` replaces the compiled SQL by a hash of the raw SQL's macro closure
+    (see `macro_closure_hash`); `compute_manifest_fingerprints` uses it for ancestors that
+    dbt-virtual does not build. `details`, when given, receives what went into the hash.
+    """
     unique_id = node["unique_id"]
     name = node["name"]
     resource_type = node.get("resource_type", "model")
@@ -330,16 +460,23 @@ def compute_node_fingerprint(
     if node.get("schema"):
         schemas_to_strip.append(str(node["schema"]))
 
-    norm_compiled = normalize_sql(
-        compiled_sql,
-        self_identifier=node.get("alias") or name,
-        known_schemas=schemas_to_strip,
-        dialect=dialect,
+    norm_compiled = (
+        normalize_sql(
+            compiled_sql,
+            self_identifier=node.get("alias") or name,
+            known_schemas=schemas_to_strip,
+            dependency_identifiers=dependency_identifiers,
+            dialect=dialect,
+        )
+        if hash_compiled
+        else ""
     )
     norm_raw = normalize_sql(
         raw_sql,
         self_identifier=name,
-        known_schemas=schemas_to_strip,
+        # Raw SQL holds no rendered schema: the node's own schema (which differs per target) would
+        # only strip a hard-coded literal of that name in one environment and not the other.
+        known_schemas=list(known_schemas or []),
         use_ast=False,
         dialect=dialect,
     )
@@ -350,19 +487,41 @@ def compute_node_fingerprint(
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "resource_type": resource_type,
         "name": name,
-        "config": config_subset,
-        "normalized_compiled_sql": norm_compiled,
+        # How later runs treat the table, not what it contains (SQLMesh also keeps these out of
+        # the data hash), so changing them must not rebuild the physical table.
+        "config": {k: v for k, v in config_subset.items() if k not in METADATA_ONLY_CONFIG},
         "normalized_raw_sql": norm_raw,
         "upstream_fingerprints": sorted_upstreams,
     }
+    if hash_compiled:
+        payload["normalized_compiled_sql"] = norm_compiled
+        macro_ids: list[str] = []
+    else:
+        macro_ids, payload["macro_closure_hash"] = macro_closure_hash(node, macros)
+    if details is not None:
+        details.update(
+            {
+                "mode": "compiled_sql" if hash_compiled else "raw_sql_and_macros",
+                "normalized_compiled_sql": norm_compiled,
+                "normalized_raw_sql": norm_raw,
+                "macro_closure_hash": payload.get("macro_closure_hash"),
+                "macros": macro_ids,
+                "config": payload["config"],
+                "upstream_fingerprints": sorted_upstreams,
+            }
+        )
+    if resource_type == "seed":
+        # A seed's data lives in its CSV, which only the manifest checksum reflects.
+        payload["seed_checksum"] = (node.get("checksum") or {}).get("checksum")
 
     canonical_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(canonical_bytes).hexdigest()[:fp_length]
     if config_subset.get("physical_version"):
         digest = str(config_subset["physical_version"])
 
-    is_routine = materialized in {"table_function", "function", "procedure"}
-    physical_identifier = name if is_routine else f"{name}__{digest}"
+    # Routines and views have no `<name>__<fp>` physical table; they are deployed by DDL.
+    has_physical_table = materialized not in ROUTINE_MATERIALIZATIONS and materialized != "view"
+    physical_identifier = f"{name}__{digest}" if has_physical_table else name
 
     return NodeFingerprint(
         unique_id=unique_id,
@@ -381,9 +540,24 @@ def compute_manifest_fingerprints(
     known_schemas: list[str] | None = None,
     fp_length: int = DEFAULT_FINGERPRINT_LENGTH,
     dialect: str | None = None,
+    hash_compiled_ancestors: bool = False,
+    details: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, NodeFingerprint]:
-    """Compute Merkle-DAG fingerprints for all virtual_env nodes in a dbt manifest."""
+    """Compute Merkle-DAG fingerprints for all virtual_env nodes in a dbt manifest.
+
+    Virtual nodes hash their compiled SQL. Ancestors that dbt-virtual does not build (non-virtual
+    models and snapshots) hash their raw SQL and macro closure instead, because their compiled SQL
+    depends on the warehouse and the clock; `hash_compiled_ancestors=True` restores the old rule.
+    `details`, when given, is filled with `unique_id -> what went into each hash` (every node
+    reached, not only virtual ones).
+
+    Raises `MissingCompiledCodeError` when a virtual node has Jinja in its raw SQL but the
+    manifest was parsed, not compiled (`dbt parse`, `run-operation`): hashing only the raw SQL
+    would give a different fingerprint than `plan` after a compile.
+    """
     nodes: dict[str, dict[str, Any]] = manifest.get("nodes") or {}
+    macros = MacroIndex(manifest.get("macros") or {})
+    sources: dict[str, Any] = manifest.get("sources") or {}
     adapter_type = (manifest.get("metadata") or {}).get("adapter_type")
     sql_dialect = dialect or (str(adapter_type).removeprefix("dbt-") if adapter_type else "bigquery")
     virtual_nodes = {uid: n for uid, n in nodes.items() if is_virtual_node(n)}
@@ -398,10 +572,24 @@ def compute_manifest_fingerprints(
                 "because environment state and physical identifiers are keyed by model name."
             )
         virtual_name_uids[name] = uid
+    uncompiled = sorted(
+        str(n.get("name"))
+        for n in virtual_nodes.values()
+        if not (n.get("compiled_code") or n.get("compiled_sql"))
+        and any(m in (n.get("raw_code") or n.get("raw_sql") or "") for m in _JINJA_MARKERS)
+    )
+    if uncompiled:
+        raise MissingCompiledCodeError(
+            f"The manifest has no compiled SQL for virtual node(s) {', '.join(uncompiled)}: it comes "
+            "from `dbt parse` or a `run-operation`, not from `dbt compile`. Fingerprints would hash "
+            "the raw SQL only and differ from `dbt-virtual plan`. Compile first (omit --skip-compile)."
+        )
+    # Every ref()-able node contributes to its children's fingerprints: models (virtual or not),
+    # seeds (CSV checksum) and snapshots.
     dependency_nodes = {
         uid: n
         for uid, n in nodes.items()
-        if is_virtual_node(n) or n.get("resource_type") == "model"
+        if is_virtual_node(n) or n.get("resource_type") in {"model", "seed", "snapshot"}
     }
 
     computed: dict[str, NodeFingerprint] = {}
@@ -417,18 +605,35 @@ def compute_manifest_fingerprints(
         node = dependency_nodes[uid]
         depends_on = (node.get("depends_on") or {}).get("nodes") or []
         upstream_fps: dict[str, str] = {}
+        parent_identifiers: set[str] = set()
         for parent_uid in depends_on:
             if parent_uid in dependency_nodes:
                 parent_fp = _resolve(parent_uid)
                 upstream_fps[parent_uid] = parent_fp.fingerprint
+                parent = dependency_nodes[parent_uid]
+                parent_identifiers.update(
+                    str(v) for v in (parent.get("name"), parent.get("alias")) if v
+                )
+            elif parent_uid in sources:
+                # A source's location often differs per target; its schema is not a logic change.
+                parent_identifiers.add(str(sources[parent_uid].get("identifier") or sources[parent_uid].get("name")))
 
+        node_details: dict[str, Any] | None = {} if details is not None else None
         fp_obj = compute_node_fingerprint(
             node,
             upstream_fingerprints=upstream_fps,
             known_schemas=known_schemas,
+            dependency_identifiers=parent_identifiers,
             fp_length=fp_length,
             dialect=sql_dialect,
+            macros=macros,
+            hash_compiled=hash_compiled_ancestors
+            or is_virtual_node(node)
+            or node.get("resource_type") == "seed",
+            details=node_details,
         )
+        if details is not None and node_details is not None:
+            details[uid] = {**node_details, "fingerprint": fp_obj.fingerprint}
         visiting.remove(uid)
         computed[uid] = fp_obj
         return fp_obj
@@ -439,11 +644,94 @@ def compute_manifest_fingerprints(
     return {uid: computed[uid] for uid in sorted(virtual_nodes)}
 
 
+_ENV_DEPENDENT_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        "qualified relation that is not a dependency (hard-coded or per-target location)",
+        r"`[^`\n]+`\.`[^`\n]+`\.`[^`\n]+`|`[^`.\n]+\.[^`.\n]+\.[^`.\n]+`",
+    ),
+    ("clock function (value moves between runs)", r"\b(?:CURRENT_(?:DATE|TIMESTAMP|DATETIME|TIME)|NOW|GETDATE|SYSDATE)\b"),
+    (
+        "timestamp literal (often run_started_at or a watermark read from the warehouse)",
+        r"'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[^']*'",
+    ),
+)
+
+
+def find_environment_dependent_tokens(normalized_sql: str) -> list[tuple[str, str]]:
+    """List `(reason, text)` for tokens left in normalized SQL that may differ between environments.
+
+    These are not removed: a hard-coded prod table or a branch on `target.name` is a real logic
+    difference. They are what to look at when the same code gets two fingerprints.
+    """
+    found: list[tuple[str, str]] = []
+    for reason, pattern in _ENV_DEPENDENT_PATTERNS:
+        for match in sorted({m.group(0) for m in re.finditer(pattern, normalized_sql, re.IGNORECASE)}):
+            found.append((reason, match))
+    return found
+
+
+def explain_fingerprint(
+    manifest: dict[str, Any],
+    selector: str,
+    *,
+    known_schemas: list[str] | None = None,
+    hash_compiled_ancestors: bool = False,
+    include_ancestors: bool = False,
+) -> str:
+    """Render what went into the fingerprint of a model (by name or unique_id) as text."""
+    details: dict[str, dict[str, Any]] = {}
+    compute_manifest_fingerprints(
+        manifest,
+        known_schemas=known_schemas,
+        hash_compiled_ancestors=hash_compiled_ancestors,
+        details=details,
+    )
+    nodes = manifest.get("nodes") or {}
+    matches = [uid for uid in details if uid == selector or nodes[uid].get("name") == selector]
+    if not matches:
+        raise ValueError(f"No virtual model or ancestor named '{selector}' in the manifest.")
+    lines: list[str] = []
+
+    def _render(uid: str) -> None:
+        info = details[uid]
+        lines.append(f"fingerprint {info['fingerprint']}  {uid}  (hashed from: {info['mode']})")
+        lines.append(f"  config: {json.dumps(info['config'], sort_keys=True, default=str)}")
+        for parent, parent_fp in info["upstream_fingerprints"].items():
+            lines.append(f"  upstream {parent}: {parent_fp}")
+        if info["mode"] == "compiled_sql":
+            lines.append(f"  normalized compiled SQL: {info['normalized_compiled_sql']}")
+            for reason, text in find_environment_dependent_tokens(info["normalized_compiled_sql"]):
+                lines.append(f"  env-dependent? {reason}: {text}")
+        else:
+            lines.append(f"  macros hashed ({len(info['macros'])}): {', '.join(info['macros'])}")
+            lines.append("  compiled SQL is not hashed for this ancestor (it depends on warehouse state and time)")
+        lines.append(f"  normalized raw SQL: {info['normalized_raw_sql']}")
+        lines.append("")
+
+    for uid in matches:
+        _render(uid)
+        if include_ancestors:
+            stack = list(details[uid]["upstream_fingerprints"])
+            done: set[str] = set()
+            while stack:
+                parent = stack.pop()
+                if parent in done or parent not in details:
+                    continue
+                done.add(parent)
+                _render(parent)
+                stack.extend(details[parent]["upstream_fingerprints"])
+    return "\n".join(lines)
+
+
 def write_fingerprints_file(
     fingerprints: dict[str, NodeFingerprint],
     output_path: Path,
+    cache: dict | None = None,
 ) -> None:
-    """Write computed fingerprints to `.dbt_virtual/fingerprints.json`."""
+    """Write computed fingerprints to `.dbt_virtual/fingerprints.json`.
+
+    `cache` (inputs hash + manifest checksum) lets `dbt-virtual dbt` skip `dbt compile` next time.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
@@ -451,4 +739,6 @@ def write_fingerprints_file(
         "nodes": {uid: fp.to_dict() for uid, fp in sorted(fingerprints.items())},
         "by_name": {fp.name: fp.fingerprint for fp in sorted(fingerprints.values(), key=lambda x: x.name)},
     }
+    if cache is not None:
+        data["cache"] = cache
     output_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

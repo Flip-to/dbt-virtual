@@ -2,36 +2,87 @@
   {%- set defaults = {
     'enabled': true,
     'physical_schema': 'dbt_virtual_physical',
+    'physical_schemas_by_location': {},
+    'schema_locations': {},
     'environment': target.name,
     'base_environment': 'prod',
+    'guard_shared_tables': true,
     'ref_resolution': 'env_view',
     'env_schemas': {
       'staging': 'staging',
       'prod': 'prod'
     },
     'retention_releases': 5,
-    'retention_days': 7
+    'retention_days': 7,
+    'authorize_env_views': false,
+    'expire_env_days': none,
+    'physical_locations': {}
   } -%}
   {%- set user_cfg = var('dbt_virtual', {}) or {} -%}
   {#- dbt renders a var only when its whole value is a string, so Jinja nested inside the
       `dbt_virtual` mapping (e.g. `environment: "{{ env_var('DBT_VIRTUAL_ENV', target.name) }}"`)
       arrives here unrendered. Render string values ourselves. -#}
   {%- for key, value in user_cfg.items() -%}
-    {%- if value is mapping -%}
-      {%- set rendered_map = {} -%}
-      {%- for sub_key, sub_value in value.items() -%}
-        {%- do rendered_map.update({sub_key: dbt_virtual.render_config_value(sub_value)}) -%}
-      {%- endfor -%}
-      {%- do defaults.update({key: rendered_map}) -%}
-    {%- else -%}
-      {%- do defaults.update({key: dbt_virtual.render_config_value(value)}) -%}
-    {%- endif -%}
+    {%- do defaults.update({key: dbt_virtual.render_config_value(value)}) -%}
   {%- endfor -%}
+  {#- DECISION(cross_project_promote_by_clone): `physical_schema` / `physical_database` are where
+      the CURRENT environment's registry and physical tables live. Without `physical_locations`
+      they are `physical_schema` and `target.database`, as before. -#}
+  {%- set cli_env = var('_dbt_virtual_env', '') -%}
+  {%- set active_env = cli_env if cli_env != '' else defaults.get('environment', target.name) -%}
+  {%- set location = dbt_virtual.resolve_physical_location(defaults, active_env) -%}
+  {%- do defaults.update({
+    'physical_schema_default': defaults.get('physical_schema'),
+    'physical_schema': location['schema'],
+    'physical_database': location['database']
+  }) -%}
   {{ return(defaults) }}
 {%- endmacro %}
 
 
+{% macro resolve_physical_location(cfg, env_name) -%}
+  {#- `physical_locations.<env>` if listed, else `physical_locations.default`, else
+      `{database: target.database, schema: physical_schema}`. An entry may omit either key. -#}
+  {%- set locations = cfg.get('physical_locations', {}) or {} -%}
+  {%- set entry = locations.get(env_name) if env_name in locations else (locations.get('default') or {}) -%}
+  {%- set entry = entry if entry is mapping else {} -%}
+  {{ return({
+    'database': entry.get('database') or target.database,
+    'schema': entry.get('schema') or cfg.get('physical_schema_default', cfg.get('physical_schema'))
+  }) }}
+{%- endmacro %}
+
+
+{% macro physical_location(env_name=none) -%}
+  {#- Where `env_name`'s registry (`_environments`, `_releases`, ...) and physical tables live. -#}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- if env_name is none -%}
+    {{ return({'database': cfg.get('physical_database'), 'schema': cfg.get('physical_schema')}) }}
+  {%- endif -%}
+  {{ return(dbt_virtual.resolve_physical_location(cfg, env_name)) }}
+{%- endmacro %}
+
+
+{% macro active_database() -%}
+  {#- Database of the current environment's physical location. -#}
+  {{ return(dbt_virtual.get_config().get('physical_database') or target.database) }}
+{%- endmacro %}
+
+
+{% macro same_location(a, b) -%}
+  {{ return((a['database'] | string | lower) == (b['database'] | string | lower) and (a['schema'] | string | lower) == (b['schema'] | string | lower)) }}
+{%- endmacro %}
+
+
 {% macro render_config_value(value) -%}
+  {%- if value is mapping -%}
+    {#- `env_schemas` may nest one mapping per environment. -#}
+    {%- set rendered = {} -%}
+    {%- for sub_key, sub_value in value.items() -%}
+      {%- do rendered.update({sub_key: dbt_virtual.render_config_value(sub_value)}) -%}
+    {%- endfor -%}
+    {{ return(rendered) }}
+  {%- endif -%}
   {%- if value is string and ('{{' in value or '{%' in value) and render is defined -%}
     {{ return(render(value) | trim) }}
   {%- endif -%}
@@ -49,7 +100,7 @@
   {%- if obj[key] is defined -%}
     {{ return(obj[key]) }}
   {%- endif -%}
-  {%- if key == 'virtual_env' or key == 'virtual_env_epoch' or key == 'parameters' or key == 'returns' -%}
+  {%- if key == 'virtual_env' or key == 'virtual_env_epoch' or key == 'virtual_location' or key == 'parameters' or key == 'returns' -%}
     {%- set extra = dbt_virtual.node_attr(obj, '_extra', {}) -%}
     {%- if extra is mapping and key in extra -%}
       {{ return(extra.get(key, default)) }}
@@ -60,10 +111,8 @@
 
 
 {% macro is_virtual_node(node) -%}
-  {%- set cfg = dbt_virtual.get_config() -%}
-  {%- if not cfg.get('enabled', true) -%}
-    {{ return(false) }}
-  {%- endif -%}
+  {#- Check the node's own flag first: `get_config()` renders the whole vars mapping, and calling it
+      for every node made parsing a 1,000-node project ~2.5x slower (measured on the team's project). -#}
   {%- if node is none or node is undefined -%}
     {{ return(false) }}
   {%- endif -%}
@@ -72,14 +121,13 @@
     {{ return(false) }}
   {%- endif -%}
   {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
-  {%- if dbt_virtual.node_attr(node_cfg, 'virtual_env', false) == true -%}
-    {{ return(true) }}
+  {%- set flagged = dbt_virtual.node_attr(node_cfg, 'virtual_env', false) == true
+        or dbt_virtual.node_attr(dbt_virtual.node_attr(node_cfg, 'meta', {}), 'virtual_env', false) == true -%}
+  {%- if not flagged -%}
+    {{ return(false) }}
   {%- endif -%}
-  {%- set meta = dbt_virtual.node_attr(node_cfg, 'meta', {}) -%}
-  {%- if dbt_virtual.node_attr(meta, 'virtual_env', false) == true -%}
-    {{ return(true) }}
-  {%- endif -%}
-  {{ return(false) }}
+  {%- set enabled = var('dbt_virtual', {}).get('enabled', true) if var('dbt_virtual', {}) is mapping else true -%}
+  {{ return(enabled != false and (enabled | string | lower) != 'false') }}
 {%- endmacro %}
 
 
@@ -94,19 +142,78 @@
 
 
 {% macro get_env_schema(env_name=none) -%}
+  {#- The environment's default schema (models without a custom schema). -#}
+  {{ return(dbt_virtual.env_schema_for(env_name, none)) }}
+{%- endmacro %}
+
+
+{% macro env_schema_for(env_name=none, schema_key=none) -%}
+  {#-
+    DECISION(per_custom_schema_env_datasets): where an environment exposes a virtual object.
+    `env_schemas.<env>` is either one schema (every custom schema collapses into it) or a mapping
+    `{default: <schema>, <custom_schema>: <schema>, ...}`; an unlisted custom schema `c` becomes
+    `<default>_c`, like dbt's default `generate_schema_name`.
+    Unmapped environments (e.g. `pr_42`) get one schema, `<base_env_default_schema>_<env>`, as
+    documented in docs/guides/configuration_reference.md.
+  -#}
   {%- set cfg = dbt_virtual.get_config() -%}
   {%- set active_env = env_name if env_name is not none else dbt_virtual.get_current_env() -%}
   {%- set env_schemas = cfg.get('env_schemas', {}) or {} -%}
-  {%- if active_env in env_schemas -%}
-    {{ return(env_schemas[active_env]) }}
+  {%- set key = (schema_key | string | trim) if schema_key is not none else '' -%}
+  {%- if key == 'default' or key == 'None' -%}
+    {%- set key = '' -%}
   {%- endif -%}
-  {#- Unmapped environments (e.g. `pr_42`) get `<base_env_schema>_<env>`, as documented in
-      docs/guides/configuration_reference.md. Falling back to `target.schema` made
-      `drop-env --env pr_42` drop the caller's target schema. -#}
+  {%- if active_env in env_schemas -%}
+    {%- set mapping = env_schemas[active_env] -%}
+    {%- if mapping is mapping -%}
+      {%- set default_schema = mapping.get('default', target.schema) -%}
+      {%- if key == '' -%}
+        {{ return(default_schema) }}
+      {%- elif key in mapping -%}
+        {{ return(mapping[key]) }}
+      {%- endif -%}
+      {{ return(default_schema ~ '_' ~ key) }}
+    {%- endif -%}
+    {{ return(mapping) }}
+  {%- endif -%}
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
-  {%- set base_schema = env_schemas.get(base_env, target.schema) -%}
+  {#- With `schema_locations` (multi-region), an unmapped environment keeps one schema per base
+      schema, so an object stays in the location of its base schema. -#}
+  {%- set per_key = (cfg.get('schema_locations', {}) or {}) | length > 0 -%}
+  {%- set base_schema = dbt_virtual.env_schema_for(base_env, (key if per_key else none)) if (base_env in env_schemas and base_env != active_env) else target.schema -%}
   {%- set env_suffix = modules.re.sub('[^0-9A-Za-z_]', '_', active_env | string) if modules is defined else (active_env | string) -%}
   {{ return(base_schema ~ '_' ~ env_suffix) }}
+{%- endmacro %}
+
+
+{% macro node_schema_key(node) -%}
+  {#- The custom schema a node is configured with (`config.schema`), or none. -#}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+  {%- set key = dbt_virtual.node_attr(node_cfg, 'schema', none) -%}
+  {{ return(none if (key is none or (key | string | trim) == '') else (key | string | trim)) }}
+{%- endmacro %}
+
+
+{% macro env_object_identifier(node) -%}
+  {#- Name of a virtual node's object in an environment schema: the env view of a table model
+      is named after the model; views and routines keep their alias. -#}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
+  {%- if dbt_virtual.node_attr(node_cfg, 'materialized', 'view') in ['table', 'incremental'] -%}
+    {{ return(dbt_virtual.node_attr(node, 'name', '')) }}
+  {%- endif -%}
+  {{ return(dbt_virtual.node_attr(node, 'alias', none) or dbt_virtual.node_attr(node, 'name', '')) }}
+{%- endmacro %}
+
+
+{% macro virtual_node_by_name(model_name) -%}
+  {%- if graph is defined and graph.nodes is defined -%}
+    {%- for node in graph.nodes.values() -%}
+      {%- if dbt_virtual.node_attr(node, 'name', '') == model_name and dbt_virtual.is_virtual_node(node) -%}
+        {{ return(node) }}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{ return(none) }}
 {%- endmacro %}
 
 
@@ -125,8 +232,40 @@
 {%- endmacro %}
 
 
+{% macro get_precomputed_fps() -%}
+  {#- CLI-computed Merkle fingerprints `{model_name: fp}`: `--vars '{_dbt_virtual_fps: ...}'` first, else
+      the JSON in the `DBT_VIRTUAL_FPS` environment variable (`dbt-virtual plan --print-fps`).
+      `env_var` is allowed while dbt parses, so a plain `dbt run` can name tables with them. -#}
+  {%- set from_var = var('_dbt_virtual_fps', none) -%}
+  {%- if from_var -%}
+    {{ return(from_var) }}
+  {%- endif -%}
+  {%- set raw = env_var('DBT_VIRTUAL_FPS', '') | trim -%}
+  {%- if raw == '' -%}
+    {{ return({}) }}
+  {%- endif -%}
+  {%- set parsed = fromjson(raw) -%}
+  {%- if parsed is not mapping -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual: DBT_VIRTUAL_FPS must be a JSON object {model_name: fingerprint}, as printed by `dbt-virtual plan --print-fps`.") }}
+  {%- endif -%}
+  {{ return(parsed) }}
+{%- endmacro %}
+
+
+{% macro runtime_fingerprint(node) -%}
+  {#- The Merkle fingerprint at execution time, always computed from the `graph` copy of the node:
+      the `model` object of a hook and the node of a result carry slightly different config values
+      (e.g. `partition_by` None vs unset), which would hash differently from the on-run-start guard. -#}
+  {%- set uid = dbt_virtual.node_attr(node, 'unique_id', none) -%}
+  {%- if uid is not none and graph is defined and graph.nodes is defined and graph.nodes.get(uid) is not none -%}
+    {{ return(dbt_virtual.get_fingerprint(graph.nodes.get(uid))) }}
+  {%- endif -%}
+  {{ return(dbt_virtual.get_fingerprint(node)) }}
+{%- endmacro %}
+
+
 {% macro get_fingerprint(node, depth=0) -%}
-  {%- set precomputed = var('_dbt_virtual_fps', {}) -%}
+  {%- set precomputed = dbt_virtual.get_precomputed_fps() -%}
   {%- set model_name = dbt_virtual.node_attr(node, 'name', '') -%}
   {%- if model_name in precomputed -%}
     {{ return(precomputed[model_name]) }}

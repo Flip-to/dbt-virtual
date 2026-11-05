@@ -54,35 +54,146 @@
 {%- endmacro %}
 
 
-{% macro create_or_replace_view_sql(view_relation, physical_relation) -%}
-  {{ return(adapter.dispatch('create_or_replace_view_sql', 'dbt_virtual')(view_relation, physical_relation)) }}
+{% macro create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
+  {#- `node` (optional) is the dbt node of the model; BigQuery puts its description and labels in the view's OPTIONS. -#}
+  {{ return(adapter.dispatch('create_or_replace_view_sql', 'dbt_virtual')(view_relation, physical_relation, node)) }}
 {%- endmacro %}
 
-{% macro postgres__create_or_replace_view_sql(view_relation, physical_relation) -%}
+{% macro postgres__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
   DROP VIEW IF EXISTS {{ view_relation }} CASCADE;
   CREATE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
 {%- endmacro %}
 
-{% macro default__create_or_replace_view_sql(view_relation, physical_relation) -%}
+{% macro bigquery__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
+  CREATE OR REPLACE VIEW {{ view_relation }}{{ dbt_virtual.bigquery_env_view_options(node) }} AS
+  SELECT * FROM {{ physical_relation }}
+{%- endmacro %}
+
+{% macro default__create_or_replace_view_sql(view_relation, physical_relation, node=none) -%}
   CREATE OR REPLACE VIEW {{ view_relation }} AS
   SELECT * FROM {{ physical_relation }}
 {%- endmacro %}
 
 
-{% macro create_schema_if_not_exists_sql(schema_name) -%}
-  {{ return(adapter.dispatch('create_schema_if_not_exists_sql', 'dbt_virtual')(schema_name)) }}
+{% macro bigquery_env_view_options(node) -%}
+  {#-
+    ` OPTIONS(description=..., labels=[...])` for an env view, or ''. Mirrors dbt-bigquery's
+    `get_common_options`: the description only when `persist_docs.relation` is on, `labels` always
+    (and `labels_from_meta`). Metadata is not part of the fingerprint.
+  -#}
+  {%- if node is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
+  {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
+  {%- set opts = [] -%}
+  {%- set description = dbt_virtual.node_attr(node, 'description', '') -%}
+  {%- if persist is mapping and persist.get('relation') and description -%}
+    {%- do opts.append('description=' ~ dbt_virtual.sql_string_literal(description)) -%}
+  {%- endif -%}
+  {%- set labels = dbt_virtual.node_attr(node_cfg, 'labels', {}) or {} -%}
+  {%- if dbt_virtual.node_attr(node_cfg, 'labels_from_meta', false) -%}
+    {%- set merged = {} -%}
+    {%- for meta_key, meta_val in (dbt_virtual.node_attr(node_cfg, 'meta', {}) or {}).items() -%}
+      {%- do merged.update({meta_key: meta_val}) -%}
+    {%- endfor -%}
+    {%- do merged.update(labels) -%}
+    {%- set labels = merged -%}
+  {%- endif -%}
+  {%- if labels -%}
+    {%- set pairs = [] -%}
+    {%- for label_key, label_val in labels.items() -%}
+      {%- do pairs.append('(' ~ dbt_virtual.sql_string_literal(label_key) ~ ', ' ~ dbt_virtual.sql_string_literal(label_val) ~ ')') -%}
+    {%- endfor -%}
+    {%- do opts.append('labels=[' ~ (pairs | join(', ')) ~ ']') -%}
+  {%- endif -%}
+  {%- if (opts | length) == 0 -%}
+    {{ return('') }}
+  {%- endif -%}
+  {{ return(' OPTIONS(' ~ (opts | join(', ')) ~ ')') }}
 {%- endmacro %}
 
-{% macro bigquery__create_schema_if_not_exists_sql(schema_name) -%}
-  CREATE SCHEMA IF NOT EXISTS `{{ target.database }}`.`{{ schema_name }}`
+
+{% macro env_view_column_docs(node) -%}
+  {#- `{column: {name, description}}` to persist on an env view: only with `persist_docs.columns`. -#}
+  {%- set described = {} -%}
+  {%- if node is not none -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
+    {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
+    {%- if persist is mapping and persist.get('columns') -%}
+      {%- for col_name, col in (dbt_virtual.node_attr(node, 'columns', {}) or {}).items() -%}
+        {%- set col_description = dbt_virtual.node_attr(col, 'description', '') -%}
+        {%- if col_description -%}
+          {%- do described.update({col_name: {'name': col_name, 'description': col_description}}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {{ return(described) }}
 {%- endmacro %}
 
-{% macro snowflake__create_schema_if_not_exists_sql(schema_name) -%}
+
+{% macro apply_env_view_metadata(view_relation, node) -%}
+  {#- Metadata that `CREATE VIEW` cannot carry. BigQuery: column descriptions, set the way
+      dbt-bigquery's own view materialization does (`adapter.update_columns`). -#}
+  {{ return(adapter.dispatch('apply_env_view_metadata', 'dbt_virtual')(view_relation, node)) }}
+{%- endmacro %}
+
+{% macro default__apply_env_view_metadata(view_relation, node) -%}
+{%- endmacro %}
+
+{% macro bigquery__apply_env_view_metadata(view_relation, node) -%}
+  {%- if node is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set described = dbt_virtual.env_view_column_docs(node) -%}
+  {%- if described -%}
+    {%- do adapter.update_columns(view_relation, described) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {#- Lets the views of `env_schema` read `physical_schema` without granting readers access to it. -#}
+  {{ return(adapter.dispatch('authorize_env_dataset', 'dbt_virtual')(database, env_schema, physical_schema)) }}
+{%- endmacro %}
+
+{% macro default__authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {{ log("dbt-virtual: authorize_env_views is a BigQuery feature; ignoring it on " ~ target.type ~ ".", info=False) }}
+{%- endmacro %}
+
+{% macro bigquery__authorize_env_dataset(database, env_schema, physical_schema) -%}
+  {#- ONE authorized-dataset entry (`targetTypes: [VIEWS]`) on the physical dataset covers every
+      current and future view of the env dataset. `adapter.grant_access_to` reads the dataset and
+      only calls `update_dataset` when the entry is missing (dbt-bigquery 1.12 impl.py), and
+      serializes the update behind a lock. -#}
+  {%- if env_schema != physical_schema -%}
+    {%- do adapter.grant_access_to(
+      {'dataset': {'projectId': database, 'datasetId': env_schema}, 'targetTypes': ['VIEWS']},
+      'dataset',
+      none,
+      {'project': database, 'dataset': physical_schema}
+    ) -%}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro create_schema_if_not_exists_sql(schema_name, location=none) -%}
+  {{ return(adapter.dispatch('create_schema_if_not_exists_sql', 'dbt_virtual')(schema_name, location)) }}
+{%- endmacro %}
+
+{% macro bigquery__create_schema_if_not_exists_sql(schema_name, location=none) -%}
+  {#- `location` pins the dataset to a BigQuery location; dbt-bigquery's own `create schema` leaves
+      it to the job's location. -#}
+  CREATE SCHEMA IF NOT EXISTS `{{ dbt_virtual.active_database() }}`.`{{ schema_name }}`{{ " OPTIONS (location = '" ~ location ~ "')" if location is not none else "" }}
+{%- endmacro %}
+
+{% macro snowflake__create_schema_if_not_exists_sql(schema_name, location=none) -%}
   CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
 {%- endmacro %}
 
-{% macro default__create_schema_if_not_exists_sql(schema_name) -%}
+{% macro default__create_schema_if_not_exists_sql(schema_name, location=none) -%}
   CREATE SCHEMA IF NOT EXISTS {{ schema_name }}
 {%- endmacro %}
 
@@ -92,7 +203,7 @@
 {%- endmacro %}
 
 {% macro bigquery__drop_schema_cascade_sql(schema_name) -%}
-  DROP SCHEMA IF EXISTS `{{ target.database }}`.`{{ schema_name }}` CASCADE
+  DROP SCHEMA IF EXISTS `{{ dbt_virtual.active_database() }}`.`{{ schema_name }}` CASCADE
 {%- endmacro %}
 
 {% macro snowflake__drop_schema_cascade_sql(schema_name) -%}
@@ -104,42 +215,54 @@
 {%- endmacro %}
 
 
-{% macro registry_relation(physical_schema, table_name) -%}
-  {{ return(adapter.dispatch('registry_relation', 'dbt_virtual')(physical_schema, table_name)) }}
-{%- endmacro %}
-
-{% macro bigquery__registry_relation(physical_schema, table_name) -%}
-  `{{ target.database }}`.`{{ physical_schema }}`.{{ table_name }}
-{%- endmacro %}
-
-{% macro snowflake__registry_relation(physical_schema, table_name) -%}
-  {{ physical_schema }}.{{ table_name }}
-{%- endmacro %}
-
-{% macro default__registry_relation(physical_schema, table_name) -%}
-  {{ physical_schema }}.{{ table_name }}
+{% macro qualify_schema(database, physical_schema) -%}
+  {#- `<database>.<schema>` when `database` is not the connection's own database, else `<schema>`. -#}
+  {%- if database and (database | string | lower) != (target.database | string | lower) -%}
+    {{ return(database ~ '.' ~ physical_schema) }}
+  {%- endif -%}
+  {{ return(physical_schema) }}
 {%- endmacro %}
 
 
-{% macro ensure_registry_tables_sql(physical_schema) -%}
-  {{ return(adapter.dispatch('ensure_registry_tables_sql', 'dbt_virtual')(physical_schema)) }}
+{% macro registry_relation(physical_schema, table_name, database=none) -%}
+  {#- `database`: the registry's project/catalog; default the current environment's location. -#}
+  {{ return(adapter.dispatch('registry_relation', 'dbt_virtual')(physical_schema, table_name, database or dbt_virtual.active_database())) }}
 {%- endmacro %}
 
-{% macro bigquery__ensure_registry_tables_sql(physical_schema) -%}
-  CREATE SCHEMA IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`;
+{% macro bigquery__registry_relation(physical_schema, table_name, database=none) -%}
+  `{{ database }}`.`{{ physical_schema }}`.{{ table_name }}
+{%- endmacro %}
 
-  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._environments (
+{% macro snowflake__registry_relation(physical_schema, table_name, database=none) -%}
+  {{ dbt_virtual.qualify_schema(database, physical_schema) }}.{{ table_name }}
+{%- endmacro %}
+
+{% macro default__registry_relation(physical_schema, table_name, database=none) -%}
+  {{ dbt_virtual.qualify_schema(database, physical_schema) }}.{{ table_name }}
+{%- endmacro %}
+
+
+{% macro ensure_registry_tables_sql(physical_schema, database=none) -%}
+  {{ return(adapter.dispatch('ensure_registry_tables_sql', 'dbt_virtual')(physical_schema, database or dbt_virtual.active_database())) }}
+{%- endmacro %}
+
+{% macro bigquery__ensure_registry_tables_sql(physical_schema, database=none) -%}
+  CREATE SCHEMA IF NOT EXISTS `{{ database }}`.`{{ physical_schema }}`;
+
+  CREATE TABLE IF NOT EXISTS `{{ database }}`.`{{ physical_schema }}`._environments (
     environment STRING NOT NULL,
     model_name STRING NOT NULL,
     resource_type STRING NOT NULL,
     fingerprint STRING NOT NULL,
     physical_identifier STRING NOT NULL,
     release_id STRING,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL,
+    schema_key STRING,
+    build_quality STRING
   )
   CLUSTER BY environment, model_name;
 
-  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._releases (
+  CREATE TABLE IF NOT EXISTS `{{ database }}`.`{{ physical_schema }}`._releases (
     release_id STRING NOT NULL,
     source_environment STRING NOT NULL,
     target_environment STRING,
@@ -152,19 +275,22 @@
     status STRING NOT NULL,
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key STRING,
+    build_quality STRING,
+    sealed_at TIMESTAMP
   )
   PARTITION BY DATE(created_at)
   CLUSTER BY release_id, status;
 
-  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._locks (
+  CREATE TABLE IF NOT EXISTS `{{ database }}`.`{{ physical_schema }}`._locks (
     environment STRING NOT NULL,
     owner STRING NOT NULL,
     acquired_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS `{{ target.database }}`.`{{ physical_schema }}`._intervals (
+  CREATE TABLE IF NOT EXISTS `{{ database }}`.`{{ physical_schema }}`._intervals (
     model_name STRING NOT NULL,
     fingerprint STRING NOT NULL,
     physical_identifier STRING NOT NULL,
@@ -175,20 +301,22 @@
   CLUSTER BY model_name, fingerprint;
 {%- endmacro %}
 
-{% macro snowflake__ensure_registry_tables_sql(physical_schema) -%}
-  CREATE SCHEMA IF NOT EXISTS {{ physical_schema }};
+{% macro snowflake__ensure_registry_tables_sql(physical_schema, database=none) -%}
+  CREATE SCHEMA IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }};
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._environments (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._environments (
     environment VARCHAR NOT NULL,
     model_name VARCHAR NOT NULL,
     resource_type VARCHAR NOT NULL,
     fingerprint VARCHAR NOT NULL,
     physical_identifier VARCHAR NOT NULL,
     release_id VARCHAR,
-    updated_at TIMESTAMP NOT NULL
+    updated_at TIMESTAMP NOT NULL,
+    schema_key VARCHAR,
+    build_quality VARCHAR
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._releases (
     release_id VARCHAR NOT NULL,
     source_environment VARCHAR NOT NULL,
     target_environment VARCHAR,
@@ -201,17 +329,20 @@
     status VARCHAR NOT NULL,
     created_at TIMESTAMP NOT NULL,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key VARCHAR,
+    build_quality VARCHAR,
+    sealed_at TIMESTAMP
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._locks (
     environment VARCHAR NOT NULL,
     owner VARCHAR NOT NULL,
     acquired_at TIMESTAMP NOT NULL,
     expires_at TIMESTAMP NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._intervals (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._intervals (
     model_name VARCHAR NOT NULL,
     fingerprint VARCHAR NOT NULL,
     physical_identifier VARCHAR NOT NULL,
@@ -221,20 +352,22 @@
   );
 {%- endmacro %}
 
-{% macro default__ensure_registry_tables_sql(physical_schema) -%}
-  CREATE SCHEMA IF NOT EXISTS {{ physical_schema }};
+{% macro default__ensure_registry_tables_sql(physical_schema, database=none) -%}
+  CREATE SCHEMA IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }};
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._environments (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._environments (
     environment VARCHAR,
     model_name VARCHAR,
     resource_type VARCHAR,
     fingerprint VARCHAR,
     physical_identifier VARCHAR,
     release_id VARCHAR,
-    updated_at TIMESTAMP
+    updated_at TIMESTAMP,
+    schema_key VARCHAR,
+    build_quality VARCHAR
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._releases (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._releases (
     release_id VARCHAR,
     source_environment VARCHAR,
     target_environment VARCHAR,
@@ -247,17 +380,20 @@
     status VARCHAR,
     created_at TIMESTAMP,
     promoted_at TIMESTAMP,
-    rolled_back_at TIMESTAMP
+    rolled_back_at TIMESTAMP,
+    schema_key VARCHAR,
+    build_quality VARCHAR,
+    sealed_at TIMESTAMP
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._locks (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._locks (
     environment VARCHAR,
     owner VARCHAR,
     acquired_at TIMESTAMP,
     expires_at TIMESTAMP
   );
 
-  CREATE TABLE IF NOT EXISTS {{ physical_schema }}._intervals (
+  CREATE TABLE IF NOT EXISTS {{ dbt_virtual.qualify_schema(database, physical_schema) }}._intervals (
     model_name VARCHAR,
     fingerprint VARCHAR,
     physical_identifier VARCHAR,
@@ -268,12 +404,41 @@
 {%- endmacro %}
 
 
-{% macro upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
-  {{ return(adapter.dispatch('upsert_environment_pointer_sql', 'dbt_virtual')(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id)) }}
+{% macro registry_migrations_sql(physical_schema, database=none) -%}
+  {{ return(adapter.dispatch('registry_migrations_sql', 'dbt_virtual')(physical_schema, database)) }}
 {%- endmacro %}
 
-{% macro bigquery__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
-  MERGE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} AS T
+{% macro bigquery__registry_migrations_sql(physical_schema, database=none) -%}
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} ADD COLUMN IF NOT EXISTS schema_key STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS schema_key STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} ADD COLUMN IF NOT EXISTS build_quality STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS build_quality STRING;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS sealed_at TIMESTAMP
+{%- endmacro %}
+
+{% macro default__registry_migrations_sql(physical_schema, database=none) -%}
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS schema_key VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS build_quality VARCHAR;
+  ALTER TABLE {{ dbt_virtual.registry_relation(physical_schema, '_releases', database) }} ADD COLUMN IF NOT EXISTS sealed_at TIMESTAMP
+{%- endmacro %}
+
+
+{% macro sql_nullable_literal(value) -%}
+  {%- if value is none or value == '' -%}
+    {{ return('NULL') }}
+  {%- endif -%}
+  {{ return(dbt_virtual.sql_string_literal(value)) }}
+{%- endmacro %}
+
+
+{% macro upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none, database=none) -%}
+  {{ return(adapter.dispatch('upsert_environment_pointer_sql', 'dbt_virtual')(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key, database)) }}
+{%- endmacro %}
+
+{% macro bigquery__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none, database=none) -%}
+  MERGE {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} AS T
   USING (
     SELECT
       '{{ env_name }}' AS environment,
@@ -282,35 +447,88 @@
       '{{ fingerprint }}' AS fingerprint,
       '{{ physical_identifier }}' AS physical_identifier,
       '{{ release_id }}' AS release_id,
-      CURRENT_TIMESTAMP() AS updated_at
+      CURRENT_TIMESTAMP() AS updated_at,
+      CAST({{ dbt_virtual.sql_nullable_literal(schema_key) }} AS STRING) AS schema_key
   ) AS S
   ON T.environment = S.environment AND T.model_name = S.model_name
   WHEN MATCHED THEN UPDATE SET
+    resource_type = S.resource_type,
     fingerprint = S.fingerprint,
     physical_identifier = S.physical_identifier,
     release_id = S.release_id,
-    updated_at = S.updated_at
-  WHEN NOT MATCHED THEN INSERT ROW
+    updated_at = S.updated_at,
+    schema_key = S.schema_key
+  WHEN NOT MATCHED THEN INSERT (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key)
+    VALUES (S.environment, S.model_name, S.resource_type, S.fingerprint, S.physical_identifier, S.release_id, S.updated_at, S.schema_key)
 {%- endmacro %}
 
-{% macro snowflake__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
-  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+{% macro snowflake__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none, database=none) -%}
+  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }}
   WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
-  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
-    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at
+  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} (
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
   ) VALUES (
-    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
+    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(schema_key) }}
   )
 {%- endmacro %}
 
-{% macro default__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id) -%}
-  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+{% macro default__upsert_environment_pointer_sql(physical_schema, env_name, model_name, resource_type, fingerprint, physical_identifier, release_id, schema_key=none, database=none) -%}
+  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }}
   WHERE environment = '{{ env_name }}' AND model_name = '{{ model_name }}';
-  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
-    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at
+  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments', database) }} (
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
   ) VALUES (
-    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP
+    '{{ env_name }}', '{{ model_name }}', '{{ resource_type }}', '{{ fingerprint }}', '{{ physical_identifier }}', '{{ release_id }}', CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(schema_key) }}
   )
+{%- endmacro %}
+
+
+{% macro upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  {#-
+    Multi-row form of `upsert_environment_pointer_sql` for `flush_registry`: one statement (batch)
+    for N pointers of one environment. `rows` are dicts with `name`, `resource_type`, `fingerprint`,
+    `physical_identifier`, `release_id` and `schema_key`; names must be unique within `rows`.
+  -#}
+  {{ return(adapter.dispatch('upsert_environment_pointers_sql', 'dbt_virtual')(physical_schema, env_name, rows)) }}
+{%- endmacro %}
+
+{% macro bigquery__upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  MERGE {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} AS T
+  USING (
+    {%- for r in rows %}
+    {{ 'UNION ALL ' if not loop.first else '' }}SELECT
+      {{ dbt_virtual.sql_string_literal(env_name) }} AS environment,
+      {{ dbt_virtual.sql_string_literal(r['name']) }} AS model_name,
+      {{ dbt_virtual.sql_string_literal(r['resource_type']) }} AS resource_type,
+      {{ dbt_virtual.sql_string_literal(r['fingerprint']) }} AS fingerprint,
+      {{ dbt_virtual.sql_string_literal(r['physical_identifier']) }} AS physical_identifier,
+      {{ dbt_virtual.sql_string_literal(r['release_id']) }} AS release_id,
+      CURRENT_TIMESTAMP() AS updated_at,
+      CAST({{ dbt_virtual.sql_nullable_literal(r['schema_key']) }} AS STRING) AS schema_key
+    {%- endfor %}
+  ) AS S
+  ON T.environment = S.environment AND T.model_name = S.model_name
+  WHEN MATCHED THEN UPDATE SET
+    resource_type = S.resource_type,
+    fingerprint = S.fingerprint,
+    physical_identifier = S.physical_identifier,
+    release_id = S.release_id,
+    updated_at = S.updated_at,
+    schema_key = S.schema_key
+  WHEN NOT MATCHED THEN INSERT (environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key)
+    VALUES (S.environment, S.model_name, S.resource_type, S.fingerprint, S.physical_identifier, S.release_id, S.updated_at, S.schema_key)
+{%- endmacro %}
+
+{% macro default__upsert_environment_pointers_sql(physical_schema, env_name, rows) -%}
+  DELETE FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  WHERE environment = {{ dbt_virtual.sql_string_literal(env_name) }}
+    AND model_name IN ({% for r in rows %}{{ dbt_virtual.sql_string_literal(r['name']) }}{{ ', ' if not loop.last else '' }}{% endfor %});
+  INSERT INTO {{ dbt_virtual.registry_relation(physical_schema, '_environments') }} (
+    environment, model_name, resource_type, fingerprint, physical_identifier, release_id, updated_at, schema_key
+  ) VALUES
+  {%- for r in rows %}
+  ({{ dbt_virtual.sql_string_literal(env_name) }}, {{ dbt_virtual.sql_string_literal(r['name']) }}, {{ dbt_virtual.sql_string_literal(r['resource_type']) }}, {{ dbt_virtual.sql_string_literal(r['fingerprint']) }}, {{ dbt_virtual.sql_string_literal(r['physical_identifier']) }}, {{ dbt_virtual.sql_string_literal(r['release_id']) }}, CURRENT_TIMESTAMP, {{ dbt_virtual.sql_nullable_literal(r['schema_key']) }}){{ ',' if not loop.last else '' }}
+  {%- endfor %}
 {%- endmacro %}
 
 
@@ -391,35 +609,78 @@ $$
 {%- endmacro %}
 
 
+{% macro expired_environments_sql(physical_schema, expire_days) -%}
+  {#- Environments whose newest `_environments.updated_at` is older than `expire_days` days. -#}
+  {{ return(adapter.dispatch('expired_environments_sql', 'dbt_virtual')(physical_schema, expire_days)) }}
+{%- endmacro %}
+
+{% macro bigquery__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {{ expire_days | int }} DAY)
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro snowflake__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < DATEADD(day, -{{ expire_days | int }}, CURRENT_TIMESTAMP())
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro databricks__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < DATEADD(DAY, -{{ expire_days | int }}, CURRENT_TIMESTAMP())
+  ORDER BY environment
+{%- endmacro %}
+
+{% macro default__expired_environments_sql(physical_schema, expire_days) -%}
+  SELECT environment
+  FROM {{ dbt_virtual.registry_relation(physical_schema, '_environments') }}
+  GROUP BY environment
+  HAVING MAX(updated_at) < CURRENT_TIMESTAMP - INTERVAL '{{ expire_days | int }} days'
+  ORDER BY environment
+{%- endmacro %}
+
+
 {% macro find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   {{ return(adapter.dispatch('find_orphan_tables_sql', 'dbt_virtual')(physical_schema, retention_releases, retention_days)) }}
 {%- endmacro %}
 
 {% macro bigquery__find_orphan_tables_sql(physical_schema, retention_releases, retention_days) -%}
   WITH protected_releases AS (
+    -- The last N releases of EACH environment: ranking across all environments let busy PR
+    -- candidates push prod's rollback targets out of retention.
     SELECT release_id
     FROM (
-      SELECT release_id, MAX(created_at) AS release_created_at
-      FROM `{{ target.database }}`.`{{ physical_schema }}`._releases
-      WHERE status IN ('promoted', 'candidate')
+      SELECT
+        release_id,
+        COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+        MAX(COALESCE(promoted_at, created_at)) AS release_ts
+      FROM `{{ dbt_virtual.active_database() }}`.`{{ physical_schema }}`._releases
+      WHERE status IN ('promoted', 'candidate', 'rolled_back')
       GROUP BY release_id
     )
     -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
     WHERE TRUE
-    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
+    QUALIFY DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT SPLIT(physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
-    FROM `{{ target.database }}`.`{{ physical_schema }}`._environments
+    FROM `{{ dbt_virtual.active_database() }}`.`{{ physical_schema }}`._environments
     WHERE resource_type = 'model'
     UNION DISTINCT
     SELECT SPLIT(r.physical_identifier, '.')[SAFE_OFFSET(1)] AS table_name
-    FROM `{{ target.database }}`.`{{ physical_schema }}`._releases AS r
+    FROM `{{ dbt_virtual.active_database() }}`.`{{ physical_schema }}`._releases AS r
     INNER JOIN protected_releases AS pr USING (release_id)
     WHERE r.resource_type = 'model'
   )
   SELECT t.table_name
-  FROM `{{ target.database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES AS t
+  FROM `{{ dbt_virtual.active_database() }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES AS t
   LEFT JOIN protected_tables AS p ON t.table_name = p.table_name
   WHERE t.table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')
     AND REGEXP_CONTAINS(t.table_name, r'__[0-9a-f]{8,64}$')
@@ -432,14 +693,16 @@ $$
   WITH protected_releases AS (
     SELECT release_id
     FROM (
-      SELECT release_id, MAX(created_at) AS release_created_at
+      SELECT
+        release_id,
+        COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+        MAX(COALESCE(promoted_at, created_at)) AS release_ts
       FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-      WHERE status IN ('promoted', 'candidate')
+      WHERE status IN ('promoted', 'candidate', 'rolled_back')
       GROUP BY release_id
     )
-    -- BigQuery rejects QUALIFY without WHERE, GROUP BY or HAVING.
     WHERE TRUE
-    QUALIFY DENSE_RANK() OVER (ORDER BY release_created_at DESC) <= {{ retention_releases }}
+    QUALIFY DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) <= {{ retention_releases }}
   ),
   protected_tables AS (
     SELECT LOWER(SPLIT_PART(physical_identifier, '.', 2)) AS table_name
@@ -452,7 +715,7 @@ $$
     WHERE r.resource_type = 'model'
   )
   SELECT LOWER(t.table_name) AS table_name
-  FROM {{ target.database }}.information_schema.tables AS t
+  FROM {{ dbt_virtual.active_database() }}.information_schema.tables AS t
   LEFT JOIN protected_tables AS p ON LOWER(t.table_name) = p.table_name
   WHERE UPPER(t.table_schema) = UPPER('{{ physical_schema }}')
     AND t.table_type = 'BASE TABLE'
@@ -494,11 +757,14 @@ $$
     SELECT release_id
     FROM (
       SELECT release_id,
-        DENSE_RANK() OVER (ORDER BY release_created_at DESC) AS release_rank
+        DENSE_RANK() OVER (PARTITION BY release_env ORDER BY release_ts DESC) AS release_rank
       FROM (
-        SELECT release_id, MAX(created_at) AS release_created_at
+        SELECT
+          release_id,
+          COALESCE(MAX(target_environment), MAX(source_environment)) AS release_env,
+          MAX(COALESCE(promoted_at, created_at)) AS release_ts
         FROM {{ dbt_virtual.registry_relation(physical_schema, '_releases') }}
-        WHERE status IN ('promoted', 'candidate')
+        WHERE status IN ('promoted', 'candidate', 'rolled_back')
         GROUP BY release_id
       ) AS release_times
     ) AS ranked_releases
@@ -518,6 +784,9 @@ $$
   FROM information_schema.tables AS t
   LEFT JOIN protected_tables AS p ON LOWER(t.table_name) = p.table_name
   WHERE LOWER(t.table_schema) = LOWER('{{ physical_schema }}')
+    {%- if (dbt_virtual.active_database() | string | lower) != (target.database | string | lower) %}
+    AND LOWER(t.table_catalog) = LOWER('{{ dbt_virtual.active_database() }}')
+    {%- endif %}
     AND t.table_type = 'BASE TABLE'
     AND {{ suffix_predicate }}
     AND {{ dbt_virtual.orphan_table_age_predicate_sql(physical_schema, retention_days) }}
@@ -578,7 +847,7 @@ $$
 {% macro bigquery__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }}
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP TABLE FUNCTION IF EXISTS {{ object_relation }}
@@ -594,7 +863,7 @@ $$
 {% macro duckdb__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }}
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }}
   {%- elif resource_type == 'table_function' -%}
     DROP MACRO TABLE IF EXISTS {{ object_relation }}
@@ -608,7 +877,7 @@ $$
 {% macro default__drop_object_if_exists_sql(object_relation, resource_type='model') -%}
   {%- if resource_type == 'table' -%}
     DROP TABLE IF EXISTS {{ object_relation }} CASCADE
-  {%- elif resource_type == 'model' -%}
+  {%- elif resource_type in ['model', 'view'] -%}
     DROP VIEW IF EXISTS {{ object_relation }} CASCADE
   {%- else -%}
     SELECT 1
@@ -633,22 +902,25 @@ $$
 {%- endmacro %}
 
 
-{% macro list_physical_tables_sql(physical_schema) -%}
-  {{ return(adapter.dispatch('list_physical_tables_sql', 'dbt_virtual')(physical_schema)) }}
+{% macro list_physical_tables_sql(physical_schema, database=none) -%}
+  {{ return(adapter.dispatch('list_physical_tables_sql', 'dbt_virtual')(physical_schema, database or dbt_virtual.active_database())) }}
 {%- endmacro %}
 
-{% macro bigquery__list_physical_tables_sql(physical_schema) -%}
+{% macro bigquery__list_physical_tables_sql(physical_schema, database=none) -%}
   SELECT table_name
-  FROM `{{ target.database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES
+  FROM `{{ database }}`.`{{ physical_schema }}`.INFORMATION_SCHEMA.TABLES
   WHERE table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')
     AND REGEXP_CONTAINS(table_name, r'__[0-9a-f]{8,64}$')
   ORDER BY table_name
 {%- endmacro %}
 
-{% macro default__list_physical_tables_sql(physical_schema) -%}
+{% macro default__list_physical_tables_sql(physical_schema, database=none) -%}
   SELECT table_name
   FROM information_schema.tables
   WHERE LOWER(table_schema) = LOWER('{{ physical_schema }}')
+    {%- if (database | string | lower) != (target.database | string | lower) %}
+    AND LOWER(table_catalog) = LOWER('{{ database }}')
+    {%- endif %}
     AND table_type = 'BASE TABLE'
     AND table_name LIKE '%\_\_%' ESCAPE '\'
   ORDER BY table_name
@@ -661,6 +933,45 @@ $$
       literals that merely contain the env schema name (`staging_flag`, `raw_staging.events`). -#}
   {%- set pattern = '(?<![0-9A-Za-z_$])' ~ modules.re.escape(env_schema) ~ '(?=[`"]?\\.)' -%}
   {{ return(modules.re.sub(pattern, '__DBT_VIRTUAL_ENV_SCHEMA__', sql_text)) }}
+{%- endmacro %}
+
+
+{% macro env_placeholder_token(schema_key=none) -%}
+  {%- if schema_key is none or schema_key == '' or schema_key == 'default' -%}
+    {{ return('__DBT_VIRTUAL_ENV_SCHEMA__') }}
+  {%- endif -%}
+  {{ return('__DBT_VIRTUAL_ENV_SCHEMA_' ~ schema_key ~ '__') }}
+{%- endmacro %}
+
+
+{% macro env_placeholders_sql(sql_text, env_name=none) -%}
+  {#- Replace references to virtual objects in `env_name`'s schemas with a placeholder naming the
+      object's custom schema, so promotion can point each reference at the right schema of the
+      target environment. Several custom schemas may share one schema in `env_name` (e.g. a
+      single-dataset staging), so this goes object by object, not schema by schema. -#}
+  {%- set result = namespace(sql=sql_text) -%}
+  {%- if graph is defined and graph.nodes is defined -%}
+    {%- for node in graph.nodes.values() -%}
+      {%- if dbt_virtual.is_virtual_node(node) -%}
+        {%- set key = dbt_virtual.node_schema_key(node) -%}
+        {%- set schema = dbt_virtual.env_schema_for(env_name, key) -%}
+        {%- set ident = dbt_virtual.env_object_identifier(node) -%}
+        {%- set pattern = '(?<![0-9A-Za-z_$])' ~ modules.re.escape(schema) ~ '(?=[`"]?\\.[`"]?' ~ modules.re.escape(ident) ~ '(?![0-9A-Za-z_$]))' -%}
+        {%- set result.sql = modules.re.sub(pattern, dbt_virtual.env_placeholder_token(key), result.sql) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {#- Other references qualified with the environment's default schema: previous behaviour. -#}
+  {{ return(dbt_virtual.env_schema_placeholder_sql(result.sql, dbt_virtual.env_schema_for(env_name, none))) }}
+{%- endmacro %}
+
+
+{% macro resolve_env_placeholders_sql(sql_text, env_name) -%}
+  {%- set result = namespace(sql=sql_text) -%}
+  {%- for key in modules.re.findall('__DBT_VIRTUAL_ENV_SCHEMA_([0-9A-Za-z_]+?)__(?![0-9A-Za-z])', sql_text) | unique -%}
+    {%- set result.sql = result.sql | replace(dbt_virtual.env_placeholder_token(key), dbt_virtual.env_schema_for(env_name, key)) -%}
+  {%- endfor -%}
+  {{ return(result.sql | replace('__DBT_VIRTUAL_ENV_SCHEMA__', dbt_virtual.env_schema_for(env_name, none))) }}
 {%- endmacro %}
 
 
@@ -709,7 +1020,7 @@ $$
 
 {% macro bigquery__validate_routine_exists_sql(env_schema, routine_name) -%}
   SELECT routine_name
-  FROM `{{ target.database }}`.`{{ env_schema }}`.INFORMATION_SCHEMA.ROUTINES
+  FROM `{{ dbt_virtual.active_database() }}`.`{{ env_schema }}`.INFORMATION_SCHEMA.ROUTINES
   WHERE routine_name = '{{ routine_name }}'
   LIMIT 1
 {%- endmacro %}
@@ -718,3 +1029,36 @@ $$
   SELECT '{{ routine_name }}' AS routine_name
 {%- endmacro %}
 
+
+{% macro routine_exists_sql(schema_name, routine_name) -%}
+  {#- A query returning a row when the routine exists, used by `virtual_adopt`. The default returns
+      an empty string: adopt then skips the routine with a log instead of guessing. -#}
+  {{ return(adapter.dispatch('routine_exists_sql', 'dbt_virtual')(schema_name, routine_name)) }}
+{%- endmacro %}
+
+{% macro bigquery__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM `{{ dbt_virtual.active_database() }}`.`{{ schema_name }}`.INFORMATION_SCHEMA.ROUTINES
+  WHERE routine_name = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro snowflake__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM {{ dbt_virtual.active_database() }}.INFORMATION_SCHEMA.FUNCTIONS
+  WHERE UPPER(function_schema) = UPPER('{{ schema_name }}') AND UPPER(function_name) = UPPER('{{ routine_name }}')
+  UNION ALL
+  SELECT 1 FROM {{ dbt_virtual.active_database() }}.INFORMATION_SCHEMA.PROCEDURES
+  WHERE UPPER(procedure_schema) = UPPER('{{ schema_name }}') AND UPPER(procedure_name) = UPPER('{{ routine_name }}')
+{%- endmacro %}
+
+{% macro duckdb__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM duckdb_functions()
+  WHERE schema_name = '{{ schema_name }}' AND function_name = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro postgres__routine_exists_sql(schema_name, routine_name) -%}
+  SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = '{{ schema_name }}' AND p.proname = '{{ routine_name }}'
+{%- endmacro %}
+
+{% macro default__routine_exists_sql(schema_name, routine_name) -%}
+  {{ return('') }}
+{%- endmacro %}

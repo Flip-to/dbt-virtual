@@ -6,6 +6,7 @@ Replicates SQLMesh's core plan/diff engine on top of dbt manifests and warehouse
    - `SEED_INCREMENTAL` — new fingerprint for an incremental model with a `prod` base table to `CLONE`
    - `FULL_BUILD`       — new table model or incremental model with no base table
    - `ROUTINE_DEPLOY`   — new/modified UDF, TVF, or stored procedure
+   - `VIEW_DEPLOY`      — new/modified `view` model (no physical table; REUSE when unchanged)
 2. Performs column-level schema compatibility analysis (`NON_BREAKING` vs `BREAKING`) between
    environments or manifest versions to warn before promotion.
 """
@@ -15,9 +16,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from dbt_virtual.fingerprint import NodeFingerprint, extract_sql_output_columns
+from dbt_virtual.fingerprint import (
+    ROUTINE_MATERIALIZATIONS,
+    NodeFingerprint,
+    extract_sql_output_columns,
+)
 
-ROUTINE_TYPES = {"table_function", "function", "procedure"}
+ROUTINE_TYPES = set(ROUTINE_MATERIALIZATIONS)
+VIEW_TYPES = {"view"}
 
 
 @dataclass(frozen=True)
@@ -30,7 +36,7 @@ class NodePlanAction:
     materialized: str
     fingerprint: str
     physical_identifier: str
-    action: str  # REUSE | SEED_INCREMENTAL | FULL_BUILD | ROUTINE_DEPLOY
+    action: str  # REUSE | SEED_INCREMENTAL | FULL_BUILD | ROUTINE_DEPLOY | VIEW_DEPLOY
     reason: str
     base_fingerprint: str | None = None
 
@@ -148,6 +154,9 @@ def classify_plan_actions(
     base_env_state: dict[str, str] | None = None,
     existing_physical_tables: set[str] | None = None,
     full_refresh: bool = False,
+    registered_physical_tables: set[str] | None = None,
+    partial_physical_tables: set[str] | None = None,
+    base_physical_tables: set[str] | None = None,
 ) -> dict[str, NodePlanAction]:
     """Classify each virtualized node into REUSE, SEED_INCREMENTAL, FULL_BUILD, or ROUTINE_DEPLOY.
 
@@ -163,23 +172,51 @@ def classify_plan_actions(
         Optional set of physical table names (`<model>__<fp>`) already materialized in `<physical_schema>`.
     full_refresh:
         When True, forces `FULL_BUILD` on all table/incremental models.
+    registered_physical_tables:
+        Optional set of physical tables referenced by `_environments` or `_releases`, i.e. written
+        by a build that finished. When given, an existing table that is not registered (e.g. a
+        clone whose `dbt build` failed) is rebuilt instead of reused.
+    base_physical_tables:
+        Physical tables in the base environment's location when it differs from the target's
+        (`physical_locations`, cross-project). They can seed an incremental model by clone but are
+        never reused in place.
+    partial_physical_tables:
+        Physical tables whose latest registration is a windowed or `--empty` build
+        (`build_quality = 'partial'`). They are neither reused nor cloned as an incremental
+        seed: another environment would inherit the missing data.
     """
     env_map = env_state or {}
     base_map = base_env_state or {}
     phys_tables = set(existing_physical_tables or set())
+    if registered_physical_tables is not None:
+        phys_tables &= set(registered_physical_tables)
 
     # Without a catalog snapshot, treat state pointers as evidence that physical tables exist.
     # When a snapshot is supplied, it is authoritative and can reveal stale registry pointers.
     if existing_physical_tables is None:
         for model_name, fp in (*env_map.items(), *base_map.items()):
             phys_tables.add(f"{model_name}__{fp}")
+    if partial_physical_tables:
+        phys_tables -= set(partial_physical_tables)
+
+    seed_tables = phys_tables | (set(base_physical_tables or set()) - set(partial_physical_tables or set()))
 
     actions: dict[str, NodePlanAction] = {}
     for uid, fp_obj in sorted(fingerprints.items()):
         base_fp = base_map.get(fp_obj.name) or env_map.get(fp_obj.name)
         mat = fp_obj.materialized
 
-        if mat in ROUTINE_TYPES:
+        if mat in VIEW_TYPES:
+            # A view has no physical table: it is registered with a DDL template, like a routine.
+            if not full_refresh and env_map.get(fp_obj.name) == fp_obj.fingerprint:
+                action = "REUSE"
+                reason = "View fingerprint already active in target environment"
+            else:
+                action = "VIEW_DEPLOY"
+                reason = (
+                    "View SQL or upstream changed" if base_fp else "New virtualized view"
+                )
+        elif mat in ROUTINE_TYPES:
             if not full_refresh and env_map.get(fp_obj.name) == fp_obj.fingerprint:
                 action = "REUSE"
                 reason = "Routine fingerprint already active in target environment"
@@ -197,7 +234,7 @@ def classify_plan_actions(
             not full_refresh
             and mat == "incremental"
             and fp_obj.name in base_map
-            and f"{fp_obj.name}__{base_map[fp_obj.name]}" in phys_tables
+            and f"{fp_obj.name}__{base_map[fp_obj.name]}" in seed_tables
         ):
             action = "SEED_INCREMENTAL"
             reason = (
@@ -228,7 +265,7 @@ def classify_plan_actions(
 
 def compute_dbt_select_for_build(actions: dict[str, NodePlanAction]) -> tuple[list[str], dict[str, str]]:
     """Split planned actions into:
-    1. `models_to_build`: model names requiring `dbt build` (`SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`)
+    1. `models_to_build`: model names requiring `dbt build` (`SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`, `VIEW_DEPLOY`)
     2. `reused_models`: mapping of `model_name -> fingerprint` for `REUSE` table/incremental models
        that only need a zero-compute view pointer sync.
     """

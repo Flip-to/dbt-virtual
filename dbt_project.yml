@@ -6,12 +6,26 @@ require-dbt-version: [">=1.6.0", "<2.0.0"]
 
 macro-paths: ["macros"]
 model-paths: ["models"]
+# The repo's tests/ holds a fixture dbt project; dbt's default test-paths ("tests") made
+# installed packages parse it and fail ("value of 'models' is not a list").
+test-paths: ["dbt_package_tests"]
+seed-paths: ["dbt_package_seeds"]
+snapshot-paths: ["dbt_package_snapshots"]
+analysis-paths: ["dbt_package_analyses"]
 
 clean-targets:
   - "target"
   - "dbt_packages"
   - ".dbt_virtual"
   - "tests"
+
+# Run by dbt for every project that installs this package (verified with dbt-core 1.12.6: package
+# hooks run for run/build/compile). Both are no-ops unless the run built virtualized nodes
+# (`flush_registry`) or `dbt-virtual build` passed its plan vars (`run_start`).
+on-run-start:
+  - "{{ dbt_virtual.run_start() }}"
+on-run-end:
+  - "{{ dbt_virtual.flush_registry(results) }}"
 
 vars:
   dbt_virtual:
@@ -25,3 +39,5 @@ vars:
       prod: "prod"
     retention_releases: 5
     retention_days: 7
+    authorize_env_views: false  # BigQuery: authorize each env dataset (views) on the physical dataset
+    expire_env_days: null       # gc drops unmapped envs idle for N days (null = off)

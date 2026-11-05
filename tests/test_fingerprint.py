@@ -266,7 +266,8 @@ def test_normalize_sql_strips_comments_and_fp_suffixes() -> None:
     )
     assert "0123456789ab" not in cleaned
     assert "__DBT_VIRTUAL_THIS__" in cleaned
-    assert "__DBT_VIRTUAL_SCHEMA__." in cleaned
+    # The node's own three-part name collapses to one token (its project and dataset differ per target).
+    assert "FROM __DBT_VIRTUAL_THIS__ WHERE" in cleaned
 
 
 def test_sqlglot_ast_canonicalization_and_column_extraction() -> None:
@@ -502,3 +503,74 @@ def test_bigquery_table_options_hooks_and_contracts_change_fingerprint() -> None
         compute_node_fingerprint(contract_v1).fingerprint
         != compute_node_fingerprint(contract_v2).fingerprint
     )
+
+
+def _env_manifest(parent_schema: str, env_schema: str, parent_sql: str = "select 1 as id") -> dict:
+    """A virtual child that reads a non-virtual model, a virtual model and a seed."""
+    return {
+        "nodes": {
+            "model.p.orders": {
+                "unique_id": "model.p.orders", "name": "orders", "alias": "orders",
+                "resource_type": "model", "schema": parent_schema,
+                "compiled_code": parent_sql, "raw_code": parent_sql,
+                "config": {"materialized": "table"}, "depends_on": {"nodes": []},
+            },
+            "seed.p.rates": {
+                "unique_id": "seed.p.rates", "name": "rates", "alias": "rates",
+                "resource_type": "seed", "schema": parent_schema,
+                "checksum": {"name": "sha256", "checksum": "aaa111"},
+                "config": {"materialized": "seed"}, "depends_on": {"nodes": []},
+            },
+            "model.p.up": {
+                "unique_id": "model.p.up", "name": "up", "alias": "up__0123456789ab",
+                "resource_type": "model", "schema": "analytics_physical",
+                "compiled_code": "select 2 as id", "raw_code": "select 2 as id",
+                "config": {"materialized": "table", "virtual_env": True},
+                "depends_on": {"nodes": []},
+            },
+            "model.p.child": {
+                "unique_id": "model.p.child", "name": "child", "alias": "child__0123456789ab",
+                "resource_type": "model", "schema": "analytics_physical",
+                "compiled_code": (
+                    f"select o.id from `proj`.`{parent_schema}`.`orders` as o "
+                    f"join `proj`.`{env_schema}`.`up` as u using (id) "
+                    f"join `proj`.`{parent_schema}`.`rates` as r using (id)"
+                ),
+                "raw_code": (
+                    "select o.id from {{ ref('orders') }} as o join {{ ref('up') }} as u using (id) "
+                    "join {{ ref('rates') }} as r using (id)"
+                ),
+                "config": {"materialized": "table", "virtual_env": True},
+                "depends_on": {"nodes": ["model.p.orders", "model.p.up", "seed.p.rates"]},
+            },
+        }
+    }
+
+
+def test_ref_locations_do_not_change_fingerprints_across_environments() -> None:
+    """Dev/PR targets put models in other datasets than prod; that alone must not rebuild tables."""
+    dev = compute_manifest_fingerprints(_env_manifest("rt_dev_someone", "rt_dev_someone"))
+    prod = compute_manifest_fingerprints(_env_manifest("prod_derived", "prod"))
+    assert dev["model.p.child"].fingerprint == prod["model.p.child"].fingerprint
+    assert dev["model.p.up"].fingerprint == prod["model.p.up"].fingerprint
+
+
+def test_parent_and_seed_changes_still_change_child_fingerprint() -> None:
+    base = compute_manifest_fingerprints(_env_manifest("prod_derived", "prod"))
+    parent_changed = compute_manifest_fingerprints(
+        _env_manifest("prod_derived", "prod", parent_sql="select 3 as id")
+    )
+    assert parent_changed["model.p.child"].fingerprint != base["model.p.child"].fingerprint
+
+    seed_changed = _env_manifest("prod_derived", "prod")
+    seed_changed["nodes"]["seed.p.rates"]["checksum"]["checksum"] = "bbb222"
+    changed = compute_manifest_fingerprints(seed_changed)
+    assert changed["model.p.child"].fingerprint != base["model.p.child"].fingerprint
+
+
+def test_dependency_qualifiers_only_rewrite_three_part_names() -> None:
+    sql = "select o.orders, x.orders from `p`.`ds`.`orders` as o join p.ds.orders as x on true"
+    out = normalize_sql(sql, dependency_identifiers={"orders"}, use_ast=False)
+    # Two-part `alias.column` references keep their alias, so changing it changes the hash.
+    assert "o.orders, x.orders" in out
+    assert out.count("__DBT_VIRTUAL_REF__.orders") == 2
