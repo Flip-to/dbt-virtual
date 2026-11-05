@@ -66,6 +66,31 @@ def _default_lock_owner() -> str:
     return f"dbt-virtual-cli:{user}@{socket.gethostname()}"
 
 
+def _dbt_target(ns: argparse.Namespace) -> str:
+    """dbt profile target: `--target`, else the environment name (previous behaviour)."""
+    return getattr(ns, "target", None) or ns.env
+
+
+def _user_vars(ns: argparse.Namespace) -> dict[str, object]:
+    """Extra dbt vars from `--vars` (JSON object). dbt-virtual's own `_dbt_virtual_*` vars win."""
+    raw = getattr(ns, "vars", None)
+    if not raw:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise SystemExit("dbt-virtual: --vars must be a JSON object")
+    return value
+
+
+def _state_args(ns: argparse.Namespace) -> list[str]:
+    args: list[str] = []
+    if getattr(ns, "defer", False):
+        args.append("--defer")
+    if getattr(ns, "state", None):
+        args.extend(["--state", ns.state])
+    return args
+
+
 def _run_dbt(args: list[str], project_dir: Path) -> int:
     cmd = ["dbt", *args]
     result = subprocess.run(cmd, cwd=project_dir, check=False)
@@ -75,7 +100,10 @@ def _run_dbt(args: list[str], project_dir: Path) -> int:
 def cmd_plan(ns: argparse.Namespace) -> int:
     project_dir = Path(ns.project_dir).resolve()
     if not ns.skip_compile:
-        rc = _run_dbt(["compile", "--target", ns.env], project_dir)
+        compile_args = ["compile", "--target", _dbt_target(ns)]
+        if _user_vars(ns):
+            compile_args.extend(["--vars", json.dumps(_user_vars(ns))])
+        rc = _run_dbt(compile_args, project_dir)
         if rc != 0:
             return rc
 
@@ -130,7 +158,10 @@ def cmd_plan(ns: argparse.Namespace) -> int:
 def cmd_build(ns: argparse.Namespace) -> int:
     project_dir = Path(ns.project_dir).resolve()
     if not ns.skip_compile:
-        rc = _run_dbt(["compile", "--target", ns.env], project_dir)
+        compile_args = ["compile", "--target", _dbt_target(ns)]
+        if _user_vars(ns):
+            compile_args.extend(["--vars", json.dumps(_user_vars(ns))])
+        rc = _run_dbt(compile_args, project_dir)
         if rc != 0:
             return rc
 
@@ -152,6 +183,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
 
     by_name = {fp.name: fp.fingerprint for fp in fps.values()}
     dbt_vars: dict[str, object] = {
+        **_user_vars(ns),
         "_dbt_virtual_fps": by_name,
         "_dbt_virtual_env": ns.env,
         "_dbt_virtual_release": ns.release or "",
@@ -168,7 +200,7 @@ def cmd_build(ns: argparse.Namespace) -> int:
                 "run-operation",
                 name,
                 "--target",
-                ns.env,
+                _dbt_target(ns),
                 "--args",
                 json.dumps(op_args),
                 "--vars",
@@ -222,7 +254,8 @@ def cmd_build(ns: argparse.Namespace) -> int:
     build_args = [
         "build",
         "--target",
-        ns.env,
+        _dbt_target(ns),
+        *_state_args(ns),
         "--vars",
         json.dumps(dbt_vars),
     ]
@@ -463,6 +496,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Known environment schema names to normalize out of SQL fingerprints.",
     )
     p_plan.add_argument("--format", choices=["text", "json"], default="text")
+    p_plan.add_argument(
+        "--target",
+        default=None,
+        help="dbt profile target (default: the --env name). Lets e.g. env pr_42 build with target ci.",
+    )
+    p_plan.add_argument(
+        "--vars",
+        default=None,
+        help="Extra dbt vars as a JSON object, merged under dbt-virtual's own vars (e.g. window vars).",
+    )
     p_plan.set_defaults(func=cmd_plan)
 
     # build
@@ -476,6 +519,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--full-refresh", action="store_true", help="Pass --full-refresh to dbt build.")
     p_build.add_argument("--skip-compile", action="store_true", help="Reuse existing target/manifest.json.")
     p_build.add_argument("--known-schema", dest="known_schemas", action="append", default=[])
+    p_build.add_argument(
+        "--target",
+        default=None,
+        help="dbt profile target (default: the --env name). Lets e.g. env pr_42 build with target ci.",
+    )
+    p_build.add_argument(
+        "--vars",
+        default=None,
+        help="Extra dbt vars as a JSON object, merged under dbt-virtual's own vars (e.g. window vars).",
+    )
+    p_build.add_argument("--defer", action="store_true", help="Pass --defer to dbt build.")
+    p_build.add_argument("--state", default=None, help="Pass --state <path> to dbt build (with --defer).")
     p_build.set_defaults(func=cmd_build)
 
     # promote

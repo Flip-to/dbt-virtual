@@ -768,3 +768,32 @@ def test_cli_build_seeds_incremental_clones_before_dbt_build(tmp_path: Path) -> 
     seed_vars = json.loads(seed_cmd[seed_cmd.index("--vars") + 1])
     build_cmd = recorded_cmds[build_idx]
     assert seed_vars == json.loads(build_cmd[build_cmd.index("--vars") + 1])
+
+
+def test_cli_build_target_vars_and_defer_are_separate_from_env(tmp_path: Path) -> None:
+    """CI builds env pr_42 with profile target `ci`, extra window vars, and --defer/--state."""
+    target_dir = tmp_path / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "manifest.json").write_text(json.dumps(_sample_manifest()), encoding="utf-8")
+    recorded: list[list[str]] = []
+
+    def fake_run_dbt(args: list[str], project_dir: Path) -> int:
+        recorded.append(args)
+        return 0
+
+    with patch("dbt_virtual.cli._run_dbt", side_effect=fake_run_dbt):
+        rc = main(
+            [
+                "--project-dir", str(tmp_path), "build", "--env", "pr_42", "--target", "ci",
+                "--vars", json.dumps({"enable_prod_hooks": False, "_dbt_virtual_env": "spoofed"}),
+                "--defer", "--state", "/tmp/prodstate", "--skip-compile",
+            ]
+        )
+    assert rc == 0
+    build_cmd = next(cmd for cmd in recorded if cmd[0] == "build")
+    assert build_cmd[build_cmd.index("--target") + 1] == "ci"
+    assert "--defer" in build_cmd and build_cmd[build_cmd.index("--state") + 1] == "/tmp/prodstate"
+    build_vars = json.loads(build_cmd[build_cmd.index("--vars") + 1])
+    assert build_vars["enable_prod_hooks"] is False
+    # dbt-virtual's own vars cannot be overridden by --vars.
+    assert build_vars["_dbt_virtual_env"] == "pr_42"
