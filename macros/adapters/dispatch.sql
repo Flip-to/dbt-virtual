@@ -553,6 +553,12 @@ $$
   )
 {%- endmacro %}
 
+{% macro default__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
+  {#- dbt resolves `adapter.dispatch(...)` while parsing; without a default, every dbt command on
+      BigQuery and Snowflake failed with "No macro named 'orphan_table_age_predicate_sql'". -#}
+  {{ exceptions.raise_compiler_error("dbt-virtual gc: no table age predicate for adapter '" ~ target.type ~ "'.") }}
+{%- endmacro %}
+
 {% macro databricks__orphan_table_age_predicate_sql(physical_schema, retention_days) -%}
   t.created < DATEADD(DAY, -{{ retention_days }}, CURRENT_TIMESTAMP())
 {%- endmacro %}

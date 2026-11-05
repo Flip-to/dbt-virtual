@@ -71,6 +71,11 @@ ROUTING_SHIM = """{% macro generate_schema_name(custom_schema_name, node) -%}
 {% macro ref() -%}
   {{ return(dbt_virtual.virtual_ref(*varargs, **kwargs)) }}
 {%- endmacro %}
+
+{# The override docs/guides/getting_started.md recommends; it used to break `dbt parse`. #}
+{% macro is_incremental() -%}
+  {{ return(dbt_virtual.virtual_is_incremental()) }}
+{%- endmacro %}
 """
 
 TARGETS = {"staging": "analytics_staging", "prod": "analytics"}

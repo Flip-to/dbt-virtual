@@ -181,7 +181,15 @@ class MacroTestHarness:
             "ref": lambda name: FakeRelation(
                 self.target["database"], "analytics_staging", name, "view"
             ),
-            "dbt": type("DbtObj", (), {"string_literal": staticmethod(lambda s: repr(str(s)))})(),
+            "dbt": type(
+                "DbtObj",
+                (),
+                {
+                    "string_literal": staticmethod(lambda s: repr(str(s))),
+                    # dbt's is_incremental(): the target table does not exist in these tests.
+                    "is_incremental": staticmethod(lambda: False),
+                },
+            )(),
             "exceptions": type("ExcObj", (), {"raise_compiler_error": staticmethod(_raise_compiler_error)})(),
             "api": type(
                 "ApiObj",
