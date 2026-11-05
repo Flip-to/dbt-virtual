@@ -15,7 +15,11 @@ updated_at: 2026-11-05T00:00:00Z
    then `status`, `plan`, `build`, `promote`, `rollback` with the current code.
 3. Bug fixed: `status` / `rollback` / `drop-env` failed on a v0.1.0 registry (`build_quality` not found);
    `migrate_registry_if_old` migrates it first.
-4. Known limitation recorded: docs/tech_debt/cli_lock_owner_shared_per_user_host.md.
+4. Bug fixed: the lease lock let two runners win under MVCC (CI: "2 runners hold the lock"): one conditional
+   statement (ON CONFLICT on a unique index, or MERGE) then a read-back; see
+   docs/decisions/20261105_lease_lock_single_statement_acquire.md and
+   docs/tech_debt/snowflake_lock_not_constraint_enforced.md.
+5. Known limitation recorded: docs/tech_debt/cli_lock_owner_shared_per_user_host.md.
 
 The non-atomic DELETE+INSERT pointer upsert (DuckDB/PostgreSQL) is pinned by a strict xfail that points at
 branch claude/dbt-virtual-registry-merge; this bean does not change the upsert macros.

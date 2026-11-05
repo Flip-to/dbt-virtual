@@ -245,7 +245,7 @@ def test_legacy_releases_are_refused_only_when_require_sealed() -> None:
 def test_refused_promote_releases_the_lease_lock() -> None:
     harness = _harness()
     harness.query_responses.extend(
-        [FakeResult([]), FakeResult([]), FakeResult([]), FakeResult([("cli@host", "2999-01-01T00:00:00Z")])]
+        [FakeResult([]), FakeResult([("cli@host", "2999-01-01T00:00:00Z")])]
     )
     harness.query_responses.append(FakeResult(_release_rows(sealed=None)))
     with pytest.raises(RuntimeError, match="not sealed"):

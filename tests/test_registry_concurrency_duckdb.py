@@ -37,6 +37,10 @@ def test_lock_race_has_exactly_one_winner(backend) -> None:
     rc.scenario_lock_race_has_exactly_one_winner(backend, n=4, rounds=3)
 
 
+def test_legacy_locks_table_without_unique_key_is_upgraded(backend) -> None:
+    rc.scenario_legacy_locks_table_is_upgraded(backend)
+
+
 def test_lease_lifecycle_expired_lease_is_taken_over(backend) -> None:
     rc.scenario_lease_lifecycle(backend)
 

@@ -900,19 +900,17 @@ def test_virtual_audit_lock_intervals_and_export_state() -> None:
 
     # 2. Concurrency lock acquisition & conflict detection
     harness.executed_queries.clear()
-    harness.query_responses.append(FakeResult([]))  # delete expired
-    harness.query_responses.append(FakeResult([]))  # delete own lease
-    harness.query_responses.append(FakeResult([]))  # insert own lease
+    harness.query_responses.append(FakeResult([]))  # MERGE own lease (one conditional statement)
     harness.query_responses.append(FakeResult([("ci_job_1", "2026-10-27T23:59:59Z")]))  # live leases
     harness.call_macro("virtual_acquire_lock", env="prod", owner="ci_job_1", ttl_minutes=15)
     lock_queries = "\n".join(harness.executed_queries)
-    assert "INSERT INTO `test_proj`.`analytics_physical`._locks" in lock_queries
+    assert "MERGE INTO `test_proj`.`analytics_physical`._locks" in lock_queries
     assert "'ci_job_1'" in lock_queries
     assert "ORDER BY acquired_at ASC, owner ASC" in lock_queries
 
-    # An older live lease of another owner wins: this owner removes its lease and fails.
+    # A live lease of another owner (even a later one) blocks: this owner removes its lease and fails.
     harness.executed_queries.clear()
-    harness.query_responses.extend([FakeResult([]), FakeResult([]), FakeResult([])])
+    harness.query_responses.extend([FakeResult([])])  # MERGE
     harness.query_responses.append(
         FakeResult([("ci_job_other", "2026-10-27T23:59:59Z"), ("ci_job_1", "2026-10-27T23:59:59Z")])
     )

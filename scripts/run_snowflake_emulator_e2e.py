@@ -392,6 +392,7 @@ def run_postgres_concurrency(dsn: str) -> list[str]:
                 rc.REGISTRY_MERGE_XFAIL,
             ),
             ("lock race: exactly one winner", lambda: rc.scenario_lock_race_has_exactly_one_winner(backend, n=4, rounds=3)),
+            ("legacy _locks table is upgraded", lambda: rc.scenario_legacy_locks_table_is_upgraded(backend)),
             ("lease lifecycle and expired takeover", lambda: rc.scenario_lease_lifecycle(backend)),
             ("promote refused while lease held", lambda: rc.scenario_promote_is_refused_while_the_lease_is_held(backend)),
             ("simultaneous promotes", lambda: rc.scenario_simultaneous_promotes(backend, rounds=2)),

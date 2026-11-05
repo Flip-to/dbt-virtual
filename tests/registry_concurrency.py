@@ -24,6 +24,12 @@ from tests.test_macros_execution import FakeRelation, MacroTestHarness
 LOCK_CONFLICT = "dbt-virtual lock conflict"
 
 
+def lost_the_lock(backend: Backend, message: str) -> bool:
+    """A runner that did not get the lease: the lock-conflict error, or (DuckDB) the unique violation
+    the warehouse raises for the second concurrent insert of `_locks(environment)`."""
+    return LOCK_CONFLICT in message or any(m in message for m in backend.lost_race_errors)
+
+
 def split_statements(sql: str) -> list[str]:
     return [s.strip() for s in sql.split(";") if s.strip()]
 
@@ -54,6 +60,7 @@ class Backend:
     adapter_type = "duckdb"
     database = ""
     quote_char = ""
+    lost_race_errors: tuple[str, ...] = ()
 
     def new_conn(self) -> Conn:  # pragma: no cover - interface
         raise NotImplementedError
@@ -105,6 +112,7 @@ class _DuckConn(Conn):
 
 class DuckDBBackend(Backend):
     name = "duckdb"
+    lost_race_errors = ("violates unique constraint", "PRIMARY KEY or UNIQUE constraint violation")
 
     def __init__(self) -> None:
         import duckdb
@@ -473,8 +481,9 @@ def _locks(backend: Backend, names: Names, env: str) -> list[str]:
 def scenario_lock_race_has_exactly_one_winner(backend: Backend, n: int = 5, rounds: int = 3) -> None:
     """n runners acquire the lease on one environment at the same moment.
 
-    Catches: a check-then-insert acquire that lets two runners both hold the lock; a loser that
-    fails with something other than the lock-conflict message; a loser that leaves its lease row
+    Catches: an acquire that lets two runners both hold the lock (the old start-time ordering did,
+    under MVCC); a loser that fails with something other than the lock-conflict message (or, on
+    DuckDB, the unique violation of the second concurrent insert); a loser that leaves its lease row
     behind (which would block the winner's successors until the TTL).
     """
     names = new_world(backend, "lock")
@@ -485,8 +494,33 @@ def scenario_lock_race_has_exactly_one_winner(backend: Backend, n: int = 5, roun
         assert len(winners) == 1, f"round {r}: {len(winners)} runners hold the lock: {winners}; {[o.message for o in outcomes if not o.ok]}"
         for o in outcomes:
             if not o.ok:
-                assert LOCK_CONFLICT in o.message, f"round {r}: loser failed with {o.message!r}"
+                assert lost_the_lock(backend, o.message), f"round {r}: loser failed with {o.message!r}"
         assert _locks(backend, names, env) == winners, (_locks(backend, names, env), winners)
+
+
+def scenario_legacy_locks_table_is_upgraded(backend: Backend) -> None:
+    """A `_locks` table from v0.1.0/v0.2.0 (no unique key, maybe two leases for one environment) is
+    deduplicated and keyed by the first acquire; the lease then excludes a second owner.
+
+    Catches: `ON CONFLICT (environment)` failing on a registry created before the unique index.
+    Runs on DuckDB and PostgreSQL only (the other warehouses have no index to add).
+    """
+    names = new_world(backend, "legacy")
+    locks = backend.qualified(names.physical, "_locks")
+    conn = backend.new_conn()
+    try:
+        conn.run(f"DROP INDEX {backend.qualified(names.physical, '_locks_environment_uq')}")
+        conn.run(
+            f"INSERT INTO {locks} VALUES ('prod', 'old1', {backend.ts(-3)}, {backend.ts(10)}); "
+            f"INSERT INTO {locks} VALUES ('prod', 'old2', {backend.ts(-2)}, {backend.ts(10)})"
+        )
+    finally:
+        conn.close()
+    outcome = run_parallel(backend, [_acquire(backend, names, "prod", "old2")])[0]
+    assert outcome.ok, outcome.message  # the latest lease (old2) was kept, so its owner refreshes it
+    assert _locks(backend, names, "prod") == ["old2"], _locks(backend, names, "prod")
+    other = run_parallel(backend, [_acquire(backend, names, "prod", "new")])[0]
+    assert not other.ok and LOCK_CONFLICT in other.message, other.message
 
 
 def scenario_lease_lifecycle(backend: Backend) -> None:
@@ -653,7 +687,7 @@ def scenario_simultaneous_promotes(backend: Backend, rounds: int = 2) -> None:
         assert ok, f"round {r}: no promote succeeded: {[o.message for o in outcomes]}"
         for o in outcomes:
             if not o.ok:
-                assert LOCK_CONFLICT in o.message, f"round {r}: failed with a non-lock error: {o.message}"
+                assert lost_the_lock(backend, o.message), f"round {r}: failed with a non-lock error: {o.message}"
         state = _prod_state(backend, names)
         assert len(state) == 2 and state[0][2] == state[1][2], f"round {r}: prod mixes releases: {state}"
         assert state[0][2] == ok[-1] or state[0][2] in ok, (state, ok)
@@ -702,13 +736,16 @@ def scenario_same_owner_reacquires_the_lease(backend: Backend) -> None:
     """Pins TECH_DEBT(cli_lock_owner_shared_per_user_host): the same owner string is re-entrant.
 
     `dbt-virtual promote` defaults `--lock-owner` to `dbt-virtual-cli:<user>@<host>`, the same for
-    every process of one user on one machine. A second acquire with that owner replaces the lease
+    every process of one user on one machine. A second acquire with that owner refreshes the lease
     and succeeds, so two promotes started from one machine do not exclude each other. When the
     owner becomes unique per process, flip this scenario to expect a lock conflict.
     """
     names = new_world(backend, "owner")
-    outcomes = run_parallel(
-        backend, [_acquire(backend, names, "prod", "dbt-virtual-cli:me@host") for _ in range(2)]
-    )
+    # One after the other: truly simultaneous inserts of one owner can lose the race on a warehouse
+    # with a unique key (DuckDB), which is the safe outcome; the limitation is the re-entrant refresh.
+    outcomes = [
+        run_parallel(backend, [_acquire(backend, names, "prod", "dbt-virtual-cli:me@host")])[0]
+        for _ in range(2)
+    ]
     assert [o.ok for o in outcomes] == [True, True], [o.message for o in outcomes]
     assert set(_locks(backend, names, "prod")) == {"dbt-virtual-cli:me@host"}
