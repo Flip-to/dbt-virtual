@@ -1,11 +1,14 @@
-{% macro ensure_registry() -%}
+{% macro ensure_registry(location=none) -%}
   {#- Runs DDL only when the registry is missing or predates `schema_key`. It used to run the
-      four-table DDL script for every model, i.e. one extra BigQuery job per model per run. -#}
+      four-table DDL script for every model, i.e. one extra BigQuery job per model per run.
+      `location` selects the registry of that location (`physical_schemas_by_location`). -#}
   {%- if execute -%}
-    {%- set cfg = dbt_virtual.get_config() -%}
-    {%- set phys_schema = cfg.get('physical_schema') -%}
+    {%- set phys_schema = dbt_virtual.physical_schema_for(location) -%}
     {%- set releases_rel = adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') -%}
     {%- if releases_rel is none -%}
+      {%- if dbt_virtual.create_location_for(location) is not none -%}
+        {%- do dbt_virtual.exec_sql_statement(dbt_virtual.create_schema_if_not_exists_sql(phys_schema, dbt_virtual.create_location_for(location))) -%}
+      {%- endif -%}
       {%- call statement('ensure_registry', fetch_result=False) -%}
         {{ dbt_virtual.ensure_registry_tables_sql(phys_schema) }}
       {%- endcall -%}
@@ -136,39 +139,19 @@
   {%- endif -%}
 
   {%- set cfg = dbt_virtual.get_config() -%}
-  {%- set phys_schema = cfg.get('physical_schema') -%}
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
-  {%- do dbt_virtual.ensure_registry() -%}
-
-  {%- set base_query -%}
-    SELECT model_name, physical_identifier
-    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
-    WHERE environment = '{{ base_env }}'
-      AND resource_type = 'model'
-  {%- endset -%}
-  {%- set base_rows = run_query(base_query) -%}
-  {%- set base_map = {} -%}
-  {%- if base_rows -%}
-    {%- for row in base_rows.rows -%}
-      {%- do base_map.update({row[0]: row[1]}) -%}
-    {%- endfor -%}
-  {%- endif -%}
-
-  {#- Physical tables some environment or release points at, i.e. written by a build that finished. -#}
-  {%- set registered_query -%}
-    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} WHERE resource_type = 'model'
-    {{ 'UNION DISTINCT' if target.type == 'bigquery' else 'UNION' }}
-    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
-  {%- endset -%}
-  {%- set registered_rows = run_query(registered_query) -%}
-  {%- set registered = [] -%}
-  {%- if registered_rows -%}
-    {%- for row in registered_rows.rows -%}
-      {%- do registered.append(row[0].split('.')[-1]) -%}
-    {%- endfor -%}
-  {%- endif -%}
+  {#- One registry per location: the base tables and the registered tables of a node are read
+      from the registry of its own location. -#}
+  {%- set seed_info = {} -%}
 
   {%- for node in candidates -%}
+    {%- set phys_schema = dbt_virtual.physical_schema_for_node(node) -%}
+    {%- if phys_schema not in seed_info -%}
+      {%- do dbt_virtual.ensure_registry(dbt_virtual.node_location(node)) -%}
+      {%- do seed_info.update({phys_schema: dbt_virtual.seed_registry_info(phys_schema, base_env)}) -%}
+    {%- endif -%}
+    {%- set base_map = seed_info[phys_schema]['base_map'] -%}
+    {%- set registered = seed_info[phys_schema]['registered'] -%}
     {%- set node_name = dbt_virtual.node_attr(node, 'name', '') -%}
     {%- set node_db = dbt_virtual.node_attr(node, 'database', target.database) -%}
     {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
@@ -290,7 +273,8 @@
   {%- endif -%}
 
   {%- set cfg = dbt_virtual.get_config() -%}
-  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set phys_schema = dbt_virtual.physical_schema_for_node(model) -%}
+  {%- set node_loc = dbt_virtual.node_location(model) -%}
   {%- set env_name = dbt_virtual.get_current_env() -%}
   {%- set schema_key = dbt_virtual.node_schema_key(model) -%}
   {%- set env_schema = dbt_virtual.env_schema_for(env_name, schema_key) -%}
@@ -305,12 +289,16 @@
   {%- endif -%}
   {%- set release_id = var('_dbt_virtual_release', '') -%}
 
-  {%- do dbt_virtual.ensure_registry() -%}
+  {%- do dbt_virtual.ensure_registry(node_loc) -%}
 
   {%- set existing_env_rel = adapter.get_relation(database=this.database, schema=env_schema, identifier=model.name) -%}
   {%- if existing_env_rel is none and adapter.check_schema_exists is defined and not adapter.check_schema_exists(this.database, env_schema) -%}
     {#- Unmapped environments (`pr_42` -> `<base_schema>_pr_42`) may not have a schema yet. -#}
-    {%- do adapter.create_schema(api.Relation.create(database=this.database, schema=env_schema)) -%}
+    {%- if dbt_virtual.create_location_for(node_loc) is not none -%}
+      {%- do dbt_virtual.exec_sql_statement(dbt_virtual.create_schema_if_not_exists_sql(env_schema, dbt_virtual.create_location_for(node_loc))) -%}
+    {%- else -%}
+      {%- do adapter.create_schema(api.Relation.create(database=this.database, schema=env_schema)) -%}
+    {%- endif -%}
   {%- endif -%}
   {%- set drop_legacy_tbl_stmt = '' -%}
   {%- if existing_env_rel is not none and existing_env_rel.type is defined and existing_env_rel.type == 'table' -%}
@@ -408,12 +396,12 @@
   -#}
   {%- if execute and dbt_virtual.is_virtual_node(node) -%}
     {%- set cfg = dbt_virtual.get_config() -%}
-    {%- set phys_schema = cfg.get('physical_schema') -%}
+    {%- set phys_schema = dbt_virtual.physical_schema_for_node(node) -%}
     {%- set env_name = dbt_virtual.get_current_env() -%}
     {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
     {%- set fp = dbt_virtual.get_fingerprint(node) -%}
     {%- set release_id = var('_dbt_virtual_release', '') -%}
-    {%- do dbt_virtual.ensure_registry() -%}
+    {%- do dbt_virtual.ensure_registry(dbt_virtual.node_location(node)) -%}
 
     {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) -%}
     {%- set params_sig = dbt_virtual.node_attr(node_cfg, 'parameters', '') -%}
@@ -496,4 +484,38 @@
       {%- endif %}
     {%- endcall -%}
   {%- endif -%}
+{%- endmacro %}
+
+
+{% macro seed_registry_info(phys_schema, base_env) -%}
+  {#- What `seed_incremental_clones` needs from one registry: the physical table `base_env` points
+      at per model, and the tables some environment or release points at, i.e. written by a build
+      that finished. -#}
+  {%- set base_query -%}
+    SELECT model_name, physical_identifier
+    FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
+    WHERE environment = '{{ base_env }}'
+      AND resource_type = 'model'
+  {%- endset -%}
+  {%- set base_rows = run_query(base_query) -%}
+  {%- set base_map = {} -%}
+  {%- if base_rows -%}
+    {%- for row in base_rows.rows -%}
+      {%- do base_map.update({row[0]: row[1]}) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set registered_query -%}
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }} WHERE resource_type = 'model'
+    {{ 'UNION DISTINCT' if target.type == 'bigquery' else 'UNION' }}
+    SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
+  {%- endset -%}
+  {%- set registered_rows = run_query(registered_query) -%}
+  {%- set registered = [] -%}
+  {%- if registered_rows -%}
+    {%- for row in registered_rows.rows -%}
+      {%- do registered.append(row[0].split('.')[-1]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{ return({'base_map': base_map, 'registered': registered}) }}
 {%- endmacro %}

@@ -2,6 +2,8 @@
   {%- set defaults = {
     'enabled': true,
     'physical_schema': 'dbt_virtual_physical',
+    'physical_schemas_by_location': {},
+    'schema_locations': {},
     'environment': target.name,
     'base_environment': 'prod',
     'ref_resolution': 'env_view',
@@ -49,7 +51,7 @@
   {%- if obj[key] is defined -%}
     {{ return(obj[key]) }}
   {%- endif -%}
-  {%- if key == 'virtual_env' or key == 'virtual_env_epoch' or key == 'parameters' or key == 'returns' -%}
+  {%- if key == 'virtual_env' or key == 'virtual_env_epoch' or key == 'virtual_location' or key == 'parameters' or key == 'returns' -%}
     {%- set extra = dbt_virtual.node_attr(obj, '_extra', {}) -%}
     {%- if extra is mapping and key in extra -%}
       {{ return(extra.get(key, default)) }}
@@ -129,7 +131,10 @@
     {{ return(mapping) }}
   {%- endif -%}
   {%- set base_env = cfg.get('base_environment', 'prod') -%}
-  {%- set base_schema = dbt_virtual.env_schema_for(base_env, none) if (base_env in env_schemas and base_env != active_env) else target.schema -%}
+  {#- With `schema_locations` (multi-region), an unmapped environment keeps one schema per base
+      schema, so an object stays in the location of its base schema. -#}
+  {%- set per_key = (cfg.get('schema_locations', {}) or {}) | length > 0 -%}
+  {%- set base_schema = dbt_virtual.env_schema_for(base_env, (key if per_key else none)) if (base_env in env_schemas and base_env != active_env) else target.schema -%}
   {%- set env_suffix = modules.re.sub('[^0-9A-Za-z_]', '_', active_env | string) if modules is defined else (active_env | string) -%}
   {{ return(base_schema ~ '_' ~ env_suffix) }}
 {%- endmacro %}
