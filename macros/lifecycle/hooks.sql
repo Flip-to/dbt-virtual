@@ -275,6 +275,7 @@
 {% macro sync_env_view() -%}
   {#-
     Post-hook for virtualized table/incremental models:
+    For virtualized `view` models, only registers the view (see `register_view_deployment`).
     1. Creates/updates the virtual view `<env_schema>.<model_name>` -> `SELECT * FROM <this>`.
     2. Upserts the environment pointer in `<physical_schema>._environments`.
     3. Records the release entry in `<physical_schema>._releases` when `_dbt_virtual_release` is set.
@@ -285,6 +286,11 @@
 
   {%- set node_cfg = dbt_virtual.node_attr(model, 'config', {}) -%}
   {%- set mat = dbt_virtual.node_attr(node_cfg, 'materialized', '') -%}
+  {%- if mat == 'view' -%}
+    {#- A virtual view is built in the environment schema by dbt; record it so promote, rollback
+        and init-env can create it in other environments. -#}
+    {{ return(dbt_virtual.register_view_deployment(model, this)) }}
+  {%- endif -%}
   {%- if mat not in ['table', 'incremental'] -%}
     {{ return('') }}
   {%- endif -%}
@@ -496,4 +502,82 @@
       {%- endif %}
     {%- endcall -%}
   {%- endif -%}
+{%- endmacro %}
+
+
+{% macro register_view_deployment(node, target_relation, body_sql=none) -%}
+  {#-
+    Returns the SQL (for a post-hook) that records a virtual `view` model in `_environments` (and
+    `_releases` when a release is being built) with a `CREATE OR REPLACE VIEW` template, which
+    `virtual_promote` / `virtual_rollback` / `virtual_init_env` replay in other environments.
+    References to virtual objects in the template are per-object placeholders, resolved per target
+    environment (see `env_placeholders_sql`). `resource_type` is `view`.
+  -#}
+  {%- if not execute or not dbt_virtual.is_virtual_node(node) -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set cfg = dbt_virtual.get_config() -%}
+  {%- set phys_schema = cfg.get('physical_schema') -%}
+  {%- set env_name = dbt_virtual.get_current_env() -%}
+  {%- set schema_key = dbt_virtual.node_schema_key(node) -%}
+  {%- set fp = dbt_virtual.get_fingerprint(node) -%}
+  {%- set release_id = var('_dbt_virtual_release', '') -%}
+  {%- do dbt_virtual.ensure_registry() -%}
+
+  {%- set body = body_sql if body_sql is not none else (dbt_virtual.node_attr(node, 'compiled_code', '') or dbt_virtual.node_attr(node, 'compiled_sql', '')) -%}
+  {%- set body = (body | string | trim).rstrip(';') -%}
+  {%- if body == '' -%}
+    {{ exceptions.raise_compiler_error("dbt-virtual: no compiled SQL available to register view '" ~ dbt_virtual.node_attr(node, 'name', '') ~ "'.") }}
+  {%- endif -%}
+  {%- set ddl = 'CREATE OR REPLACE VIEW ' ~ target_relation ~ ' AS\n' ~ body -%}
+  {%- set ddl_template = dbt_virtual.env_placeholders_sql(ddl, env_name) -%}
+  {%- set phys_ident = target_relation.schema ~ '.' ~ target_relation.identifier -%}
+
+  {%- set sql_statements -%}
+    {{ dbt_virtual.upsert_environment_pointer_sql(
+      phys_schema,
+      env_name,
+      node.name,
+      'view',
+      fp,
+      phys_ident,
+      release_id,
+      schema_key
+    ) }};
+
+    {%- if release_id != '' %}
+    INSERT INTO {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} (
+      release_id,
+      source_environment,
+      target_environment,
+      model_name,
+      resource_type,
+      dependency_tier,
+      fingerprint,
+      physical_identifier,
+      routine_ddl_template,
+      status,
+      created_at,
+      promoted_at,
+      rolled_back_at,
+      schema_key
+    ) VALUES (
+      '{{ release_id }}',
+      '{{ env_name }}',
+      NULL,
+      '{{ node.name }}',
+      'view',
+      2,
+      '{{ fp }}',
+      '{{ phys_ident }}',
+      {{ dbt_virtual.sql_string_literal(ddl_template) }},
+      'candidate',
+      {{ dbt_virtual.current_timestamp_sql() }},
+      NULL,
+      NULL,
+      {{ dbt_virtual.sql_nullable_literal(schema_key) }}
+    );
+    {%- endif %}
+  {%- endset -%}
+  {{ return(sql_statements) }}
 {%- endmacro %}

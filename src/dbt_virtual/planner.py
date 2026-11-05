@@ -6,6 +6,7 @@ Replicates SQLMesh's core plan/diff engine on top of dbt manifests and warehouse
    - `SEED_INCREMENTAL` — new fingerprint for an incremental model with a `prod` base table to `CLONE`
    - `FULL_BUILD`       — new table model or incremental model with no base table
    - `ROUTINE_DEPLOY`   — new/modified UDF, TVF, or stored procedure
+   - `VIEW_DEPLOY`      — new/modified `view` model (no physical table; REUSE when unchanged)
 2. Performs column-level schema compatibility analysis (`NON_BREAKING` vs `BREAKING`) between
    environments or manifest versions to warn before promotion.
 """
@@ -22,6 +23,7 @@ from dbt_virtual.fingerprint import (
 )
 
 ROUTINE_TYPES = set(ROUTINE_MATERIALIZATIONS)
+VIEW_TYPES = {"view"}
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,7 @@ class NodePlanAction:
     materialized: str
     fingerprint: str
     physical_identifier: str
-    action: str  # REUSE | SEED_INCREMENTAL | FULL_BUILD | ROUTINE_DEPLOY
+    action: str  # REUSE | SEED_INCREMENTAL | FULL_BUILD | ROUTINE_DEPLOY | VIEW_DEPLOY
     reason: str
     base_fingerprint: str | None = None
 
@@ -190,7 +192,17 @@ def classify_plan_actions(
         base_fp = base_map.get(fp_obj.name) or env_map.get(fp_obj.name)
         mat = fp_obj.materialized
 
-        if mat in ROUTINE_TYPES:
+        if mat in VIEW_TYPES:
+            # A view has no physical table: it is registered with a DDL template, like a routine.
+            if not full_refresh and env_map.get(fp_obj.name) == fp_obj.fingerprint:
+                action = "REUSE"
+                reason = "View fingerprint already active in target environment"
+            else:
+                action = "VIEW_DEPLOY"
+                reason = (
+                    "View SQL or upstream changed" if base_fp else "New virtualized view"
+                )
+        elif mat in ROUTINE_TYPES:
             if not full_refresh and env_map.get(fp_obj.name) == fp_obj.fingerprint:
                 action = "REUSE"
                 reason = "Routine fingerprint already active in target environment"
@@ -239,7 +251,7 @@ def classify_plan_actions(
 
 def compute_dbt_select_for_build(actions: dict[str, NodePlanAction]) -> tuple[list[str], dict[str, str]]:
     """Split planned actions into:
-    1. `models_to_build`: model names requiring `dbt build` (`SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`)
+    1. `models_to_build`: model names requiring `dbt build` (`SEED_INCREMENTAL`, `FULL_BUILD`, `ROUTINE_DEPLOY`, `VIEW_DEPLOY`)
     2. `reused_models`: mapping of `model_name -> fingerprint` for `REUSE` table/incremental models
        that only need a zero-compute view pointer sync.
     """
