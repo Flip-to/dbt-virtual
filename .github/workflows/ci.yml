@@ -38,6 +38,24 @@ jobs:
       - name: Run unit tests
         run: uv run --python ${{ matrix.python-version }} pytest -v
 
+  dbt-parse-warehouses:
+    name: dbt parse with the package on BigQuery & Snowflake (fake credentials)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-suffix: parse-3.11
+          python-version: "3.11"
+      - name: Sync dependencies
+        run: uv sync --extra dev --python 3.11
+      - name: dbt parse on BigQuery and Snowflake profiles (no connection needed)
+        # Skips silently if an adapter cannot be installed, so fail the job on skips.
+        run: uv run --python 3.11 pytest -v -rs tests/test_dbt_parse_warehouses.py
+        env:
+          DBT_VIRTUAL_REQUIRE_PARSE_ADAPTERS: "1"
+
   emulator-e2e:
     name: BigQuery Emulator E2E (Flip-to/bigquery-emulator)
     runs-on: ubuntu-24.04
