@@ -192,7 +192,12 @@
     FROM {{ dbt_virtual.registry_relation(phys_schema, '_environments') }}
     WHERE environment IN ('{{ env }}', '{{ base_env }}')
   {%- endset -%}
-  {%- set env_rows = run_query(env_query) -%}
+  {#- A project that has never built or promoted has no registry (and maybe no physical schema):
+      report empty state instead of failing on the missing relation. -#}
+  {%- set schema_exists = adapter.check_schema_exists(target.database, phys_schema) -%}
+  {%- set registry_exists = schema_exists and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_environments') is not none
+      and adapter.get_relation(database=target.database, schema=phys_schema, identifier='_releases') is not none -%}
+  {%- set env_rows = run_query(env_query) if registry_exists else none -%}
 
   {%- set env_state = {} -%}
   {%- set base_env_state = {} -%}
@@ -207,7 +212,7 @@
     {%- endfor -%}
   {%- endif -%}
 
-  {%- set tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(phys_schema)) -%}
+  {%- set tbl_rows = run_query(dbt_virtual.list_physical_tables_sql(phys_schema)) if schema_exists else none -%}
   {%- set existing_tables = [] -%}
   {%- if tbl_rows -%}
     {%- for r in tbl_rows.rows -%}
@@ -222,7 +227,7 @@
     UNION DISTINCT
     SELECT DISTINCT physical_identifier FROM {{ dbt_virtual.registry_relation(phys_schema, '_releases') }} WHERE resource_type = 'model'
   {%- endset -%}
-  {%- set registered_rows = run_query(registered_query | replace('UNION DISTINCT', 'UNION') if target.type != 'bigquery' else registered_query) -%}
+  {%- set registered_rows = run_query(registered_query | replace('UNION DISTINCT', 'UNION') if target.type != 'bigquery' else registered_query) if registry_exists else none -%}
   {%- set registered_tables = [] -%}
   {%- if registered_rows -%}
     {%- for r in registered_rows.rows -%}
