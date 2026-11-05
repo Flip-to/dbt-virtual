@@ -115,6 +115,25 @@
 {%- endmacro %}
 
 
+{% macro env_view_column_docs(node) -%}
+  {#- `{column: {name, description}}` to persist on an env view: only with `persist_docs.columns`. -#}
+  {%- set described = {} -%}
+  {%- if node is not none -%}
+    {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
+    {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
+    {%- if persist is mapping and persist.get('columns') -%}
+      {%- for col_name, col in (dbt_virtual.node_attr(node, 'columns', {}) or {}).items() -%}
+        {%- set col_description = dbt_virtual.node_attr(col, 'description', '') -%}
+        {%- if col_description -%}
+          {%- do described.update({col_name: {'name': col_name, 'description': col_description}}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {{ return(described) }}
+{%- endmacro %}
+
+
 {% macro apply_env_view_metadata(view_relation, node) -%}
   {#- Metadata that `CREATE VIEW` cannot carry. BigQuery: column descriptions, set the way
       dbt-bigquery's own view materialization does (`adapter.update_columns`). -#}
@@ -128,19 +147,9 @@
   {%- if node is none -%}
     {{ return('') }}
   {%- endif -%}
-  {%- set node_cfg = dbt_virtual.node_attr(node, 'config', {}) or {} -%}
-  {%- set persist = dbt_virtual.node_attr(node_cfg, 'persist_docs', {}) -%}
-  {%- if persist is mapping and persist.get('columns') -%}
-    {%- set described = {} -%}
-    {%- for col_name, col in (dbt_virtual.node_attr(node, 'columns', {}) or {}).items() -%}
-      {%- set col_description = dbt_virtual.node_attr(col, 'description', '') -%}
-      {%- if col_description -%}
-        {%- do described.update({col_name: {'name': col_name, 'description': col_description}}) -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- if described -%}
-      {%- do adapter.update_columns(view_relation, described) -%}
-    {%- endif -%}
+  {%- set described = dbt_virtual.env_view_column_docs(node) -%}
+  {%- if described -%}
+    {%- do adapter.update_columns(view_relation, described) -%}
   {%- endif -%}
 {%- endmacro %}
 

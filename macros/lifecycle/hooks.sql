@@ -204,14 +204,23 @@
     type='view'
   ) -%}
 
-  {#- Create the view now (not in the returned hook SQL): its column descriptions are set through
-      the adapter, which needs the view to exist. -#}
-  {%- if existing_env_rel is not none and existing_env_rel.type is defined and existing_env_rel.type == 'table' -%}
-    {%- do dbt_virtual.exec_sql_statement(dbt_virtual.drop_object_if_exists_sql(existing_env_rel, 'table')) -%}
+  {#- Column descriptions are set through the adapter, which needs the view to exist: only then
+      create the view now. Otherwise the view DDL stays in the returned hook SQL. -#}
+  {%- set create_now = target.type == 'bigquery' and (dbt_virtual.env_view_column_docs(model) | length) > 0 -%}
+  {%- if create_now -%}
+    {%- if (drop_legacy_tbl_stmt | trim) != '' -%}
+      {%- do dbt_virtual.exec_sql_statement(drop_legacy_tbl_stmt) -%}
+    {%- endif -%}
+    {%- do dbt_virtual.create_env_view(view_rel, this, model, phys_schema, []) -%}
+  {%- else -%}
+    {%- do dbt_virtual.finalize_env_view(view_rel, model, phys_schema, []) -%}
   {%- endif -%}
-  {%- do dbt_virtual.create_env_view(view_rel, this, model, phys_schema, []) -%}
 
   {%- set sql_statements -%}
+    {%- if not create_now -%}
+    {{ drop_legacy_tbl_stmt }}{{ dbt_virtual.create_or_replace_view_sql(view_rel, this, model) }};
+    {%- endif %}
+
     {{ dbt_virtual.upsert_environment_pointer_sql(
       phys_schema,
       env_name,
