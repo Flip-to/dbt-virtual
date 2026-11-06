@@ -143,7 +143,7 @@ dbt-virtual diff-data --from staging --to prod --release v2026.11.05 \
 | `--where` / `--window-days` | none | Bound both sides (`--window-days N` keeps the last N days of the partition column). |
 | `--format` | `text` | `json` prints the summary that the macro logs as `DBT_VIRTUAL_DIFF_JSON:{...}`. |
 
-Per-model config (in `config()` or `meta`): `unique_key` or `diff_key` (the key bisected on and joined on; ranges need a numeric key), `diff_exclude_columns`, `diff_where`, `diff_window_days`, and `diff_partition_by` (`{field, data_type}`) when `partition_by` is not set (BigQuery's `partition_by` is used otherwise). A model without a key is checksummed per segment only: it is reported as differing with an upper bound, without row detail.
+Per-model config (in `config()` or `meta`): `unique_key` or `diff_key` (a string or a list: every entry is joined on, so composite keys work; range bisection uses the first numeric entry, e.g. `id` for `[event_date, id]`; with no numeric entry the differing segments are joined whole, which is slower on big partitions; the summary reports `bisect_key`), `diff_exclude_columns`, `diff_where`, `diff_window_days`, and `diff_partition_by` (`{field, data_type}`) when `partition_by` is not set (BigQuery's `partition_by` is used otherwise). A model without a key is checksummed per segment only: it is reported as differing with an upper bound, without row detail.
 
 `promote --data-diff [--max-mismatch-pct X]` runs the same diff against `--to` after the audit and before repointing anything; above the threshold the promotion stops.
 
@@ -154,7 +154,7 @@ Cost: see "Data diff" in [How it works](how_it_works.md).
 ### `dbt-virtual promote`
 Executes zero-rebuild promotion from `--from` (`staging`) to `--to` (`prod`):
 1. Compiles the project for `--to` and passes the expected fingerprints to `virtual_promote` (see the guards below).
-2. Takes the lease lock on `--to` in `_locks` (skip with `--no-lock`); it is released when the promote finishes or is refused.
+2. Takes the lease lock on `--to` in `_locks` (skip with `--no-lock`); it is released when the promote finishes, is refused or fails (the CLI releases it after a failed run-operation, so a retry needs no `--no-lock`).
 3. **Refuses, before changing anything**, a release that is partial, unsealed or built from other code (guards below).
 4. Runs `virtual_audit` (row counts and, on BigQuery, partition coverage) when `--audit` is on; it is on by default when `--to` is the base environment.
 5. Verifies all physical tables of the release exist in `physical_schema`.
@@ -197,7 +197,7 @@ dbt-virtual promote \
 ---
 
 ### `dbt-virtual rollback`
-Instantly repoints all views and redeploys all routines in `--env` (`prod`) to the target release (or the previous promoted release if `--to-release` is omitted). It takes the same lease lock as `promote` (`--no-lock`, `--lock-owner`) and first checks that every physical table of the target release still exists, failing before any change if `gc` dropped one. Undone releases are marked `rolled_back`, so running it again goes one more release back:
+Instantly repoints all views and redeploys all routines in `--env` (`prod`) to the target release (or the previous promoted release if `--to-release` is omitted). It takes the same lease lock as `promote` (`--no-lock`, `--lock-owner`) and first checks that every physical table of the target release still exists, failing before any change if `gc` dropped one. A legacy table left at the environment path by `adopt --keep-existing-table` is replaced by the view; the lock is released if the rollback fails. Undone releases are marked `rolled_back`, so running it again goes one more release back:
 
 ```bash
 # Roll back prod to the immediately preceding release
