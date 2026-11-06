@@ -1,5 +1,5 @@
 ---
-# dbt-virtual-0034
+# dbt-virtual-0035
 title: 'Emulator E2E for BigQuery clone chains (depth query, COPY at depth 3)'
 status: in-progress
 type: task
