@@ -127,7 +127,9 @@ jobs:
           DBT_VIRTUAL_BQ_EMULATOR_PROJECT: "test-project"
           # A missing adapter or emulator fails the job instead of skipping the tests.
           DBT_VIRTUAL_REQUIRE_BQ_EMULATOR: "1"
-        run: uv run --python 3.11 pytest -v -rs -n 4 --dist load tests/test_dbt_bigquery_emulator_e2e.py
+        # Serial: with -n 4 the shared emulator timed out ("read tcp ... i/o timeout") on PRs #31 and #32
+        # (2026-11-06), so parallel dbt-bigquery workers overload a single emulator instance.
+        run: uv run --python 3.11 pytest -v -rs tests/test_dbt_bigquery_emulator_e2e.py
 
   snowflake-and-postgres-e2e:
     name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E
