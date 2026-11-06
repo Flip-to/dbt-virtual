@@ -61,6 +61,9 @@ jobs:
   emulator-e2e:
     name: BigQuery Emulator E2E (Flip-to/bigquery-emulator)
     runs-on: ubuntu-24.04
+    env:
+      # The emulator branch the image is built from.
+      BQEMU_BRANCH: flipto/main
     steps:
       - uses: actions/checkout@v5
         with:
@@ -75,7 +78,7 @@ jobs:
       - name: Resolve Flip-to/bigquery-emulator revision
         id: bqemu_rev
         run: |
-          REV=$(git ls-remote https://github.com/Flip-to/bigquery-emulator.git refs/heads/flipto/main | cut -f1)
+          REV=$(git ls-remote https://github.com/Flip-to/bigquery-emulator.git refs/heads/${BQEMU_BRANCH} | cut -f1)
           echo "rev=${REV}" >> "$GITHUB_OUTPUT"
       - name: Cache Flip-to/bigquery-emulator Docker image
         id: bqemu_cache
@@ -118,6 +121,13 @@ jobs:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_concurrency_upgrade_e2e.py
+      - name: Real dbt-core + dbt-bigquery E2E (dbt-virtual lifecycle on the emulator)
+        env:
+          DBT_VIRTUAL_BQ_EMULATOR: "http://127.0.0.1:9050"
+          DBT_VIRTUAL_BQ_EMULATOR_PROJECT: "test-project"
+          # A missing adapter or emulator fails the job instead of skipping the tests.
+          DBT_VIRTUAL_REQUIRE_BQ_EMULATOR: "1"
+        run: uv run --python 3.11 pytest -v -rs -n 4 --dist load tests/test_dbt_bigquery_emulator_e2e.py
 
   snowflake-and-postgres-e2e:
     name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E

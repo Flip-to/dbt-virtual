@@ -45,6 +45,8 @@ tests/
   test_dbt_duckdb_adopt_objects.py # Real dbt-duckdb: adopt registers deployed views and routines
   test_dbt_duckdb_small_gaps.py # Real dbt-duckdb: `ref_resolution` validation, `status` without a registry
   test_dbt_parse_warehouses.py # `dbt parse` on BigQuery/Snowflake profiles with fake credentials (uv; skipped offline)
+  test_dbt_bigquery_emulator_e2e.py # Real dbt-core + dbt-bigquery lifecycle against the BigQuery emulator (needs DBT_VIRTUAL_BQ_EMULATOR; skipped otherwise)
+  bq_emulator_project.py      # Helper: throwaway dbt project + profile (`api_endpoint`) for the emulator tests
   test_sqlmesh_parity_fixes.py # Gaps found by comparing with SQLMesh (unregistered tables, DAG-depth deploy order, GC-ed rollback)
   test_require_cli_fingerprints.py # `require_cli_fingerprints` guard against bare dbt runs
   test_check_docs_layout.py   # Unit tests for docs/tech-debt/decision/bean layout guard
@@ -67,6 +69,7 @@ Python dependencies and tests are managed with **uv**:
 ```bash
 uv run pytest -q                                              # Run all unit, property-based and real-dbt tests (about 30 min; the real-dbt files dominate)
 uv run pytest tests/test_dbt_parse_warehouses.py -v            # dbt parse on BigQuery/Snowflake (needs uv and network to install the adapters)
+DBT_VIRTUAL_BQ_EMULATOR=http://127.0.0.1:9050 uv run --extra emulator pytest -n 4 tests/test_dbt_bigquery_emulator_e2e.py   # real dbt-bigquery on a running emulator (9 min on 4 workers, 2026-11-05)
 uv run ruff check src tests scripts                           # Lint Python code
 uv run python scripts/check_docs_layout.py                    # Check docs, tech debt, decisions & beans
 uv run python scripts/check_docs_layout.py --write-index      # Regenerate README.md indexes in docs/
@@ -81,7 +84,7 @@ uv run --with zensical zensical build --clean --strict        # Build GitHub Pag
 - **Hybrid Packaging**: Every lifecycle operation works both via the `dbt-virtual` Python CLI (`plan`, `build`, `run`, `diff`, `audit`, `promote`, `rollback`, `status`, `adopt`, `init-env`, `drop-env`, `gc`) and via `dbt run-operation` macros (`docs/decisions/20261027_hybrid_package_and_bigquery_first.md`).
 - **CLI flags**: `plan` and `build` take `--target` (dbt profile target, default the `--env` name) and `--vars` (JSON extra dbt vars); `build` also takes `--defer` / `--state`; `promote`, `audit` and `rollback` take `--no-lock` / `--lock-owner` (lease lock in `_locks`). `run --env <env>` refreshes an environment's unchanged table/incremental models in place and refuses a changed fingerprint unless `--allow-changes`.
 - **Environments, views and guards** (`docs/specs/20261105_multi_dataset_envs_views_run_and_guards.md`): `env_schemas.<env>` may map each custom schema to its own dataset (`schema_key` in the registry); virtual views are registered and promoted like routines; `ref_resolution` accepts `env_view`, `physical`, `hybrid` only (`explicit` is rejected); `require_cli_fingerprints` blocks bare `dbt run` of virtual tables; `adopt` registers deployed tables, views and routines.
-- **Multi-Emulator CI**: We test end-to-end SQL execution against `Flip-to/bigquery-emulator`, `nnnkkk7/snowflake-emulator`, `postgres:16-alpine`, and real `dbt-core` + `dbt-duckdb` in `.github/workflows/ci.yml`; a `dbt parse` job runs the package against BigQuery and Snowflake profiles with fake credentials. `scripts/run_bigquery_sandbox_e2e.py` is an opt-in run against real BigQuery.
+- **Multi-Emulator CI**: We test end-to-end SQL execution against `Flip-to/bigquery-emulator`, `nnnkkk7/snowflake-emulator`, `postgres:16-alpine`, real `dbt-core` + `dbt-duckdb`, and real `dbt-core` + `dbt-bigquery` on the BigQuery emulator (`tests/test_dbt_bigquery_emulator_e2e.py`, gated on the emulator fixes in bean 0031) in `.github/workflows/ci.yml`; a `dbt parse` job runs the package against BigQuery and Snowflake profiles with fake credentials. `scripts/run_bigquery_sandbox_e2e.py` is an opt-in run against real BigQuery.
 
 ## Agent Skills (`.claude/skills/`)
 
