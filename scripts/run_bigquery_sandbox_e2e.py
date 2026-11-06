@@ -29,7 +29,13 @@ and `extended_cross_location`): `authorize_env_views`, env view description / la
 descriptions, `diff-data` on partitioned tables (with bytes billed per query read from
 INFORMATION_SCHEMA.JOBS_BY_USER), the partition coverage audit, `gc --expire-env-days`, and
 promote-by-clone between two datasets that stand for two "locations". `--only-extended` skips the
-base lifecycle. Cross-PROJECT clone needs a second project and is not exercised here.
+base lifecycle.
+
+`--xproject` runs promote-by-clone across two GCP PROJECTS (`--project` acts as CI,
+`--prod-project` / DBT_VIRTUAL_SBX_PROD_PROJECT as prod; both datasets' location must be the
+same): see `extended_cross_project`. Datasets with the sandbox prefix are created and dropped in
+both projects; nothing else is touched. Bytes billed per step are read from
+INFORMATION_SCHEMA.JOBS_BY_USER of each project.
 """
 
 from __future__ import annotations
@@ -153,6 +159,17 @@ class Sandbox:
 
         self.bq = bigquery
         self.client = bigquery.Client(project=self.project, location=self.location)
+        self.prod_project = getattr(ns, "prod_project", None)
+        self.clients = {self.project: self.client}
+        if self.prod_project and self.prod_project != self.project:
+            self.clients[self.prod_project] = bigquery.Client(
+                project=self.prod_project, location=self.location)
+        # dataset key -> project, for keys that live outside `self.project` (--xproject)
+        self.key_project: dict[str, str] = {}
+        self.step_windows: list[tuple[str, datetime, datetime]] = []
+
+    def pj(self, key: str) -> str:
+        return self.key_project.get(key, self.project)
 
     # ---------------------------------------------------------------- setup / teardown
     def write_project(self) -> None:
@@ -237,21 +254,28 @@ models:
         for name, sql in models.items():
             (self.proj / "models" / f"{name}.sql").write_text(sql, encoding="utf-8")
 
+    def sandbox_datasets_by_project(self) -> dict[str, list[str]]:
+        return {
+            project: sorted(
+                ds.dataset_id
+                for ds in client.list_datasets(project=project)
+                if ds.dataset_id == self.sbx or ds.dataset_id.startswith(self.sbx + "_")
+            )
+            for project, client in self.clients.items()
+        }
+
     def sandbox_datasets(self) -> list[str]:
-        return sorted(
-            ds.dataset_id
-            for ds in self.client.list_datasets(project=self.project)
-            if ds.dataset_id == self.sbx or ds.dataset_id.startswith(self.sbx + "_")
-        )
+        return sorted(d for ids in self.sandbox_datasets_by_project().values() for d in ids)
 
     def cleanup(self) -> list[str]:
         dropped = []
-        for dataset_id in self.sandbox_datasets():
-            assert dataset_id.startswith(SANDBOX_PREFIX)
-            self.client.delete_dataset(
-                f"{self.project}.{dataset_id}", delete_contents=True, not_found_ok=True
-            )
-            dropped.append(dataset_id)
+        for project, ids in self.sandbox_datasets_by_project().items():
+            for dataset_id in ids:
+                assert dataset_id.startswith(SANDBOX_PREFIX)
+                self.clients[project].delete_dataset(
+                    f"{project}.{dataset_id}", delete_contents=True, not_found_ok=True
+                )
+                dropped.append(dataset_id)
         return dropped
 
     # ---------------------------------------------------------------- process helpers
@@ -259,9 +283,11 @@ models:
              expect_ok: bool | None) -> subprocess.CompletedProcess:
         self.step_no += 1
         t0 = time.time()
+        w0 = datetime.now(timezone.utc)
         res = subprocess.run(
             cmd, cwd=self.proj, env=self.env, capture_output=True, text=True, check=False
         )
+        self.step_windows.append((label, w0, datetime.now(timezone.utc)))
         out = (res.stdout or "") + (res.stderr or "")
         safe = "".join(c if c.isalnum() or c in "-." else "_" for c in label)[:60]
         log = self.logs / f"{self.step_no:02d}_{safe}.log"
@@ -294,27 +320,28 @@ models:
         return [dict(r.items()) for r in self.client.query(sql).result()]
 
     def fq(self, key: str, name: str) -> str:
-        return f"`{self.project}`.`{self.ds[key]}`.`{name}`"
+        return f"`{self.pj(key)}`.`{self.ds[key]}`.`{name}`"
 
     def objects(self, key: str) -> dict[str, str] | None:
         from google.api_core.exceptions import NotFound
 
-        ref = f"{self.project}.{self.ds[key]}"
+        ref = f"{self.pj(key)}.{self.ds[key]}"
+        client = self.clients[self.pj(key)]
         try:
-            found = {t.table_id: t.table_type for t in self.client.list_tables(ref)}
-            found.update({r.routine_id: r.type_ for r in self.client.list_routines(ref)})
+            found = {t.table_id: t.table_type for t in client.list_tables(ref)}
+            found.update({r.routine_id: r.type_ for r in client.list_routines(ref)})
         except NotFound:
             return None
         return found
 
     def view_target(self, key: str, name: str) -> str:
-        return self.client.get_table(f"{self.project}.{self.ds[key]}.{name}").view_query
+        return self.clients[self.pj(key)].get_table(f"{self.pj(key)}.{self.ds[key]}.{name}").view_query
 
     def routine_body(self, key: str, name: str) -> str:
-        return self.client.get_routine(f"{self.project}.{self.ds[key]}.{name}").body
+        return self.clients[self.pj(key)].get_routine(f"{self.pj(key)}.{self.ds[key]}.{name}").body
 
-    def registry(self, table: str, where: str) -> list[dict]:
-        return self.q(f"SELECT * FROM {self.fq('physical', table)} WHERE {where}")
+    def registry(self, table: str, where: str, key: str = "physical") -> list[dict]:
+        return self.q(f"SELECT * FROM {self.fq(key, table)} WHERE {where}")
 
     def fingerprints(self) -> dict[str, str]:
         data = json.loads((self.proj / ".dbt_virtual" / "fingerprints.json").read_text("utf-8"))
@@ -605,7 +632,8 @@ def facts_sql(version: int, rpf: bool) -> str:
 
 
 def ext_project(sb: Sandbox, name: str, ds: dict[str, str], extra_vars: dict,
-                models: dict[str, str], schema_yml: str = "") -> None:
+                models: dict[str, str], schema_yml: str = "",
+                target_projects: dict[str, str] | None = None) -> None:
     """Create a dbt project `name` next to the base one and make it the sandbox's current project."""
     proj = sb.root / name
     (proj / "models").mkdir(parents=True)
@@ -644,9 +672,10 @@ models:
 """, encoding="utf-8")
     outputs = ""
     for target, dataset in (("staging", ds["staging"]), ("prod", ds["prod"])):
+        tproject = (target_projects or {}).get(target, sb.project)
         outputs += (
             f"    {target}:\n      type: bigquery\n      method: oauth\n"
-            f"      project: {sb.project}\n      dataset: {dataset}\n"
+            f"      project: {tproject}\n      dataset: {dataset}\n"
             f"      location: {sb.location}\n      threads: {sb.threads}\n"
             "      priority: interactive\n      job_retries: 1\n"
             "      job_execution_timeout_seconds: 600\n"
@@ -1015,6 +1044,239 @@ def extended_cross_location(sb: Sandbox) -> None:
 
 
 
+IAM_PROBE_PERMISSIONS = [
+    "bigquery.jobs.create", "bigquery.jobs.list", "bigquery.datasets.create", "bigquery.datasets.get",
+    "bigquery.datasets.update", "bigquery.datasets.delete", "bigquery.tables.create",
+    "bigquery.tables.get", "bigquery.tables.getData", "bigquery.tables.list",
+    "bigquery.tables.updateData", "bigquery.tables.delete", "bigquery.routines.create",
+    "bigquery.routines.get", "bigquery.routines.list",
+]
+
+
+def iam_probe(sb: Sandbox) -> None:
+    """Which BigQuery permissions the running identity holds in each project
+    (`projects.testIamPermissions`, read-only; project-level grants only, a dataset-level
+    grant does not show here)."""
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    session = AuthorizedSession(creds)
+    gcloud_token = None  # fallback when the ADC credential may not call Resource Manager (403)
+    print("\n=== IAM probe (project-level permissions of the running identity) ===")
+    for label, project in (("CI", sb.project), ("prod", sb.prod_project)):
+        url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{project}:testIamPermissions"
+        resp = session.post(url, json={"permissions": IAM_PROBE_PERMISSIONS})
+        if resp.status_code == 403:
+            import requests
+
+            if gcloud_token is None:
+                gcloud_token = subprocess.run(
+                    ["gcloud", "auth", "print-access-token"], capture_output=True, text=True,
+                    check=False, shell=(os.name == "nt")).stdout.strip()
+            if gcloud_token:
+                resp = requests.post(url, json={"permissions": IAM_PROBE_PERMISSIONS},
+                                     headers={"Authorization": f"Bearer {gcloud_token}"}, timeout=60)
+        granted = set(resp.json().get("permissions", [])) if resp.ok else set()
+        missing = [x for x in IAM_PROBE_PERMISSIONS if x not in granted]
+        sb.metrics.append(f"IAM {label}: HTTP {resp.status_code}; granted {len(granted)}/"
+                          f"{len(IAM_PROBE_PERMISSIONS)}; missing: {missing}")
+        print(sb.metrics[-1])
+
+
+def extended_cross_project(sb: Sandbox) -> None:
+    """Promote-by-clone from a CI project into a prod project (two `physical_locations` with
+    different `database`), against real BigQuery. `sb.project` is CI, `sb.prod_project` is prod."""
+    ci, pp = sb.project, sb.prod_project
+    assert pp and pp != ci, "--xproject needs --prod-project different from --project"
+    x = f"{sb.sbx}_x3"
+    ds = {"physical": f"{x}_phys_ci", "phys_prod": f"{x}_phys_prod", "staging": f"{x}_stg",
+          "prod": f"{x}_prod"}
+    sb.key_project = {"physical": ci, "staging": ci, "phys_prod": pp, "prod": pp}
+    locs = {"prod": {"database": pp, "schema": ds["phys_prod"]},
+            "default": {"database": ci, "schema": ds["physical"]}}
+    orders = "{{ config(materialized='table', unique_key='id') }}\nselect id, amount from {{ ref('events') }}\n"
+    tvf = ("{{ config(materialized='table_function', parameters='min_amount INT64') }}\n"
+           "select id, amount from {{ ref('orders') }} where amount >= min_amount\n")
+    udf = ("{{ config(materialized='virtual_function', parameters='x INT64', returns='INT64') }}\n"
+           "x + (select max(amount) from {{ ref('orders') }})\n")
+    ext_project(sb, "proj_x3", ds, {"physical_locations": locs},
+                {"events": EVENTS_V1, "orders": orders, "big_orders": tvf, "amt_plus": udf},
+                target_projects={"staging": ci, "prod": pp})
+    print(f"\n=== extended 3: two PROJECTS, datasets {x}_* ===")
+    iam_probe(sb)
+
+    def tables_of(project: str, dataset: str) -> dict[str, str]:
+        rows = sb.clients[project].query(
+            f"SELECT table_name, table_type FROM `{project}`.`{dataset}`.INFORMATION_SCHEMA.TABLES"
+        ).result()
+        return {r["table_name"]: r["table_type"] for r in rows}
+
+    def prod_tables() -> dict[str, str]:
+        return tables_of(pp, ds["phys_prod"])
+
+    def q_prod(sql: str) -> list[dict]:
+        return [dict(r.items()) for r in sb.clients[pp].query(sql).result()]
+
+    def ids(key: str, name: str) -> list[int]:
+        return [r["id"] for r in q_prod(f"SELECT id FROM {sb.fq(key, name)} ORDER BY id")]
+
+    def prod_routines_work() -> bool:
+        return ([r["id"] for r in q_prod(
+            f"SELECT id FROM {sb.fq('prod', 'big_orders')}(20) ORDER BY id")] == [2, 3]
+            and q_prod(f"SELECT {sb.fq('prod', 'amt_plus')}(1) AS v")[0]["v"] == 41)
+
+    sb.cli("x3 build staging b1 (CI project)", "build", "--env", "staging", "--release", "b1")
+    fp1 = dict(sb.fingerprints())
+    ci_objs = sb.objects("physical") or {}
+    sb.check("b1 built in the CI project only",
+             f"events__{fp1['events']}" in ci_objs and sb.objects("phys_prod") is None
+             and sb.objects("prod") is None, (sorted(ci_objs), sb.objects("phys_prod")))
+
+    # 1. cross-project CLONE
+    sb.cli("x3 promote b1 --source-location CI (target prod project)", "promote", "--target",
+           "prod", "--from", "staging", "--to", "prod", "--release", "b1",
+           "--source-location", f"{ci}.{ds['physical']}")
+    tabs = prod_tables()
+    sb.check("1. b1 tables in the prod project have table_type CLONE",
+             all(tabs.get(f"{m}__{fp1[m]}") == "CLONE" for m in ("events", "orders")), tabs)
+    sb.check("1. prod views (prod project) point at the clones in the prod project",
+             all(f"`{pp}`.`{ds['phys_prod']}`.`{m}__{fp1[m]}`" in sb.view_target("prod", m)
+                 and ci not in sb.view_target("prod", m) for m in ("events", "orders")),
+             sb.view_target("prod", "orders"))
+    pointers = {r["model_name"] for r in q_prod(
+        f"SELECT model_name FROM `{pp}`.`{ds['phys_prod']}`._environments WHERE environment = 'prod'")}
+    rel = q_prod(f"SELECT DISTINCT status, source_environment FROM `{pp}`.`{ds['phys_prod']}`._releases "
+                 "WHERE release_id = 'b1'")
+    sb.check("1. prod registry (prod project) holds pointers and the release rows (source = staging)",
+             pointers == {"events", "orders", "big_orders", "amt_plus"}
+             and rel == [{"status": "promoted", "source_environment": "staging"}], (pointers, rel))
+    ci_prod_rows = sb.registry("_environments", "environment = 'prod'")
+    sb.check("1. the CI registry was not written with prod pointers", ci_prod_rows == [], ci_prod_rows)
+    sb.check("1. prod rows via views", ids("prod", "orders") == [1, 2, 3] and ids("prod", "events") == [1, 2, 3])
+
+    # 2. routine templates: the project id is rewritten
+    tvf_body = sb.routine_body("prod", "big_orders")
+    udf_body = sb.routine_body("prod", "amt_plus")
+    sb.check("2. prod TVF body reads the prod project's env dataset (CI project id rewritten)",
+             f"`{pp}`.`{ds['prod']}`.`orders`" in tvf_body and ci not in tvf_body, tvf_body)
+    sb.check("2. prod UDF body reads the prod project's env dataset (CI project id rewritten)",
+             f"`{pp}`.`{ds['prod']}`.`orders`" in udf_body and ci not in udf_body, udf_body)
+    sb.check("2. prod TVF and UDF answer", prod_routines_work())
+    sb.cli("x3 promote b1 again (idempotent)", "promote", "--target", "prod", "--from", "staging",
+           "--to", "prod", "--release", "b1", "--source-location", f"{ci}.{ds['physical']}")
+    sb.check("1. idempotent: release rows not duplicated", q_prod(
+        f"SELECT COUNT(*) AS n FROM `{pp}`.`{ds['phys_prod']}`._releases WHERE release_id = 'b1'"
+    )[0]["n"] == 4)
+
+    # 3. the CI project's datasets go away
+    for key in ("physical", "staging"):
+        sb.clients[ci].delete_dataset(f"{ci}.{ds[key]}", delete_contents=True, not_found_ok=True)
+    sb.check("3. CI datasets dropped", sb.objects("physical") is None and sb.objects("staging") is None)
+    sb.check("3. prod views and routines still work after the CI datasets were dropped",
+             ids("prod", "events") == [1, 2, 3] and ids("prod", "orders") == [1, 2, 3]
+             and prod_routines_work())
+
+    # 4. CI seeds an incremental model from the prod project (clone prod -> CI)
+    sb.write_models({"events": EVENTS_V2})
+    sb.cli("x3 build staging b2 (seed from the prod project)", "build", "--env", "staging",
+           "--release", "b2")
+    fp2 = dict(sb.fingerprints())
+    rows = [(r["id"], r["v"], r["amount"]) for r in sb.q(
+        f"SELECT id, v, amount FROM {sb.fq('physical', 'events__' + fp2['events'])} ORDER BY id")]
+    sb.check("4. CI events__<fp2> = clone of the prod project's table + delta only (old values kept)",
+             rows == [(1, "a", 10), (2, "b", 25), (3, "c", 40), (4, "D", 55)], rows)
+
+    # 5. gates against prod in the other project
+    res = sb.cli("x3 diff-data b2 vs prod", "diff-data", "--from", "staging", "--to", "prod",
+                 "--release", "b2", "--format", "json", expect_ok=None)
+    dd = {mm["model"]: mm for mm in cli_json(res)["models"]} if res.returncode == 0 else {}  # type: ignore[attr-defined]
+    sb.check("5. diff-data compares b2 (CI project) with prod's tables (prod project): 1 new row each",
+             all(dd.get(n, {}).get("status") == "differs" and dd[n]["only_candidate"] == 1
+                 and dd[n]["only_target"] == 0 and dd[n]["changed"] == 0 for n in ("events", "orders")),
+             {n: (mm.get("status"), mm.get("only_candidate")) for n, mm in dd.items()})
+    res = sb.cli("x3 audit b2 vs prod", "audit", "--from", "staging", "--to", "prod",
+                 "--release", "b2", expect_ok=None)
+    sb.check("5. audit reads prod's row counts across projects",
+             "audit [events]: OK (candidate=4 rows, prod=3 rows)" in res.output,  # type: ignore[attr-defined]
+             res.output[-500:])  # type: ignore[attr-defined]
+    res = sb.cli("x3 promote b2 --data-diff --max-mismatch-pct 0 (must fail)", "promote", "--target",
+                 "prod", "--from", "staging", "--to", "prod", "--release", "b2",
+                 "--source-location", f"{ci}.{ds['physical']}", "--data-diff",
+                 "--max-mismatch-pct", "0", expect_ok=None)
+    sb.check("5. promote --data-diff across projects refuses (b2 differs from prod) and changes nothing",
+             res.returncode != 0 and "data diff failed" in res.output  # type: ignore[attr-defined]
+             and f"events__{fp1['events']}" in sb.view_target("prod", "events"),
+             (res.returncode, res.output[-500:]))  # type: ignore[attr-defined]
+    sb.cli("x3 promote b2", "promote", "--target", "prod", "--from", "staging", "--to", "prod",
+           "--release", "b2", "--source-location", f"{ci}.{ds['physical']}")
+    sb.check("prod.events -> fp2 clone in the prod project",
+             f"`{pp}`.`{ds['phys_prod']}`.`events__{fp2['events']}`" in sb.view_target("prod", "events")
+             and prod_tables().get(f"events__{fp2['events']}") == "CLONE", prod_tables())
+    sb.cli("x3 rollback prod", "rollback", "--target", "prod", "--env", "prod")
+    sb.check("rollback to b1 works: prod.events -> fp1",
+             f"events__{fp1['events']}" in sb.view_target("prod", "events"), sb.view_target("prod", "events"))
+
+
+def jobs_via_api(sb: Sandbox, client, project: str) -> list[dict]:
+    """Same rows as the JOBS_BY_USER query, through jobs.list / jobs.get (own jobs only)."""
+    rows = []
+    for item in client.list_jobs(project=project, min_creation_time=sb.started_at, all_users=False):
+        if item.job_type != "query":
+            continue
+        job = client.get_job(item.job_id, project=project, location=item.location)
+        if sb.sbx not in (job.query or "") or "INFORMATION_SCHEMA.JOBS" in job.query:
+            continue
+        rows.append({"creation_time": job.created, "statement_type": job.statement_type,
+                     "processed": job.total_bytes_processed, "billed": job.total_bytes_billed,
+                     "err": (job.error_result or {}).get("reason")})
+    return sorted(rows, key=lambda r: r["creation_time"])
+
+
+def report_bytes_by_step(sb: Sandbox) -> None:
+    """Bytes processed / billed of every query job of the running user, per project, attributed
+    to the CLI/dbt step that was running when it was created (INFORMATION_SCHEMA.JOBS_BY_USER)."""
+    from google.api_core.exceptions import Forbidden
+
+    for project, client in sb.clients.items():
+        sql = (
+            "SELECT creation_time, statement_type, total_bytes_processed AS processed, "
+            "total_bytes_billed AS billed, error_result.reason AS err "
+            f"FROM `{project}`.`region-{sb.location.lower()}`.INFORMATION_SCHEMA.JOBS_BY_USER "
+            f"WHERE creation_time >= TIMESTAMP('{sb.started_at:%Y-%m-%d %H:%M:%S}') "
+            "AND job_type = 'QUERY' AND state = 'DONE' "
+            f"AND query LIKE '%{sb.sbx}%' AND query NOT LIKE '%INFORMATION_SCHEMA.JOBS%' "
+            "ORDER BY creation_time"
+        )
+        rows: list[dict] = []
+        for _ in range(12):  # the view lags: wait until the count is stable
+            try:
+                new = [dict(r.items()) for r in client.query(sql).result()]
+            except Forbidden:  # no `bigquery.jobs.list` on the project: list the user's own jobs
+                new = jobs_via_api(sb, client, project)
+            if rows and len(new) == len(rows):
+                break
+            rows = new
+            time.sleep(10)
+        slack = timedelta(seconds=2)
+        per: dict[str, list[dict]] = {}
+        for r in rows:
+            t = r["creation_time"]
+            label = next((lbl for lbl, a, b in sb.step_windows if a - slack <= t <= b + slack),
+                         "(outside CLI steps: script checks)")
+            per.setdefault(label, []).append(r)
+        sb.metrics.append(f"bytes per step, project {'CI' if project == sb.project else 'prod'} "
+                          f"({len(rows)} jobs, {sum(r['processed'] or 0 for r in rows)} processed, "
+                          f"{sum(r['billed'] or 0 for r in rows)} billed):")
+        for label, rs in per.items():
+            kinds: dict[str, int] = {}
+            for r in rs:
+                kinds[r["statement_type"] or "?"] = kinds.get(r["statement_type"] or "?", 0) + 1
+            sb.metrics.append(
+                f"  {label}: {len(rs)} jobs {kinds}, processed {sum(r['processed'] or 0 for r in rs)}, "
+                f"billed {sum(r['billed'] or 0 for r in rs)}, errors {sum(1 for r in rs if r['err'])}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--project", default=os.environ.get("DBT_VIRTUAL_SBX_PROJECT"))
@@ -1031,9 +1293,16 @@ def main() -> int:
                     help="Run only the --extended checks, not the base lifecycle.")
     ap.add_argument("--only-cross-location", action="store_true",
                     help="Run only the cross-location extended project (implies --only-extended).")
+    ap.add_argument("--prod-project", default=os.environ.get("DBT_VIRTUAL_SBX_PROD_PROJECT"),
+                    help="Second GCP project acting as prod (--xproject); --project acts as CI.")
+    ap.add_argument("--xproject", action="store_true",
+                    help="Run only the cross-PROJECT promote-by-clone checks (needs --prod-project).")
     ns = ap.parse_args()
     if not ns.project:
         ap.error("--project or DBT_VIRTUAL_SBX_PROJECT is required")
+    if ns.xproject and (not ns.prod_project or ns.prod_project == ns.project):
+        ap.error("--xproject needs --prod-project (or DBT_VIRTUAL_SBX_PROD_PROJECT) "
+                 "different from --project")
 
     sb = Sandbox(ns)
     if sb.sandbox_datasets():
@@ -1044,7 +1313,9 @@ def main() -> int:
     steps = []
     if not ns.only_extended:
         steps.append(lifecycle)
-    if ns.only_cross_location:
+    if ns.xproject:
+        steps = [extended_cross_project]
+    elif ns.only_cross_location:
         steps = [extended_cross_location]
     elif ns.extended or ns.only_extended:
         steps += [extended_single_location, extended_cross_location]
@@ -1057,10 +1328,12 @@ def main() -> int:
                 print(f"\nSTEP FAILED in {step.__name__}: {exc}")
     finally:
         if sb.keep:
-            print(f"--keep: sandbox datasets left in place: {sb.sandbox_datasets()}")
+            print(f"--keep: sandbox datasets left in place: {sb.sandbox_datasets_by_project()}")
         else:
             print(f"dropped sandbox datasets: {sb.cleanup()}")
-            print(f"remaining with prefix {sb.sbx}: {sb.sandbox_datasets()}")
+            print(f"remaining with prefix {sb.sbx} per project: {sb.sandbox_datasets_by_project()}")
+    if ns.xproject:
+        report_bytes_by_step(sb)
     for line in sb.metrics:
         print(line)
 

@@ -71,12 +71,21 @@ byte-identical.
 
 - New config key `physical_locations`; `promote --source-location`; `virtual_database_name`; the
   state file gains `base_physical_tables`.
-- Not verified on BigQuery: that `CREATE TABLE ... CLONE` works from the CI project into the prod
-  project (BigQuery documents table clones within a region, and the dataset locations must match;
-  no BigQuery access was available), the exact IAM roles, and the routine-template rewrite of the
-  project id. Expected need, to verify: CI service account `roles/bigquery.dataEditor` + `jobUser` on
-  the CI project and `roles/bigquery.dataViewer` on prod's physical dataset; prod service account
-  `dataEditor` + `jobUser` on prod and `dataViewer` (the clone reads the table) on the CI physical dataset.
+- Verified on real BigQuery (2026-11-05, `docs/findings/20261105_cross_project_promote_by_clone_bigquery.md`):
+  `CREATE TABLE ... CLONE` from the CI project into the prod project works with both datasets in US
+  (`table_type = CLONE`), prod views and registry point at the prod-project clones, the routine
+  templates are replayed in the prod project (the source project id is rewritten, TVF and UDF checked),
+  prod keeps working after the CI datasets are dropped, CI seeds an incremental model by cloning prod's
+  table, and `audit` / `diff-data` / `promote --data-diff` compare across projects. One bug found and
+  fixed: the template stored in the prod `_releases` still named the CI project, so a prod rollback
+  redeployed a routine reading CI; the stored template is now rewritten too (`retarget_project_in_ddl`).
+- Not verified: the minimal IAM roles. The run used one human identity (`roles/editor` on the CI project,
+  prod project policy unreadable), not two least-privilege service accounts. Expected need, to verify:
+  CI service account `roles/bigquery.dataEditor` + `jobUser` on the CI project and
+  `roles/bigquery.dataViewer` on prod's physical dataset; prod service account `dataEditor` + `jobUser`
+  on prod and `dataViewer` (the clone reads the table) on the CI physical dataset. Also not verified:
+  datasets in different locations (BigQuery needs the same location for a clone) and releases promoted
+  before the template fix (their prod registry rows keep the CI project in the template).
 - Not done: reusing an unchanged prod table in place from CI (CI builds it instead), companion
   state across locations (not restored on a cross-location promote), `init-env` across locations,
   cross-project with `physical_schemas_by_location`.

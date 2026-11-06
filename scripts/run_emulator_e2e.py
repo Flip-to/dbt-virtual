@@ -88,6 +88,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     for dataset_id in (
         "e2e_reg", "e2e_old", "e2e_stg", "e2e_stg_fin", "e2e_prod", "e2e_prod_fin",
         "e2e_cov", "e2e_gc", "e2e_cmp", "e2e_loc_ci", "e2e_loc_prod", "e2e_xsrc", "e2e_xdst", "e2e_xprod",
+        "e2e_xp_phys_prod", "e2e_xp_prod",
     ):
         requests.post(
             f"{endpoint}/bigquery/v2/projects/{project}/datasets",
@@ -102,7 +103,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
 
     def lookup(database, schema, identifier):
         try:
-            table = client.get_table(f"{project}.{schema}.{identifier}")
+            table = client.get_table(f"{database or project}.{schema}.{identifier}")
         except NotFound:
             return None
         return FakeRelation(database, schema, identifier, "view" if table.table_type == "VIEW" else "table", "`")
@@ -164,7 +165,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         },
     }
 
-    def make_harness(extra_cfg=None, extra_vars=None, target_name="staging", graph_nodes=None):
+    def make_harness(extra_cfg=None, extra_vars=None, target_name="staging", graph_nodes=None, target_database=None):
         cfg = {
             "physical_schema": "e2e_reg",
             "env_schemas": {
@@ -177,7 +178,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
             vars_dict={"dbt_virtual": cfg, "_dbt_virtual_fps": fps, **(extra_vars or {})},
             target_name=target_name,
             target_schema="e2e_stg",
-            target_database=project,
+            target_database=target_database or project,
         )
         h.graph = {"nodes": nodes if graph_nodes is None else graph_nodes}
         h.query_executor = run_sql
@@ -447,6 +448,42 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     diff = json.loads(diff_line.split(":", 1)[1])["models"][0]
     assert (diff["status"], diff["only_candidate"], diff["changed"]) == ("differs", 1, 1), diff
     print("[locations] audit and data diff from the CI target compared the release with prod's own location.")
+
+    # 21. Cross-PROJECT promote by clone: CI's registry and tables are in another project, prod's in
+    # `project`. Found on real BigQuery: the release rows copied into the prod registry kept a routine
+    # template that named the CI project, so a later rollback in prod redeployed a routine reading
+    # CI (docs/findings/20261105_cross_project_promote_by_clone_bigquery.md).
+    xci = "e2e-xp-ci-project"
+    requests.post(
+        f"{endpoint}/bigquery/v2/projects/{xci}/datasets",
+        json={"datasetReference": {"projectId": xci, "datasetId": "e2e_xp_phys_ci"}}, timeout=10,
+    )
+    xp_locations = {"prod": {"database": project, "schema": "e2e_xp_phys_prod"},
+                    "default": {"database": xci, "schema": "e2e_xp_phys_ci"}}
+    xp_cfg = {"physical_schema": "e2e_xp_phys_ci", "base_environment": "prod",
+              "env_schemas": {"staging": "e2e_xp_stg", "prod": "e2e_xp_prod"},
+              "physical_locations": xp_locations}
+    exec_script(make_harness(extra_cfg=xp_cfg, target_database=xci).call_macro("ensure_registry_tables_sql", "e2e_xp_phys_ci"))
+    exec_script(make_harness(extra_cfg=xp_cfg, target_name="prod").call_macro("ensure_registry_tables_sql", "e2e_xp_phys_prod"))
+    q(f"CREATE OR REPLACE TABLE `{xci}.e2e_xp_phys_ci.orders__fp1` AS SELECT * FROM UNNEST([STRUCT(1 AS id, 10 AS amount), STRUCT(2, 20)])")
+    tvf_template = (f"CREATE OR REPLACE TABLE FUNCTION `{xci}`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`(min_amount INT64) AS "
+                    f"(SELECT * FROM `{xci}`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`orders` WHERE amount >= min_amount)")
+    q(f"INSERT INTO `{xci}.e2e_xp_phys_ci._releases` (release_id, source_environment, target_environment, model_name, resource_type, "
+      f"dependency_tier, fingerprint, physical_identifier, routine_ddl_template, status, created_at, schema_key, build_quality, sealed_at) VALUES "
+      f"('r1', 'staging', NULL, 'orders', 'model', 2, 'fp1', 'e2e_xp_phys_ci.orders__fp1', NULL, 'candidate', CURRENT_TIMESTAMP(), NULL, 'full', CURRENT_TIMESTAMP()), "
+      f"('r1', 'staging', NULL, 'tvf', 'table_function', 3, 'fpt', 'e2e_xp_stg.tvf', '{tvf_template}', 'candidate', CURRENT_TIMESTAMP(), NULL, 'full', CURRENT_TIMESTAMP())")
+    xp_nodes = {
+        "model.p.orders": {"name": "orders", "resource_type": "model", "config": {"unique_key": "id"}},
+        "model.p.tvf": {"name": "tvf", "resource_type": "model", "config": {"materialized": "table_function", "virtual_env": True}},
+    }
+    hp = make_harness(extra_cfg=xp_cfg, target_name="prod", graph_nodes=xp_nodes)
+    hp.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="r1")
+    assert [r["id"] for r in q(f"SELECT id FROM `{project}.e2e_xp_phys_prod.orders__fp1` ORDER BY id")] == [1, 2]
+    stored = q(f"SELECT routine_ddl_template AS t FROM `{project}.e2e_xp_phys_prod._releases` WHERE model_name = 'tvf'")
+    assert len(stored) == 1 and f"`{project}`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`" in stored[0]["t"] and xci not in stored[0]["t"], stored
+    assert q(f"SELECT environment, model_name FROM `{project}.e2e_xp_phys_prod._environments` ORDER BY model_name") == [
+        {"environment": "prod", "model_name": "orders"}, {"environment": "prod", "model_name": "tvf"}]
+    print("[xproject] release promoted from the CI project into the prod project by clone; the template stored in the prod registry names the prod project.")
 
     # Pilot finding: `promote` decided its default audit from the raw `base_environment`, so a Jinja
     # value never matched `--to`. `virtual_print_base_environment` renders it like the macros do

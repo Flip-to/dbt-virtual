@@ -42,4 +42,4 @@ Fix: `registry_location_for` (macros/lifecycle/data_diff.sql) resolves each side
 
 ## Conclusion
 
-Items 1, 2, 4, 5 and 6 are verified on real BigQuery. Item 3 is verified for two locations in one project; cross-project clone, its IAM roles and the routine-template rewrite remain unverified (`docs/decisions/20261105_cross_project_promote_by_clone.md` still lists them). One real bug (gates across locations) was found and fixed. Not measured: cost on tables large enough for the 10 MB billing minimum not to dominate.
+Items 1, 2, 4, 5 and 6 are verified on real BigQuery. Item 3 is verified for two locations in one project; the cross-project case was verified afterwards, see `docs/findings/20261105_cross_project_promote_by_clone_bigquery.md` (it also found a rollback bug that this run could not see). IAM roles stay unverified. One real bug (gates across locations) was found and fixed. Not measured: cost on tables large enough for the 10 MB billing minimum not to dominate.
