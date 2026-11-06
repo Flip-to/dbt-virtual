@@ -542,9 +542,6 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         target_name="prod",
         extra_cfg={
             "physical_schema": "e2e_xdst",
-            # Emulator limitation: INFORMATION_SCHEMA.TABLES has no base_table_* columns, so the
-            # clone-chain depth check cannot run here (verified on real BigQuery 2026-11-05).
-            "clone_chain_fallback": False,
             "env_schemas": {"prod": "e2e_xprod", "ci": "e2e_xprod_ci"},
             "physical_locations": {
                 "prod": {"database": project, "schema": "e2e_xdst"},
@@ -623,7 +620,7 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         "config": {"materialized": "incremental", "virtual_env": True}, "depends_on": {"nodes": []},
     }
     hs = r2_harness(
-        target_name="staging", cfg={"clone_chain_fallback": False}, nodes={"model.p.inc": inc_node2},
+        target_name="staging", nodes={"model.p.inc": inc_node2},
         extra_vars={"_dbt_virtual_seeded": []},
     )
     hs.call_macro("seed_incremental_clones", model_names=["inc"])  # the CLI's seeding
@@ -640,12 +637,59 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         "clone_table_sql", FakeRelation(project, "e2e_r2_phys", "chain0", quote_char="`"), FakeRelation(project, "e2e_r2_phys", "chain1", quote_char="`")
     ))
     assert q(f"SELECT id FROM `{project}.e2e_r2_phys.chain1`") == [{"id": 1}]
-    skipped.append(
-        "BigQuery clone chain depth (`bigquery_clone_depth`, `clone_or_copy_table`): the emulator reports table_type "
-        "'BASE TABLE' for clones, has no INFORMATION_SCHEMA.TABLES.base_table_* columns, and rejects "
-        "`CREATE TABLE d.t3 COPY d.t2` ('CREATE TABLE COPY is not supported'); covered by the macro harness tests only"
-    )
     print("[clone] clone_table_sql with the chain backstop ran on the emulator (CLONE branch).")
+
+    # 30.5: clone chain depth. Seeding clones the base environment's table; the emulator (like BigQuery) reports
+    # table_type CLONE + base_table_* and refuses a 4th chained clone, so `clone_or_copy_table` reads the depth
+    # (bigquery_clone_depth) and seeds with CREATE TABLE ... COPY at depth 3, with CLONE below. Each seeded table
+    # becomes the base environment's pointer, as after a promote, so the chain grows by one per seeding.
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_r2_phys.ch__v0` (id INT64, d DATE) PARTITION BY d CLUSTER BY id")
+    q(f"INSERT INTO `{project}.e2e_r2_phys.ch__v0` (id, d) VALUES (1, DATE '2026-10-01'), (2, DATE '2026-10-02')")
+
+    def point_prod_at(ident: str, fp: str) -> None:
+        exec_script(hr.call_macro(
+            "upsert_environment_pointer_sql", "e2e_r2_phys", "prod", "ch", "model", fp, f"e2e_r2_phys.{ident}", "adopt_ch", None
+        ))
+
+    def table_kind(ident: str) -> tuple:
+        row = q(
+            f"SELECT table_type, base_table_name FROM `{project}`.`e2e_r2_phys`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{ident}'"
+        )
+        assert len(row) == 1, (ident, row)
+        return row[0]["table_type"], row[0]["base_table_name"]
+
+    point_prod_at("ch__v0", "v0")
+    seeded: list[str] = []
+    for i in range(1, 6):
+        ident = f"ch__v{i}"
+        node = {
+            "unique_id": "model.p.ch", "name": "ch", "resource_type": "model", "alias": ident,
+            "database": project, "schema": "e2e_r2_phys", "tags": [],
+            "config": {"materialized": "incremental", "virtual_env": True}, "depends_on": {"nodes": []},
+        }
+        hs = r2_harness(target_name="staging", nodes={"model.p.ch": node}, extra_vars={"_dbt_virtual_seeded": []})
+        hs.call_macro("seed_incremental_clones", model_names=["ch"])
+        seeded.append(table_kind(ident)[0])
+        # The log names the path taken: the chain depth of the source and CLONE, or the copy at the limit.
+        if i == 4:
+            assert any("copying" in m and "3 clone(s) deep" in m for m in hs.logs), hs.logs
+        else:
+            assert any("cloning" in m for m in hs.logs), hs.logs
+        assert q(f"SELECT COUNT(*) AS n, SUM(id) AS s FROM `{project}.e2e_r2_phys.{ident}`") == [{"n": 2, "s": 3}], ident
+        point_prod_at(ident, f"v{i}")
+    assert seeded == ["CLONE", "CLONE", "CLONE", "BASE TABLE", "CLONE"], seeded
+    assert table_kind("ch__v3") == ("CLONE", "ch__v2")
+    assert table_kind("ch__v4") == ("BASE TABLE", None), "the COPY at depth 3 is an independent table"
+    assert table_kind("ch__v5") == ("CLONE", "ch__v4"), "the chain restarts from the copy"
+    # REST tables.get: type TABLE plus cloneDefinition for a clone; the COPY has none and keeps the layout.
+    tables_url = f"{endpoint}/bigquery/v2/projects/{project}/datasets/e2e_r2_phys/tables"
+    clone_meta = requests.get(f"{tables_url}/ch__v3", timeout=10).json()
+    assert clone_meta["type"] == "TABLE"
+    assert clone_meta["cloneDefinition"]["baseTableReference"]["tableId"] == "ch__v2", clone_meta
+    copy_meta = requests.get(f"{tables_url}/ch__v4", timeout=10).json()
+    assert "cloneDefinition" not in copy_meta, copy_meta
+    assert copy_meta["timePartitioning"]["field"] == "d" and copy_meta["clustering"]["fields"] == ["id"], copy_meta
+    print("[clone-chain] seeding cloned at depth 0, 1, 2, copied at depth 3 (ch__v4 BASE TABLE, partitioning and clustering kept), then cloned the copy.")
 
     run_bigquery_gap_steps(client, q, project, requests, endpoint)
     return skipped
