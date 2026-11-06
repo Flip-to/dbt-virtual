@@ -505,6 +505,9 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         target_name="prod",
         extra_cfg={
             "physical_schema": "e2e_xdst",
+            # Emulator limitation: INFORMATION_SCHEMA.TABLES has no base_table_* columns, so the
+            # clone-chain depth check cannot run here (verified on real BigQuery 2026-11-05).
+            "clone_chain_fallback": False,
             "env_schemas": {"prod": "e2e_xprod", "ci": "e2e_xprod_ci"},
             "physical_locations": {
                 "prod": {"database": project, "schema": "e2e_xdst"},
