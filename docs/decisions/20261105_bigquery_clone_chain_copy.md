@@ -55,10 +55,16 @@ previous release is garbage collected.
 ## Impact
 
 One metadata query per seeded table on BigQuery (up to 3 hops). `base_table_catalog/schema/name` and `table_type =
-'CLONE'` are taken from BigQuery's documented `INFORMATION_SCHEMA.TABLES` columns: not verified against a real
-warehouse in this change, and the emulator reports clones as `BASE TABLE`, has no `base_table_*` columns and rejects
-`CREATE TABLE ... COPY`, so the depth and COPY paths are covered by macro harness tests only. If the columns differ,
-the depth query fails and `clone_chain_fallback: false` is the workaround; revisit then.
+'CLONE'` are taken from BigQuery's documented `INFORMATION_SCHEMA.TABLES` columns; they were measured on a real
+BigQuery sandbox on 2026-11-05 (a clone reports `CLONE` and its base table; a 4th chained clone is refused with the
+message above; `COPY` makes a `BASE TABLE`). If the columns differ, the depth query fails and
+`clone_chain_fallback: false` is the workaround; revisit then.
+
+Correction (2026-11-06): the first version of this decision said the emulator reports clones as `BASE TABLE`, has no
+`base_table_*` columns and rejects `CREATE TABLE ... COPY`, so only macro harness tests covered the depth and COPY
+paths. Flip-to/googlesqlite#38 and Flip-to/bigquery-emulator#35 add all of that to the emulator, and emulator E2E
+step 30.5 (`scripts/run_emulator_e2e.py`) now seeds a chain: CLONE at depth 0, 1 and 2, COPY at depth 3, CLONE of the
+copy. The `clone_chain_fallback: false` workarounds in the emulator steps are removed.
 
 ## Who
 
