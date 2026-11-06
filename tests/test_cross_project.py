@@ -58,7 +58,7 @@ def test_cross_location_promote_clones_then_points_the_view_at_the_clone() -> No
 
     # The release is read from the CI registry.
     assert any("FROM `ci_proj`.`phys_ci`._releases" in q for q in queries)
-    clone = next(q for q in queries if q.startswith("CREATE TABLE IF NOT EXISTS `prod_proj`.`phys_prod`.`orders__fp1`"))
+    clone = next(q for q in queries if "CREATE TABLE IF NOT EXISTS `prod_proj`.`phys_prod`.`orders__fp1`" in q)
     assert "CLONE `ci_proj`.`phys_ci`.`orders__fp1`" in clone
     view = next(q for q in queries if q.startswith("CREATE OR REPLACE VIEW `prod_proj`.`analytics`.`orders`"))
     assert "`prod_proj`.`phys_prod`.`orders__fp1`" in view

@@ -243,6 +243,10 @@ The same layout, run on DuckDB, is covered by `tests/test_dbt_duckdb_multi_schem
 
 ---
 
+### `clone_chain_fallback`
+
+Default `true`. BigQuery allows 3 chained clones. Before cloning a table into a new fingerprint table, dbt-virtual reads the source's clone depth (`INFORMATION_SCHEMA.TABLES`) and uses `CREATE TABLE ... COPY` instead of `CLONE` when the new clone would be the 4th link; if the depth cannot be read, it clones and falls back to COPY on BigQuery's "chained clones" error. `false` turns this off (plain `CLONE`). Other adapters are not affected. See `docs/decisions/20261105_bigquery_clone_chain_copy.md`.
+
 ### `use_ctas_for_clone`
 - **Type**: `boolean`
 - **Default**: `false`

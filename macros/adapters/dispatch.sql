@@ -20,6 +20,21 @@
   {%- if cfg.get('use_ctas_for_clone', false) or target.name == 'emulator' -%}
     CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
     SELECT * FROM {{ source_relation }}
+  {%- elif cfg.get('clone_chain_fallback', true) -%}
+    {#- DECISION(bigquery_clone_chain_copy): BigQuery refuses a CLONE that would be the 4th in a chain
+        ("Cannot have more than 3 chained clones or snapshots"). `clone_or_copy_table` avoids the chain
+        up front; this is the backstop: on that error, make an independent COPY (a copy job, no bytes
+        scanned, partitioning, clustering and options kept). Any other error is raised again. -#}
+    BEGIN
+      CREATE TABLE IF NOT EXISTS {{ target_relation }}
+    CLONE {{ source_relation }};
+    EXCEPTION WHEN ERROR THEN
+      IF CONTAINS_SUBSTR(@@error.message, 'chained clones') THEN
+        CREATE TABLE IF NOT EXISTS {{ target_relation }} COPY {{ source_relation }};
+      ELSE
+        RAISE USING MESSAGE = @@error.message;
+      END IF;
+    END
   {%- else -%}
     CREATE TABLE IF NOT EXISTS {{ target_relation }}
     CLONE {{ source_relation }}
@@ -51,6 +66,70 @@
 {% macro default__clone_table_sql(source_relation, target_relation) -%}
   CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
   SELECT * FROM {{ source_relation }}
+{%- endmacro %}
+
+
+{% macro bigquery_max_clone_chain() -%}
+  {#- BigQuery: "Cannot have more than 3 chained clones or snapshots". -#}
+  {{ return(3) }}
+{%- endmacro %}
+
+{% macro clone_or_copy_table(source_relation, target_relation) -%}
+  {#-
+    Creates `target_relation` from `source_relation`: a zero-copy CLONE (bills only changed bytes),
+    except on BigQuery when the new clone would be the 4th link of a chain (BigQuery refuses more than
+    `bigquery_max_clone_chain()`), which happens when the source is itself a clone of a clone of a
+    clone, e.g. the table a promote left in prod after several seeded deploys. Then it makes a
+    `CREATE TABLE ... COPY` (a copy job, no bytes scanned, partitioning, clustering and options kept),
+    which is independent: chain depth 0. If the depth cannot be read, CLONE and rely on the backstop
+    in `bigquery__clone_table_sql`. Other adapters have no such limit and always use `clone_table_sql`.
+  -#}
+  {%- if target.type == 'bigquery' and not dbt_virtual.get_config().get('use_ctas_for_clone', false) and target.name != 'emulator' and dbt_virtual.get_config().get('clone_chain_fallback', true) -%}
+    {%- set depth = dbt_virtual.bigquery_clone_depth(source_relation) -%}
+    {%- if depth is none -%}
+      {{ log("dbt-virtual: clone chain depth of " ~ source_relation ~ " unknown; cloning (an over-long chain falls back to a copy).", info=True) }}
+    {%- elif depth + 1 > dbt_virtual.bigquery_max_clone_chain() -%}
+      {{ log("dbt-virtual: " ~ source_relation ~ " is " ~ depth ~ " clone(s) deep (BigQuery allows " ~ dbt_virtual.bigquery_max_clone_chain() ~ " chained); copying it to " ~ target_relation ~ " instead of cloning.", info=True) }}
+      {%- do dbt_virtual.exec_sql_statement(dbt_virtual.bigquery__copy_table_sql(source_relation, target_relation)) -%}
+      {{ return('copy') }}
+    {%- else -%}
+      {{ log("dbt-virtual: cloning " ~ source_relation ~ " (clone depth " ~ depth ~ " -> " ~ (depth + 1) ~ " of " ~ dbt_virtual.bigquery_max_clone_chain() ~ ").", info=True) }}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do dbt_virtual.exec_sql_statement(dbt_virtual.clone_table_sql(source_relation, target_relation)) -%}
+  {{ return('clone') }}
+{%- endmacro %}
+
+{% macro bigquery_clone_depth(relation) -%}
+  {#- Number of clones between `relation` and a regular table (0 = regular table), following
+      INFORMATION_SCHEMA.TABLES `base_table_*`; `none` when it cannot be read. Stops at the limit. -#}
+  {%- set state = {'depth': 0} -%}
+  {%- set current = [relation.database, relation.schema, relation.identifier] -%}
+  {%- for _ in range(dbt_virtual.bigquery_max_clone_chain()) -%}
+    {%- set res = run_query(dbt_virtual.table_type_sql(current[0], current[1], current[2])) -%}
+    {%- if res is none or (res.rows | length) == 0 -%}
+      {{ return(none) }}
+    {%- endif -%}
+    {%- set row = res.rows[0] -%}
+    {%- if (row[0] | string | upper) != 'CLONE' -%}
+      {{ return(state['depth']) }}
+    {%- endif -%}
+    {%- do state.update({'depth': state['depth'] + 1}) -%}
+    {%- if row[3] is none or row[2] is none -%}
+      {{ return(none) }}
+    {%- endif -%}
+    {%- do current.clear() -%}
+    {%- do current.extend([row[1] or relation.database, row[2], row[3]]) -%}
+  {%- endfor -%}
+  {{ return(state['depth']) }}
+{%- endmacro %}
+
+{% macro table_type_sql(database, schema, identifier) -%}
+  SELECT table_type, base_table_catalog, base_table_schema, base_table_name FROM `{{ database }}`.`{{ schema }}`.INFORMATION_SCHEMA.TABLES WHERE table_name = '{{ identifier }}'
+{%- endmacro %}
+
+{% macro bigquery__copy_table_sql(source_relation, target_relation) -%}
+  CREATE TABLE IF NOT EXISTS {{ target_relation }} COPY {{ source_relation }}
 {%- endmacro %}
 
 

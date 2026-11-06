@@ -266,7 +266,8 @@
   {%- set partition_by = dbt_virtual.diff_node_config(model_name, 'diff_partition_by') or dbt_virtual.diff_node_config(model_name, 'partition_by') -%}
 
   {#- Columns present on both sides, minus exclusions. -#}
-  {%- set cand_cols = adapter.get_columns_in_relation(cand_rel) | map(attribute='name') | list -%}
+  {%- set cand_col_objects = adapter.get_columns_in_relation(cand_rel) -%}
+  {%- set cand_cols = cand_col_objects | map(attribute='name') | list -%}
   {%- set base_cols = adapter.get_columns_in_relation(base_rel) | map(attribute='name') | list -%}
   {%- set base_lower = base_cols | map('lower') | list -%}
   {%- set cand_lower = cand_cols | map('lower') | list -%}
@@ -279,7 +280,23 @@
   {%- set quoted = [] -%}
   {%- for col in columns -%}{%- do quoted.append(adapter.quote(col)) -%}{%- endfor -%}
   {%- set key_ok = (keys | length) > 0 and (keys | select('in', columns) | list | length) == (keys | length) -%}
-  {%- set key_q = adapter.quote(keys[0]) if key_ok else '' -%}
+  {#- All `keys` are joined on at the leaves. Range bisection needs ONE numeric key: the first
+      numeric entry of `keys` (a composite key such as (date, id) bisects on `id`), none when no entry
+      is numeric: the differing segments are then joined whole. Column objects without a type
+      (no `is_number`) are taken as numeric, the previous behaviour. -#}
+  {%- set bisect_pick = [] -%}
+  {%- if key_ok -%}
+    {%- for k in keys -%}
+      {%- if bisect_pick | length == 0 -%}
+        {%- for col_obj in cand_col_objects if col_obj.name == k -%}
+          {%- if col_obj.is_number is not defined or col_obj.is_number() -%}{%- do bisect_pick.append(k) -%}{%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set bisect_key = bisect_pick[0] if bisect_pick else none -%}
+  {%- set bisect_ok = bisect_key is not none -%}
+  {%- set key_q = adapter.quote(bisect_key) if bisect_ok else '' -%}
 
   {#- Segment expression: a partition (date / timestamp / int) or the whole table. -#}
   {%- set seg_expr = '0' -%}
@@ -346,7 +363,7 @@
     {%- set nxt = [] -%}
     {%- for seg in state.pending -%}
       {%- set biggest = [seg.cc, seg.ct] | max -%}
-      {%- if biggest <= threshold or not key_ok or seg.forced_leaf or level >= max_depth or seg.lo is none or seg.hi is none or seg.hi <= seg.lo -%}
+      {%- if biggest <= threshold or not bisect_ok or seg.forced_leaf or level >= max_depth or seg.lo is none or seg.hi is none or seg.hi <= seg.lo -%}
         {%- do leaves.append(seg) -%}
       {%- else -%}
         {%- set step = ((seg.hi - seg.lo) | float) / branching -%}
@@ -364,7 +381,7 @@
                 {#- Rows whose key is NULL cannot be ranged: join them directly. -#}
                 {%- do nxt.append({'label': seg.label ~ ' key IS NULL', 'filter': seg.filter ~ ' AND ' ~ key_q ~ ' IS NULL', 'cc': sub.cc, 'ct': sub.ct, 'lo': none, 'hi': none, 'depth': level + 1, 'forced_leaf': true}) -%}
               {%- else -%}
-                {%- do nxt.append({'label': (seg.label if seg.label != 'table' else '') ~ ' ' ~ keys[0] ~ ' in [' ~ sub.lo ~ ', ' ~ sub.hi ~ ']', 'filter': seg.filter ~ ' AND ' ~ key_q ~ ' >= ' ~ sub.lo ~ ' AND ' ~ key_q ~ ' <= ' ~ sub.hi, 'cc': sub.cc, 'ct': sub.ct, 'lo': sub.lo, 'hi': sub.hi, 'depth': level + 1, 'forced_leaf': false}) -%}
+                {%- do nxt.append({'label': (seg.label if seg.label != 'table' else '') ~ ' ' ~ bisect_key ~ ' in [' ~ sub.lo ~ ', ' ~ sub.hi ~ ']', 'filter': seg.filter ~ ' AND ' ~ key_q ~ ' >= ' ~ sub.lo ~ ' AND ' ~ key_q ~ ' <= ' ~ sub.hi, 'cc': sub.cc, 'ct': sub.ct, 'lo': sub.lo, 'hi': sub.hi, 'depth': level + 1, 'forced_leaf': false}) -%}
               {%- endif -%}
             {%- endif -%}
           {%- endfor -%}
@@ -432,6 +449,7 @@
     'status': ('identical' if not any_difference else 'differs'),
     'drilled': key_ok,
     'key': keys,
+    'bisect_key': bisect_key,
     'segment_kind': seg_kind,
     'candidate_rows': total_candidate[-1],
     'target_rows': total_target[-1],

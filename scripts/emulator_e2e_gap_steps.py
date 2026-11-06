@@ -289,6 +289,8 @@ def step_promote_clone(io: _Io) -> None:
     # A. Two datasets as two locations: staging's physical tables in e2e_loc_phys_stg, prod's in e2e_loc_phys_prod.
     io.create_datasets("e2e_loc_phys_stg", "e2e_loc_phys_prod", "e2e_loc_prod")
     cfg_a = {
+        # The emulator has no INFORMATION_SCHEMA.TABLES.base_table_* (the clone-depth check) nor COPY.
+        "clone_chain_fallback": False,
         "physical_schema": "e2e_loc_phys_prod",
         "env_schemas": {"staging": "e2e_loc_stg", "prod": "e2e_loc_prod"},
         "physical_locations": {"staging": {"schema": "e2e_loc_phys_stg"}, "prod": {"schema": "e2e_loc_phys_prod"}},
@@ -332,7 +334,7 @@ def step_promote_clone(io: _Io) -> None:
     h_src = io.harness(cfg_src, nodes={"model.p.xm": node}, target_name="staging", target_schema="e2e_loc_stg")
     assert h_src.call_macro("active_database") == OTHER_PROJECT
     _seed_release(io, h_src, database=OTHER_PROJECT, schema="e2e_src_phys", release_id="rel_b", model="xm", fp="bbbbbbbbbbbb", rows_sql=rows)
-    cfg_b = {"physical_schema": "e2e_loc_phys_b", "env_schemas": {"prod": "e2e_loc_prod_b"}}
+    cfg_b = {"clone_chain_fallback": False, "physical_schema": "e2e_loc_phys_b", "env_schemas": {"prod": "e2e_loc_prod_b"}}
     h_b = io.harness(cfg_b, nodes={"model.p.xm": node}, target_name="prod", target_schema="e2e_loc_prod_b")
     io.exec_script(h_b.call_macro("ensure_registry_tables_sql", "e2e_loc_phys_b"))
     h_b.call_macro(

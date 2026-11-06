@@ -542,6 +542,9 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
         target_name="prod",
         extra_cfg={
             "physical_schema": "e2e_xdst",
+            # Emulator limitation: INFORMATION_SCHEMA.TABLES has no base_table_* columns, so the
+            # clone-chain depth check cannot run here (verified on real BigQuery 2026-11-05).
+            "clone_chain_fallback": False,
             "env_schemas": {"prod": "e2e_xprod", "ci": "e2e_xprod_ci"},
             "physical_locations": {
                 "prod": {"database": project, "schema": "e2e_xdst"},
@@ -569,6 +572,80 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     promoted = q(f"SELECT model, FORMAT_TIMESTAMP('%F', last_success) AS d FROM `{project}.e2e_cmp.xmanifest_prod` ORDER BY model")
     assert promoted == [{"model": "xm", "d": "2026-11-03"}, {"model": "xs", "d": "2026-11-02"}], promoted
     print("[companion] cross-location promote: prod's manifest got the source environment's live rows and the rows saved in the source registry.")
+    # 30. Pilot round 2: rollback over a legacy TABLE, lock release on failure, one clone per
+    # incremental, BigQuery clone chain. The emulator now runs CREATE TABLE ... CLONE and DROP SCHEMA.
+    for dataset_id in ("e2e_r2_phys", "e2e_r2_stg", "e2e_r2_prod"):
+        requests.post(
+            f"{endpoint}/bigquery/v2/projects/{project}/datasets",
+            json={"datasetReference": {"projectId": project, "datasetId": dataset_id}},
+            timeout=10,
+        )
+    r2_cfg = {"physical_schema": "e2e_r2_phys", "env_schemas": {"staging": "e2e_r2_stg", "prod": "e2e_r2_prod"}}
+
+    def r2_harness(**kwargs):
+        return make_harness(extra_cfg={**r2_cfg, **kwargs.pop("cfg", {})}, graph_nodes=kwargs.pop("nodes", {}), **kwargs)
+
+    hr = r2_harness(target_name="prod")
+    exec_script(hr.call_macro("ensure_registry_tables_sql", "e2e_r2_phys"))
+    for name in ("a", "b"):
+        q(f"CREATE OR REPLACE TABLE `{project}.e2e_r2_phys.{name}__f1` AS SELECT 1 AS x")
+        q(f"CREATE OR REPLACE TABLE `{project}.e2e_r2_prod.{name}` AS SELECT 1 AS x")  # legacy TABLE kept by adopt
+        q(
+            f"INSERT INTO `{project}.e2e_r2_phys._releases` (release_id, source_environment, target_environment, model_name, "
+            f"resource_type, dependency_tier, fingerprint, physical_identifier, status, created_at, promoted_at) VALUES "
+            f"('adopt1', 'prod', 'prod', '{name}', 'model', 2, 'f1', 'e2e_r2_phys.{name}__f1', 'promoted', "
+            f"CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"
+        )
+        exec_script(hr.call_macro(
+            "upsert_environment_pointer_sql", "e2e_r2_phys", "prod", name, "model", "f1", f"e2e_r2_phys.{name}__f1", "adopt1", None
+        ))
+    # 30.1 + 30.2: a rollback over legacy tables replaces them; a refused promote with a lock leaves no lease.
+    hr.call_macro("virtual_rollback", env="prod", to_release="adopt1", lock=True, lock_owner="r2")
+    for name in ("a", "b"):
+        assert client.get_table(f"{project}.e2e_r2_prod.{name}").table_type == "VIEW", name
+        assert q(f"SELECT x FROM `{project}.e2e_r2_prod.{name}`") == [{"x": 1}]
+    assert q(f"SELECT owner FROM `{project}.e2e_r2_phys._locks`") == []
+    refused(
+        lambda: hr.call_macro("virtual_promote", from_env="staging", to_env="prod", release_id="nope", lock=True, lock_owner="r2"),
+        "No models found",
+    )
+    assert q(f"SELECT owner FROM `{project}.e2e_r2_phys._locks`") == [], "a refused promote kept its lease"
+    print("[rollback] adopt release restored over legacy TABLEs (replaced by views); refused promote released its lock.")
+
+    # 30.3: a clone seeded earlier in the invocation is not dropped and cloned again (real CLONE).
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_r2_phys.inc__base1` AS SELECT 1 AS id")
+    exec_script(hr.call_macro(
+        "upsert_environment_pointer_sql", "e2e_r2_phys", "prod", "inc", "model", "base1", "e2e_r2_phys.inc__base1", "adopt1", None
+    ))
+    inc_node2 = {
+        "unique_id": "model.p.inc", "name": "inc", "resource_type": "model", "alias": "inc__new1",
+        "database": project, "schema": "e2e_r2_phys", "tags": [],
+        "config": {"materialized": "incremental", "virtual_env": True}, "depends_on": {"nodes": []},
+    }
+    hs = r2_harness(
+        target_name="staging", cfg={"clone_chain_fallback": False}, nodes={"model.p.inc": inc_node2},
+        extra_vars={"_dbt_virtual_seeded": []},
+    )
+    hs.call_macro("seed_incremental_clones", model_names=["inc"])  # the CLI's seeding
+    hs.call_macro("seed_incremental_clones")  # the on-run-start hook
+    assert sum("CLONE" in x for x in hs.executed_queries) == 1, hs.executed_queries
+    assert not any("never registered" in m for m in hs.logs), hs.logs
+    assert q(f"SELECT id FROM `{project}.e2e_r2_phys.inc__new1`") == [{"id": 1}]
+    print("[seed] a new incremental is cloned once per invocation; the hook did not re-clone it.")
+
+    # 30.4: the clone macro with the chain backstop runs on the emulator (scripting block, CLONE branch).
+    hc = r2_harness(target_name="staging")
+    q(f"CREATE OR REPLACE TABLE `{project}.e2e_r2_phys.chain0` AS SELECT 1 AS id")
+    q(hc.call_macro(
+        "clone_table_sql", FakeRelation(project, "e2e_r2_phys", "chain0", quote_char="`"), FakeRelation(project, "e2e_r2_phys", "chain1", quote_char="`")
+    ))
+    assert q(f"SELECT id FROM `{project}.e2e_r2_phys.chain1`") == [{"id": 1}]
+    skipped.append(
+        "BigQuery clone chain depth (`bigquery_clone_depth`, `clone_or_copy_table`): the emulator reports table_type "
+        "'BASE TABLE' for clones, has no INFORMATION_SCHEMA.TABLES.base_table_* columns, and rejects "
+        "`CREATE TABLE d.t3 COPY d.t2` ('CREATE TABLE COPY is not supported'); covered by the macro harness tests only"
+    )
+    print("[clone] clone_table_sql with the chain backstop ran on the emulator (CLONE branch).")
 
     run_bigquery_gap_steps(client, q, project, requests, endpoint)
     return skipped
