@@ -1,5 +1,5 @@
 ---
-# dbt-virtual-0031
+# dbt-virtual-0034
 title: 'Verify cross-project promote by clone on real BigQuery'
 status: in-progress
 type: bug
