@@ -113,6 +113,40 @@ def test_cross_location_routine_is_deployed_in_the_target_project() -> None:
     assert "`prod_proj`.`analytics`.`tvf`" in ddl and "ci_proj" not in ddl
 
 
+def test_cross_location_promote_stores_the_routine_template_with_the_target_project() -> None:
+    """The release rows copied into the target registry keep a routine template that names the target
+    project. Before, they kept the source project, so a later `virtual_rollback` in prod redeployed the
+    routine from a template that read the CI project (real BigQuery: `Dataset <ci>:<ds> was not found`)."""
+    h = _harness()
+    rows = [
+        (
+            "tvf",
+            "table_function",
+            "fpt",
+            "analytics_ci.tvf",
+            "CREATE OR REPLACE TABLE FUNCTION `ci_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`() AS (SELECT 1)",
+            3,
+            None,
+            "full",
+            "2026-11-04",
+        )
+    ]
+    h.query_responses.extend([FakeResult(rows), FakeResult([])])
+    h.call_macro("virtual_promote", from_env="pr_42", to_env="prod", release_id="r")
+    stored = " ".join(q for q in h.executed_queries if "INSERT INTO" in q and "_releases" in q)
+    assert "`prod_proj`.`__DBT_VIRTUAL_ENV_SCHEMA__`.`tvf`" in stored
+    assert "ci_proj" not in stored
+
+
+def test_retarget_project_in_ddl_only_replaces_whole_project_ids() -> None:
+    h = _harness()
+    ddl = "SELECT * FROM `ci_proj`.`ds`.`t` JOIN `other-ci_proj2`.`ds`.`u` JOIN ci_proj_x.ds.v"
+    out = h.call_macro("retarget_project_in_ddl", ddl, "ci_proj")
+    assert "`prod_proj`.`ds`.`t`" in out and "other-ci_proj2" in out and "ci_proj_x" in out
+    assert h.call_macro("retarget_project_in_ddl", ddl, "") == ddl
+    assert h.call_macro("retarget_project_in_ddl", ddl, "prod_proj") == ddl
+
+
 def test_same_location_promote_is_unchanged() -> None:
     # No physical_locations: the generated SQL names the target database and `physical_schema`.
     h = _harness(locations=None, target_database="test_proj")

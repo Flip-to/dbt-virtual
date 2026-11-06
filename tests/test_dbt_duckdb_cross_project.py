@@ -139,3 +139,22 @@ def test_gates_compare_with_prod_in_its_own_location(project: Project) -> None:
 
     audit = project.operation("virtual_audit", {"from_env": "staging", "to_env": "prod", "release_id": "r2"})
     assert "(new model" not in audit.stdout
+
+
+def test_rollback_in_prod_after_cross_location_promotes_redeploys_routines(tmp_path) -> None:
+    """Prod can roll back to a release it received by clone: the views move back to the older clone and
+    the routine is redeployed from the template stored in the prod registry."""
+    func = "{{ config(materialized='virtual_function', parameters='x', returns='INTEGER') }} x + 1"
+    proj = Project(tmp_path, {"orders": _table_model("select 1 as id, 10 as amount"), "f": func}, project_yml=CROSS_YML)
+    proj.build("staging", "r1")
+    promote = {"from_env": "staging", "to_env": "prod", "lock": True}
+    proj.operation("virtual_promote", {**promote, "release_id": "r1"}, env="prod")
+    proj.write_models({"orders": _table_model("select 1 as id, 99 as amount"), "f": func})
+    proj.build("staging", "r2")
+    proj.operation("virtual_promote", {**promote, "release_id": "r2"}, env="prod")
+    assert proj.query("SELECT amount FROM analytics.orders") == [(99,)]
+
+    proj.operation("virtual_rollback", {"env": "prod", "lock": True}, env="prod")
+    assert proj.query("SELECT amount FROM analytics.orders") == [(10,)]
+    assert proj.query("SELECT analytics.f(1)") == [(2,)]
+    assert proj.query("SELECT DISTINCT status FROM phys_prod._releases WHERE release_id = 'r1'") == [("promoted",)]

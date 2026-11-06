@@ -750,11 +750,8 @@
         {%- set view_node = dbt_virtual.virtual_node_by_name(model_name) -%}
         {%- do dbt_virtual.create_env_view(view_rel, phys_rel, view_node, phys_schema, authorized_schemas) -%}
       {%- elif routine_ddl is not none and routine_ddl != '' -%}
-        {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(routine_ddl, to_env) -%}
-        {%- if cross and src_db != dbt_virtual.active_database() -%}
-          {#- The template names the source project; deploy into the target project instead. -#}
-          {%- set rendered_ddl = modules.re.sub('(?<![0-9A-Za-z_-])' ~ modules.re.escape(src_db) ~ '(?![0-9A-Za-z_-])', dbt_virtual.active_database(), rendered_ddl) -%}
-        {%- endif -%}
+        {#- A cross-location template names the source project; deploy into the target project instead. -#}
+        {%- set rendered_ddl = dbt_virtual.resolve_env_placeholders_sql(dbt_virtual.retarget_project_in_ddl(routine_ddl, src_db if cross else ''), to_env) -%}
         {{ log("dbt-virtual promote [" ~ to_env ~ "]: Deploying " ~ resource_type ~ " " ~ to_schema ~ "." ~ model_name, info=True) }}
         {%- do dbt_virtual.exec_sql_statement(rendered_ddl) -%}
         {%- if resource_type != 'view' -%}
@@ -793,7 +790,7 @@
     {%- endif -%}
     {%- if cross -%}
       {%- do cross_release_values.append(dbt_virtual.promoted_release_values_sql(
-        release_id, from_env, to_env, item, target_phys_ident
+        release_id, from_env, to_env, item, target_phys_ident, src_db
       )) -%}
     {%- endif -%}
   {%- endfor -%}
@@ -903,14 +900,28 @@
 {%- endmacro %}
 
 
-{% macro promoted_release_values_sql(release_id, from_env, to_env, item, target_phys_ident) -%}
+{% macro retarget_project_in_ddl(ddl, source_database='') -%}
+  {#- A routine template recorded in another project's registry names that project (`<project>`.`<dataset>`.`<object>`).
+      Return it with the source project replaced by the active (target) project; unchanged when
+      `source_database` is empty or already the active project. Used for the DDL deployed by a
+      cross-location promote and for the template stored in the target registry, so that a later
+      rollback (which has no source project at hand) redeploys a routine that stays in the target project. -#}
+  {%- if ddl is none or source_database == '' or source_database == dbt_virtual.active_database() -%}
+    {{ return(ddl) }}
+  {%- endif -%}
+  {{ return(modules.re.sub('(?<![0-9A-Za-z_-])' ~ modules.re.escape(source_database) ~ '(?![0-9A-Za-z_-])', dbt_virtual.active_database(), ddl)) }}
+{%- endmacro %}
+
+
+{% macro promoted_release_values_sql(release_id, from_env, to_env, item, target_phys_ident, source_database='') -%}
   {#- One `_releases` VALUES tuple for an object promoted from another location. `item` is a row
-      of `ordered_registry_rows`. -#}
+      of `ordered_registry_rows`. The stored routine template has the source project rewritten to
+      the target one (`retarget_project_in_ddl`). -#}
   {%- set row_tier = {'function': 1, 'virtual_function': 1, 'model': 2, 'view': 2, 'table_function': 3}.get(item['resource_type'], 4) -%}
   {{ return(
     "('" ~ release_id ~ "', '" ~ from_env ~ "', '" ~ to_env ~ "', '" ~ item['model_name'] ~ "', '" ~ item['resource_type'] ~ "', "
     ~ row_tier ~ ", '" ~ item['fingerprint'] ~ "', '" ~ target_phys_ident ~ "', "
-    ~ (dbt_virtual.sql_string_literal(item['routine_ddl']) if item['routine_ddl'] is not none else 'NULL')
+    ~ (dbt_virtual.sql_string_literal(dbt_virtual.retarget_project_in_ddl(item['routine_ddl'], source_database)) if item['routine_ddl'] is not none else 'NULL')
     ~ ", 'promoted', " ~ dbt_virtual.current_timestamp_sql() ~ ", " ~ dbt_virtual.current_timestamp_sql() ~ ", NULL, "
     ~ dbt_virtual.sql_nullable_literal(item['schema_key']) ~ ", "
     ~ dbt_virtual.sql_nullable_literal(item['build_quality']) ~ ", "
