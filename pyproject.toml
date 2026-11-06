@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dbt-virtual"
-version = "0.2.0"
+version = "0.2.1"
 description = "SQLMesh-style virtual data environments for dbt (BigQuery, Snowflake, DuckDB, PostgreSQL, Databricks): sqlglot AST Merkle-DAG fingerprinting, zero-copy CLONE incremental seeding, per-environment routine virtualization, pre-promotion audit gates, concurrency locks, and zero-rebuild promotion & rollback."
 readme = "README.md"
 license = "Apache-2.0"
