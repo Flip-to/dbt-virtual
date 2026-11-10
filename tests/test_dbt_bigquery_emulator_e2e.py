@@ -253,3 +253,51 @@ def test_multi_dataset_environments_refresh_and_demotion_on_bigquery(tmp_path: P
             p.query(f"select id from {_fq(p, space, 'gold_rows')}(2)")
     finally:
         p.drop_everything()
+
+
+def _table_kind(p: BqProject, dataset: str, ident: str) -> tuple:
+    rows = p.query(
+        f"select table_type, base_table_name from `{PROJECT}`.`{dataset}`.INFORMATION_SCHEMA.TABLES"
+        f" where table_name = '{ident}'"
+    )
+    assert len(rows) == 1, (dataset, ident, rows)
+    return rows[0]
+
+
+def test_adopt_clones_legacy_tables_through_the_real_clone_script(proj: BqProject) -> None:
+    """`dbt-virtual adopt` on BigQuery (regression of the adopt split on `;`, Flip-to/dbt-virtual#36).
+
+    On BigQuery `clone_table_sql` is a `BEGIN ... EXCEPTION ... END` script. adopt used to cut it at
+    every `;` and real BigQuery refused the pieces (`Syntax error: Expected ";" but got end of
+    script`). The emulator runs the script as BigQuery does, so this test fails if adopt splits it
+    again. `events` is a legacy table already 3 clones deep: adopt copies it instead of failing.
+    """
+    prod, phys = proj.schemas["prod"], proj.physical
+    # The legacy deployment, written by hand in prod's dataset (not by dbt-virtual).
+    proj.query(f"create table `{PROJECT}.{prod}.orders` as select 1 as id, 10 as amount union all select 2, 20")
+    proj.query(f"create table `{PROJECT}.{proj.raw}.e0` as select 1 as event_id union all select 2")
+    proj.query(f"create table `{PROJECT}.{proj.raw}.e1` clone `{PROJECT}.{proj.raw}.e0`")
+    proj.query(f"create table `{PROJECT}.{proj.raw}.e2` clone `{PROJECT}.{proj.raw}.e1`")
+    proj.query(f"create table `{PROJECT}.{prod}.events` clone `{PROJECT}.{proj.raw}.e2`")
+    assert _table_kind(proj, prod, "events") == ("CLONE", "e2")
+
+    fp = proj.fingerprints("prod")
+    assert proj.cli("adopt", "--env", "prod", "--release", "adopt1", "--skip-compile") == 0
+
+    # orders: cloned (depth 1). events: 3 clones deep, so the 4th link is a copy.
+    assert _table_kind(proj, phys, f"orders__{fp['orders']}")[0] == "CLONE"
+    assert _table_kind(proj, phys, f"events__{fp['events']}") == ("BASE TABLE", None)
+    assert proj.query(f"select count(*) from `{PROJECT}.{phys}.events__{fp['events']}`") == [(2,)]
+    # prod now serves views over the physical tables; the legacy tables are gone.
+    assert dict(proj.tables(prod))["orders"] == "VIEW"
+    assert dict(proj.tables(prod))["events"] == "VIEW"
+    assert proj.query(f"select id, amount from `{PROJECT}.{prod}.orders` order by id") == [(1, 10), (2, 20)]
+    assert proj.query(f"select count(*) from `{PROJECT}.{prod}.events`") == [(2,)]
+    pointers = dict(
+        proj.query(
+            f"select model_name, physical_identifier from `{PROJECT}.{phys}._environments`"
+            " where environment = 'prod' and model_name in ('orders', 'events')"
+        )
+    )
+    assert pointers["orders"].endswith(f"orders__{fp['orders']}"), pointers
+    assert pointers["events"].endswith(f"events__{fp['events']}"), pointers

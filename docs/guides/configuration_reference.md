@@ -251,7 +251,7 @@ Default `true`. BigQuery allows 3 chained clones. Before cloning a table into a 
 - **Type**: `boolean`
 - **Default**: `false`
 - **What it does**:
-  On BigQuery, Snowflake and Databricks (experimental, see [Warehouse Support](warehouse_support.md)), seeds and adoptions use `CREATE TABLE ... AS SELECT *` instead of a zero-copy `CLONE`. Meant for emulators and engines without `CLONE`; a target named `emulator` gets the same behaviour (`macros/adapters/dispatch.sql`, `*__clone_table_sql`). DuckDB and PostgreSQL always copy with `CREATE TABLE ... AS SELECT *`.
+  On BigQuery, Snowflake and Databricks (experimental, see [Warehouse Support](warehouse_support.md)), seeds and adoptions use `CREATE TABLE ... AS SELECT *` instead of a zero-copy `CLONE`. Meant for engines without `CLONE`. On Snowflake and Databricks a target named `emulator` gets the same behaviour (`macros/adapters/dispatch.sql`, `*__clone_table_sql`); on BigQuery it does not, the emulator runs the real `CLONE` script. DuckDB and PostgreSQL always copy with `CREATE TABLE ... AS SELECT *`.
 
 ---
 

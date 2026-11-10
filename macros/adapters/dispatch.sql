@@ -17,7 +17,7 @@
 
 {% macro bigquery__clone_table_sql(source_relation, target_relation) -%}
   {%- set cfg = dbt_virtual.get_config() -%}
-  {%- if cfg.get('use_ctas_for_clone', false) or target.name == 'emulator' -%}
+  {%- if cfg.get('use_ctas_for_clone', false) -%}
     CREATE TABLE IF NOT EXISTS {{ target_relation }} AS
     SELECT * FROM {{ source_relation }}
   {%- elif cfg.get('clone_chain_fallback', true) -%}
@@ -84,7 +84,7 @@
     which is independent: chain depth 0. If the depth cannot be read, CLONE and rely on the backstop
     in `bigquery__clone_table_sql`. Other adapters have no such limit and always use `clone_table_sql`.
   -#}
-  {%- if target.type == 'bigquery' and not dbt_virtual.get_config().get('use_ctas_for_clone', false) and target.name != 'emulator' and dbt_virtual.get_config().get('clone_chain_fallback', true) -%}
+  {%- if target.type == 'bigquery' and not dbt_virtual.get_config().get('use_ctas_for_clone', false) and dbt_virtual.get_config().get('clone_chain_fallback', true) -%}
     {%- set depth = dbt_virtual.bigquery_clone_depth(source_relation) -%}
     {%- if depth is none -%}
       {{ log("dbt-virtual: clone chain depth of " ~ source_relation ~ " unknown; cloning (an over-long chain falls back to a copy).", info=True) }}

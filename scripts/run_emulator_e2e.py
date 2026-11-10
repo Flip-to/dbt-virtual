@@ -691,6 +691,25 @@ def run_feature_steps(client, q, project, requests, endpoint) -> list[str]:
     assert copy_meta["timePartitioning"]["field"] == "d" and copy_meta["clustering"]["fields"] == ["id"], copy_meta
     print("[clone-chain] seeding cloned at depth 0, 1, 2, copied at depth 3 (ch__v4 BASE TABLE, partitioning and clustering kept), then cloned the copy.")
 
+    # 30.6: the backstop script itself (BEGIN ... EXCEPTION WHEN ERROR THEN ... END). ch__v3 is 3 clones deep, so
+    # the CLONE in the script's body fails with BigQuery's chain-limit error, the handler sees it in
+    # @@error.message and makes a COPY. A failure the handler does not recognise is raised again.
+    q(hc.call_macro(
+        "clone_table_sql", FakeRelation(project, "e2e_r2_phys", "ch__v3", quote_char="`"), FakeRelation(project, "e2e_r2_phys", "ch__bs", quote_char="`")
+    ))
+    assert table_kind("ch__bs") == ("BASE TABLE", None), "the handler's COPY is an independent table"
+    assert q(f"SELECT COUNT(*) AS n, SUM(id) AS s FROM `{project}.e2e_r2_phys.ch__bs`") == [{"n": 2, "s": 3}]
+    try:
+        q(hc.call_macro(
+            "clone_table_sql", FakeRelation(project, "e2e_r2_phys", "no_such_source", quote_char="`"), FakeRelation(project, "e2e_r2_phys", "ch__bs2", quote_char="`")
+        ))
+    except Exception as exc:  # noqa: BLE001 - the emulator's client error type is not part of this contract
+        assert "no_such_source" in str(exc), f"the handler must re-raise the original error: {exc}"
+    else:
+        raise AssertionError("cloning a missing table must fail")
+    assert not [t for t in client.list_tables(f"{project}.e2e_r2_phys") if t.table_id == "ch__bs2"]
+    print("[clone-backstop] the EXCEPTION handler copied at the chain limit and re-raised any other error (RAISE USING MESSAGE = @@error.message).")
+
     run_bigquery_gap_steps(client, q, project, requests, endpoint)
     return skipped
 
