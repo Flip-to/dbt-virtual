@@ -25,8 +25,8 @@ This change:
 Also: a commit that only touches `.beans/`, `docs/` or Markdown skips the heavy jobs (`changes` job); the real
 dbt-duckdb tests moved to their own sharded jobs on Python 3.12; `CI ok` aggregates the results.
 
-Blocked on a package setting: pulling `ghcr.io/flip-to/bigquery-emulator` from this repo is `denied` until the package
-grants Actions access to Flip-to/dbt-virtual (or is made public). The job falls back to the source build until then.
+The image pull was `denied` in runs 42843816600 and 42847430190 (source build fallback used); in run 42849883557 the
+same pull succeeded (`Emulator 1f292a7... from image`), so the package is now readable from this repo.
 
 Measurements are in the PR body.
 
