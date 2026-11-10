@@ -21,7 +21,7 @@
 | **Orphan Table Discovery (`find_orphan_tables_sql`)** | `INFORMATION_SCHEMA.TABLES` (`table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')` + `REGEXP_CONTAINS`) | `INFORMATION_SCHEMA.TABLES` (`REGEXP_LIKE` + `DATEADD`) | `information_schema.tables` (`RLIKE` + `CREATED` age cutoff) | DuckDB `regexp_matches` + recorded release age; PostgreSQL `~` + recorded release age; unsupported adapters fail closed |
 | **CI Verification** | [`Flip-to/bigquery-emulator`](https://github.com/Flip-to/bigquery-emulator) E2E in CI, plus real `dbt-core` + `dbt-bigquery` against it (`tests/test_dbt_bigquery_emulator_e2e.py`) | [`nnnkkk7/snowflake-emulator`](https://github.com/nnnkkk7/snowflake-emulator) E2E in CI | Macro Execution Harness only (SQL not executed): **experimental** | Real `dbt-core` + `dbt-duckdb` E2E in CI; PostgreSQL in the Snowflake-emulator E2E script |
 
-On BigQuery, Snowflake and Databricks, `use_ctas_for_clone: true` (or a target named `emulator`) replaces `CLONE` with `CREATE TABLE ... AS SELECT *`, for emulators without `CLONE`.
+On BigQuery, Snowflake and Databricks, `use_ctas_for_clone: true` replaces `CLONE` with `CREATE TABLE ... AS SELECT *`, for engines without `CLONE`. On Snowflake and Databricks a target named `emulator` does the same. On BigQuery it no longer does: the BigQuery emulator supports `CLONE` and `COPY`, so its E2E runs the same clone script as real BigQuery.
 
 ---
 

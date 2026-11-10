@@ -23,7 +23,7 @@ promotes the seeded table itself (the view swap points prod at it), so prod tabl
 
 ## Decision
 
-On BigQuery (not with `use_ctas_for_clone`, not on the emulator), `clone_or_copy_table` reads the clone depth of the
+On BigQuery (not with `use_ctas_for_clone`; the emulator takes this path too since bean 0038), `clone_or_copy_table` reads the clone depth of the
 source table (`INFORMATION_SCHEMA.TABLES`: `table_type = 'CLONE'`, following `base_table_*`, at most
 `bigquery_max_clone_chain()` = 3 hops; depth 0 is a regular table):
 

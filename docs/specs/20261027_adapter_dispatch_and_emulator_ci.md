@@ -15,7 +15,7 @@ prs: []
 
 1. **Multi-Warehouse Adapter Dispatch (`macros/adapters/dispatch.sql`)**:
    - Isolate all warehouse-specific DDL and DQL behind `adapter.dispatch(..., 'dbt_virtual')`:
-     - `clone_table_sql`: `CLONE` on BigQuery and Snowflake (`bigquery__`, `snowflake__`), `SHALLOW CLONE` on Databricks (`databricks__`), and `CREATE TABLE IF NOT EXISTS ... AS SELECT *` on DuckDB/Postgres (`default__`) or when `use_ctas_for_clone` / `target.name == 'emulator'` is active.
+     - `clone_table_sql`: `CLONE` on BigQuery and Snowflake (`bigquery__`, `snowflake__`), `SHALLOW CLONE` on Databricks (`databricks__`), and `CREATE TABLE IF NOT EXISTS ... AS SELECT *` on DuckDB/Postgres (`default__`) or when `use_ctas_for_clone` is active (on Snowflake and Databricks also when `target.name == 'emulator'`; not on BigQuery since bean 0038, the emulator runs the real `CLONE` script).
      - `create_or_replace_view_sql`: `CREATE OR REPLACE VIEW` (`default__`) and `DROP VIEW IF EXISTS ... CASCADE; CREATE VIEW ...` (`postgres__`).
      - `ensure_registry_tables_sql`, `registry_relation`, `upsert_environment_pointer_sql`, `current_timestamp_sql`, `timestamp_add_minutes_sql`, `create_schema_if_not_exists_sql`, `drop_schema_cascade_sql`, `drop_object_if_exists_sql`, `create_routine_ddl_sql`, `validate_routine_exists_sql`, `list_physical_tables_sql`, and `find_orphan_tables_sql` (including BigQuery `table_type IN ('BASE TABLE', 'CLONE', 'SNAPSHOT')`) with dedicated `bigquery__`, `snowflake__`, `databricks__`, `duckdb__`, `postgres__`, and `default__` implementations.
 2. **Hermetic Multi-Emulator CI (`.github/workflows/ci.yml`)**:
