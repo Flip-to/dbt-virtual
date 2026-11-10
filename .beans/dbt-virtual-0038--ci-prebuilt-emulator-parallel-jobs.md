@@ -36,7 +36,7 @@ Measurements are in the PR body.
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | CI takes about 40 minutes, dominated by the emulator job | chat request | 2026-11-10 |
 | Built | Agent: Claude (session dbt-virtual-ci-speed), approved by Yuri Olive | Prebuilt image by SHA plus parallel jobs; no test dropped | PR (draft), branch claude/dbt-virtual-ci-prebuilt-emulator | 2026-11-10 |
-| Proven | CI | L3: PR #37 run 42847430190 green (46 min 25 s before, run 42829367114); every test runs once (unit set + real-dbt shards are complementary by construction) | run 42847430190 | 2026-11-10 |
+| Proven | CI | L3: PR #37 run 42849883557 green (46 min 25 s before, run 42829367114); every test runs once (unit set + real-dbt shards are complementary by construction) | run 42849883557 | 2026-11-10 |
 | Reviewed | pending | | pending | |
 | Shipped | pending | | pending | |
 | Verified | pending | | pending | |
