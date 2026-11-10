@@ -1419,7 +1419,10 @@
           {{ log("dbt-virtual adopt [" ~ env ~ "]: " ~ existing_rel ~ " is already a view; not cloning.", info=True) }}
         {%- elif existing_rel is not none -%}
           {{ log("dbt-virtual adopt [" ~ env ~ "]: Cloning existing table " ~ existing_rel ~ " -> " ~ phys_rel ~ " (0 compute)", info=True) }}
-          {%- do dbt_virtual.exec_ddl_dml(dbt_virtual.clone_table_sql(existing_rel, phys_rel)) -%}
+          {#- clone_or_copy_table, like seeding: it runs one statement (on BigQuery clone_table_sql is a
+              BEGIN ... EXCEPTION ... END script that exec_ddl_dml's split on `;` would cut) and copies a
+              legacy table that is already 3 clones deep instead of failing. -#}
+          {%- do dbt_virtual.clone_or_copy_table(existing_rel, phys_rel) -%}
           {%- if drop_existing_table -%}
             {#- In BigQuery/Snowflake/Postgres, replacing a BASE TABLE with a VIEW of the same name requires dropping the table first -#}
             {%- if existing_rel.type is not defined or existing_rel.type != 'view' -%}

@@ -1042,6 +1042,39 @@ def test_virtual_adopt_zero_compute_existing_project_migration() -> None:
     assert all(len(q) > 1 for q in harness.executed_queries)
 
 
+def test_bigquery_adopt_runs_the_clone_backstop_as_one_script() -> None:
+    """Regression: on real BigQuery `adopt` failed with `Expected ";" but got end of script` (2026-11-10,
+    flipto-dbt sandbox rehearsal on v0.2.1). `clone_table_sql` is a `BEGIN ... EXCEPTION ... END` block
+    (the 3-chained-clones backstop) and adopt sent it through `exec_ddl_dml`, which splits on `;`."""
+    harness = MacroTestHarness(
+        vars_dict={
+            "dbt_virtual": {
+                "physical_schema": "analytics_physical",
+                "base_environment": "prod",
+                "env_schemas": {"prod": "analytics"},
+            },
+            "_dbt_virtual_fps": {"huge_events": "fp_adopted_1"},
+        }
+    )
+    harness.graph = {
+        "nodes": {
+            "model.pkg.huge_events": {
+                "unique_id": "model.pkg.huge_events",
+                "name": "huge_events",
+                "resource_type": "model",
+                "config": {"materialized": "table", "virtual_env": True},
+            }
+        }
+    }
+    harness.existing_relations.add(("test_proj", "analytics", "huge_events"))
+    harness.call_macro("virtual_adopt", env="prod", release_id="v1", drop_existing_table=False)
+    clone_scripts = [q for q in harness.executed_queries if "CLONE `test_proj`.`analytics`.`huge_events`" in q]
+    assert clone_scripts, harness.executed_queries
+    script = clone_scripts[0]
+    assert "BEGIN" in script and "EXCEPTION WHEN ERROR" in script and "END IF;" in script
+    assert script.rstrip().endswith("END")
+
+
 def _bq_harness(**cfg: Any) -> MacroTestHarness:
     return MacroTestHarness(
         vars_dict={
