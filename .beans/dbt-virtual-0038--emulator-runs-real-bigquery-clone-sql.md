@@ -36,4 +36,4 @@ Depends on: PR #36 (adopt fix, this branch contains it) and the emulator PRs (th
 | Proven | CI | L3: emulator E2E step 30.6 (backstop COPY on a 3-deep chain, re-raise on a missing source) and real dbt-bigquery `test_adopt_clones_legacy_tables_through_the_real_clone_script`, which fails with #36 reverted | CI run 42852375975, all jobs green | 2026-11-10 |
 | Reviewed | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Diff and CI read before merge; merge authorized in chat | PR #39 | 2026-11-10 |
 | Shipped | Developer: Yuri Olive | Merged with a merge commit | PR #39 | 2026-11-10 |
-| Verified | pending | | pending | |
+| Verified | n/a | | n/a: emulator and CI change; real BigQuery adopt verified in bean 0037 | |
