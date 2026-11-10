@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   packages: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -29,23 +30,23 @@ jobs:
       - id: diff
         env:
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ACTION: ${{ github.event.action }}
           BEFORE_SHA: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           code=true
-          if [ "$EVENT" = pull_request ]; then
-            # Files changed by the whole PR, against its merge base.
-            files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
-          elif [ "$EVENT" = push ] && [ -n "$BEFORE_SHA" ] && ! echo "$BEFORE_SHA" | grep -qE '^0+$'                && git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
-            files=$(git diff --name-only "$BEFORE_SHA" HEAD || true)
-          else
-            files=""   # workflow_dispatch and unknown cases: run everything
-          fi
-          if [ -n "$files" ]; then
+          # Files changed by the commits this event added (push, or new commits on a PR).
+          # Anything else (PR opened, workflow_dispatch, force-push, unknown base): run everything.
+          if { [ "$EVENT" = push ] || { [ "$EVENT" = pull_request ] && [ "$ACTION" = synchronize ]; }; }              && [ -n "$BEFORE_SHA" ] && ! echo "$BEFORE_SHA" | grep -qE '^0+$'              && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            files=$(git diff --name-only "$BEFORE_SHA" HEAD)
             echo "$files"
-            if ! echo "$files" | grep -vE '^(\.beans/|docs/)|\.md$' | grep -q .; then
-              code=false
+            if [ -n "$files" ] && ! echo "$files" | grep -vE '^(\.beans/|docs/)|\.md$' | grep -q .; then
+              # Skipping is only safe when the commit before this one passed CI (the heavy jobs ran,
+              # or were themselves skipped on top of a passing commit).
+              prev=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${BEFORE_SHA}"                 --jq '[.workflow_runs[] | select(.conclusion == "success")] | length' || echo 0)
+              if [ "${prev:-0}" -gt 0 ]; then code=false; else echo "previous commit has no green CI run: running everything"; fi
             fi
           fi
           echo "code=${code}" >> "$GITHUB_OUTPUT"
