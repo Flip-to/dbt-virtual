@@ -22,6 +22,12 @@ This change:
   checks, and the real-dbt pytest file in three shards (`-k` selection; the third shard is the complement of the other two,
   so every test runs once). pytest still runs with `-n 4 --dist load`. No test is dropped.
 
+Also: a commit that only touches `.beans/`, `docs/` or Markdown skips the heavy jobs (`changes` job); the real
+dbt-duckdb tests moved to their own sharded jobs on Python 3.12; `CI ok` aggregates the results.
+
+Blocked on a package setting: pulling `ghcr.io/flip-to/bigquery-emulator` from this repo is `denied` until the package
+grants Actions access to Flip-to/dbt-virtual (or is made public). The job falls back to the source build until then.
+
 Measurements are in the PR body.
 
 ## A2V track
@@ -30,7 +36,7 @@ Measurements are in the PR body.
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | CI takes about 40 minutes, dominated by the emulator job | chat request | 2026-11-10 |
 | Built | Agent: Claude (session dbt-virtual-ci-speed), approved by Yuri Olive | Prebuilt image by SHA plus parallel jobs; no test dropped | PR (draft), branch claude/dbt-virtual-ci-prebuilt-emulator | 2026-11-10 |
-| Proven | pending | | pending | |
+| Proven | CI | L3: PR #37 run 42843816600 green in 8 min 57 s (46 min 25 s before, run 42829367114); every test runs once (unit set + real-dbt shards are complementary by construction) | run 42843816600 | 2026-11-10 |
 | Reviewed | pending | | pending | |
 | Shipped | pending | | pending | |
 | Verified | pending | | pending | |
