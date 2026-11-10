@@ -50,6 +50,7 @@ tests/
   test_sqlmesh_parity_fixes.py # Gaps found by comparing with SQLMesh (unregistered tables, DAG-depth deploy order, GC-ed rollback)
   test_require_cli_fingerprints.py # `require_cli_fingerprints` guard against bare dbt runs
   test_check_docs_layout.py   # Unit tests for docs/tech-debt/decision/bean layout guard
+  test_version.py             # `__version__` matches pyproject.toml
 ```
 
 Written docs live in the repo-root `docs/` tree (`guides/`, `specs/`, `decisions/`, `findings/`,

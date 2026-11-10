@@ -1,7 +1,7 @@
 ---
 # dbt-virtual-0037
 title: 'BigQuery `adopt` cut the clone backstop script at its first `;`'
-status: in-progress
+status: completed
 type: bug
 created_at: 2026-11-10T00:00:00Z
 updated_at: 2026-11-10T00:00:00Z
@@ -23,7 +23,7 @@ clones deep instead of failing.
 |---|---|---|---|---|
 | Asked | Developer: Yuri Olive | Run the pilot rehearsal on v0.2.1 | chat request | 2026-11-10 |
 | Built | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | adopt uses `clone_or_copy_table` | branch claude/dbt-virtual-adopt-clone-unsplit | 2026-11-10 |
-| Proven | CI | L2: BigQuery macro harness test `test_bigquery_adopt_runs_the_clone_backstop_as_one_script` fails on main, passes here (local 2026-11-10) | tests/test_macros_execution.py | |
-| Reviewed | pending | | pending | |
-| Shipped | pending | | pending | |
-| Verified | pending | Real BigQuery adopt in the flipto-dbt sandbox rehearsal | pending: re-run the rehearsal on this branch | |
+| Proven | CI | L2: BigQuery macro harness test `test_bigquery_adopt_runs_the_clone_backstop_as_one_script` fails on main, passes here | CI run 42836839671, all 6 checks green | 2026-11-10 |
+| Reviewed | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Diff and CI read before merge; merge authorized in chat | PR #36 | 2026-11-10 |
+| Shipped | Developer: Yuri Olive | Merged with a merge commit | PR #36 | 2026-11-10 |
+| Verified | Developer: Yuri Olive | Real BigQuery: adopt, build, audit, promote, rollback and gc in a throwaway sandbox with a downstream project pinned to this branch | sandbox rehearsal 2026-11-10 (PR #36 body) | 2026-11-10 |
