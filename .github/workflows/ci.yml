@@ -76,7 +76,55 @@ jobs:
         run: uv run --python ${{ matrix.python-version }} ruff check src tests scripts
       - name: Run unit tests
         if: needs.changes.outputs.code == 'true'
-        run: uv run --python ${{ matrix.python-version }} pytest -v -n auto --dist loadfile --durations=15
+        # The real dbt-core + dbt-duckdb files run in the real-dbt-duckdb jobs (Python 3.12) and the
+        # real dbt parse file in dbt-parse-warehouses; everything else runs here on every version.
+        run: >-
+          uv run --python ${{ matrix.python-version }} pytest -v -n auto --dist loadfile --durations=15
+          --ignore-glob='tests/test_dbt_duckdb_*.py' --ignore=tests/test_dbt_parse_warehouses.py
+
+  # Real dbt-core + dbt-duckdb tests: slow (about 50 s each), independent per test, so they are split over
+  # runners and spread per test (--dist load). They run on one Python version; the pure tests cover the others.
+  real-dbt-duckdb:
+    name: Real dbt-duckdb tests (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: "shard 1/3", shard: 0, of: 3}
+          - {name: "shard 2/3", shard: 1, of: 3}
+          - {name: "shard 3/3", shard: 2, of: 3}
+          # Module-scoped fixtures (one project shared by the file's tests): keep the file on one worker.
+          - {name: "v0.1.0 upgrade", upgrade: true}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the upgrade tests read the v0.1.0 tag
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-suffix: unit-3.12
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --extra dev --python 3.12
+      - name: Run real dbt-duckdb tests
+        env:
+          UPGRADE: ${{ matrix.upgrade }}
+          SHARD: ${{ matrix.shard }}
+          OF: ${{ matrix.of }}
+        run: |
+          set -euo pipefail
+          if [ "${UPGRADE:-}" = true ]; then
+            uv run --python 3.12 pytest -v -n auto --dist loadfile --durations=15 tests/test_dbt_duckdb_upgrade_v010.py
+            exit 0
+          fi
+          # Every test of tests/test_dbt_duckdb_*.py (but the upgrade file) lands in exactly one shard.
+          uv run --python 3.12 pytest --collect-only -q -p no:cacheprovider             --ignore=tests/test_dbt_duckdb_upgrade_v010.py tests/test_dbt_duckdb_*.py             | grep '::' | sort | awk -v n="$OF" -v i="$SHARD" 'NR % n == i' > shard_ids.txt
+          wc -l shard_ids.txt
+          test -s shard_ids.txt
+          uv run --python 3.12 pytest -v -n auto --dist load --durations=15 $(cat shard_ids.txt)
 
   dbt-parse-warehouses:
     needs: changes
@@ -265,6 +313,7 @@ jobs:
     needs:
       - changes
       - unit-and-guards
+      - real-dbt-duckdb
       - dbt-parse-warehouses
       - emulator-lifecycle
       - emulator-concurrency-upgrade
