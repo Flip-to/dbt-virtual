@@ -34,8 +34,8 @@ runs:
         # Matches the tag docker/metadata-action (type=sha, short) publishes in the emulator repo.
         IMAGE="ghcr.io/flip-to/bigquery-emulator:flipto-${REV:0:7}"
         SOURCE=build
-        if echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin >/dev/null 2>&1 \
-           && docker pull --quiet "$IMAGE" >/dev/null 2>&1; then
+        if echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin >/dev/null 2>/tmp/pull.err \
+           && docker pull --quiet "$IMAGE" >/dev/null 2>>/tmp/pull.err; then
           GOT=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
           if [ "$GOT" = "$REV" ]; then
             SOURCE=image
@@ -45,6 +45,7 @@ runs:
           fi
         else
           echo "::warning::${IMAGE} not pullable (not published yet, or no packages:read access); building from source"
+          cat /tmp/pull.err
         fi
         if [ "$SOURCE" = build ]; then
           docker build -t bigquery-emulator:flipto "https://github.com/Flip-to/bigquery-emulator.git#${REV}"

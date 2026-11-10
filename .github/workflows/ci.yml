@@ -15,7 +15,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # A commit that only touches beans, docs or Markdown (for example flipping a bean to completed before
+  # merge) skips the heavy jobs; the docs layout guard and ruff still run.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            # Files changed by the whole PR, against its merge base.
+            files=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" || true)
+          elif [ "$EVENT" = push ] && [ -n "$BEFORE_SHA" ] && ! echo "$BEFORE_SHA" | grep -qE '^0+$'                && git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
+            files=$(git diff --name-only "$BEFORE_SHA" HEAD || true)
+          else
+            files=""   # workflow_dispatch and unknown cases: run everything
+          fi
+          if [ -n "$files" ]; then
+            echo "$files"
+            if ! echo "$files" | grep -vE '^(\.beans/|docs/)|\.md$' | grep -q .; then
+              code=false
+            fi
+          fi
+          echo "code=${code}" >> "$GITHUB_OUTPUT"
+          echo "code changes: ${code}"
+
   unit-and-guards:
+    needs: changes
     name: Unit tests & docs layout guard
     runs-on: ubuntu-24.04
     strategy:
@@ -38,9 +75,12 @@ jobs:
       - name: Lint with ruff
         run: uv run --python ${{ matrix.python-version }} ruff check src tests scripts
       - name: Run unit tests
+        if: needs.changes.outputs.code == 'true'
         run: uv run --python ${{ matrix.python-version }} pytest -v -n auto --dist loadfile --durations=15
 
   dbt-parse-warehouses:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: dbt parse with the package on BigQuery & Snowflake (fake credentials)
     runs-on: ubuntu-24.04
     steps:
@@ -61,6 +101,8 @@ jobs:
   # The emulator work runs as parallel jobs, each with its own emulator container (a prebuilt image
   # pinned to the head commit of flipto/main; see .github/actions/start-bq-emulator).
   emulator-lifecycle:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: BigQuery Emulator E2E lifecycle script (Flip-to/bigquery-emulator)
     runs-on: ubuntu-24.04
     steps:
@@ -84,6 +126,8 @@ jobs:
         run: uv run --python 3.11 python scripts/run_emulator_e2e.py
 
   emulator-concurrency-upgrade:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: BigQuery Emulator concurrency and v0.1.0 upgrade checks
     runs-on: ubuntu-24.04
     steps:
@@ -107,6 +151,8 @@ jobs:
         run: uv run --python 3.11 python scripts/run_emulator_concurrency_upgrade_e2e.py
 
   emulator-real-dbt:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Real dbt-bigquery E2E on the emulator (${{ matrix.shard }})
     runs-on: ubuntu-24.04
     strategy:
@@ -145,6 +191,8 @@ jobs:
           -k "${{ matrix.select }}" tests/test_dbt_bigquery_emulator_e2e.py
 
   snowflake-and-postgres-e2e:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E
     runs-on: ubuntu-24.04
     services:
@@ -209,3 +257,24 @@ jobs:
           SNOWFLAKE_EMULATOR_HOST: "http://127.0.0.1:8080"
           POSTGRES_DSN: "postgresql://dbt:dbt@127.0.0.1:5432/test_db"
         run: uv run --python 3.11 python scripts/run_snowflake_emulator_e2e.py
+
+  # One check to require: green when every job passed or was skipped for a docs-only change.
+  ci-ok:
+    name: CI ok
+    if: always()
+    needs:
+      - changes
+      - unit-and-guards
+      - dbt-parse-warehouses
+      - emulator-lifecycle
+      - emulator-concurrency-upgrade
+      - emulator-real-dbt
+      - snowflake-and-postgres-e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail unless every job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -qE 'failure|cancelled'; then exit 1; fi
