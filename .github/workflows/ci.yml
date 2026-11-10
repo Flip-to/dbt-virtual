@@ -34,13 +34,15 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          # On a PR the checkout is a merge with the base branch; compare the PR's own commits.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           code=true
           # Files changed by the commits this event added (push, or new commits on a PR).
           # Anything else (PR opened, workflow_dispatch, force-push, unknown base): run everything.
           if { [ "$EVENT" = push ] || { [ "$EVENT" = pull_request ] && [ "$ACTION" = synchronize ]; }; }              && [ -n "$BEFORE_SHA" ] && ! echo "$BEFORE_SHA" | grep -qE '^0+$'              && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
-            files=$(git diff --name-only "$BEFORE_SHA" HEAD)
+            files=$(git diff --name-only "$BEFORE_SHA" "$HEAD_SHA")
             echo "$files"
             if [ -n "$files" ] && ! echo "$files" | grep -vE '^(\.beans/|docs/)|\.md$' | grep -q .; then
               # Skipping is only safe when the commit before this one passed CI (the heavy jobs ran,
