@@ -1,0 +1,65 @@
+name: Start Flip-to/bigquery-emulator
+description: >-
+  Starts the emulator on 127.0.0.1:9050 (project test-project) from the exact commit at the
+  head of the emulator branch: pulls the prebuilt image ghcr.io/flip-to/bigquery-emulator:flipto-<sha7>
+  and builds from source only when that image is missing or does not match the commit.
+inputs:
+  branch:
+    description: Emulator branch whose head commit is tested.
+    default: flipto/main
+  github-token:
+    description: Token with packages:read, used to pull from GHCR.
+    required: true
+outputs:
+  rev:
+    description: Full commit SHA of the emulator under test.
+    value: ${{ steps.start.outputs.rev }}
+  source:
+    description: "`image` when pulled prebuilt, `build` when built from source."
+    value: ${{ steps.start.outputs.source }}
+runs:
+  using: composite
+  steps:
+    - id: start
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_ACTOR: ${{ github.actor }}
+      run: |
+        set -uo pipefail
+        REV=$(git ls-remote https://github.com/Flip-to/bigquery-emulator.git "refs/heads/${BRANCH}" | cut -f1)
+        if [ -z "$REV" ]; then echo "::error::cannot resolve ${BRANCH}"; exit 1; fi
+        echo "rev=${REV}" >> "$GITHUB_OUTPUT"
+        # Matches the tag docker/metadata-action (type=sha, short) publishes in the emulator repo.
+        IMAGE="ghcr.io/flip-to/bigquery-emulator:flipto-${REV:0:7}"
+        SOURCE=build
+        if echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin >/dev/null 2>&1 \
+           && docker pull --quiet "$IMAGE" >/dev/null 2>&1; then
+          GOT=$(docker image inspect "$IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+          if [ "$GOT" = "$REV" ]; then
+            SOURCE=image
+            docker tag "$IMAGE" bigquery-emulator:flipto
+          else
+            echo "::warning::${IMAGE} is revision '${GOT}', expected ${REV}; building from source"
+          fi
+        else
+          echo "::warning::${IMAGE} not pullable (not published yet, or no packages:read access); building from source"
+        fi
+        if [ "$SOURCE" = build ]; then
+          docker build -t bigquery-emulator:flipto "https://github.com/Flip-to/bigquery-emulator.git#${REV}"
+        fi
+        echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
+        echo "Emulator ${REV} from ${SOURCE}"
+        docker run -d --name bqemu -p 9050:9050 -p 9060:9060 bigquery-emulator:flipto \
+          --project=test-project --host=0.0.0.0 --port=9050
+        for i in $(seq 1 60); do
+          if curl -sf http://127.0.0.1:9050/bigquery/v2/projects/test-project/datasets >/dev/null; then
+            echo "BigQuery emulator is ready."
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs bqemu | tail -50
+        echo "::error::emulator did not become ready"
+        exit 1

@@ -58,12 +58,11 @@ jobs:
         env:
           DBT_VIRTUAL_REQUIRE_PARSE_ADAPTERS: "1"
 
-  emulator-e2e:
-    name: BigQuery Emulator E2E (Flip-to/bigquery-emulator)
+  # The emulator work runs as parallel jobs, each with its own emulator container (a prebuilt image
+  # pinned to the head commit of flipto/main; see .github/actions/start-bq-emulator).
+  emulator-lifecycle:
+    name: BigQuery Emulator E2E lifecycle script (Flip-to/bigquery-emulator)
     runs-on: ubuntu-24.04
-    env:
-      # The emulator branch the image is built from.
-      BQEMU_BRANCH: flipto/main
     steps:
       - uses: actions/checkout@v5
         with:
@@ -75,59 +74,75 @@ jobs:
           python-version: "3.11"
       - name: Sync dependencies (with emulator client)
         run: uv sync --extra dev --extra emulator --python 3.11
-      - name: Resolve Flip-to/bigquery-emulator revision
-        id: bqemu_rev
-        run: |
-          REV=$(git ls-remote https://github.com/Flip-to/bigquery-emulator.git refs/heads/${BQEMU_BRANCH} | cut -f1)
-          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
-      - name: Cache Flip-to/bigquery-emulator Docker image
-        id: bqemu_cache
-        uses: actions/cache@v5
+      - uses: ./.github/actions/start-bq-emulator
         with:
-          path: /tmp/bqemu-cache
-          # Exact revision only: an older image lacks emulator fixes the E2E relies on.
-          key: bqemu-image-v2-${{ steps.bqemu_rev.outputs.rev }}
-      - name: Start Flip-to/bigquery-emulator
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/bqemu-cache
-          if [ -f /tmp/bqemu-cache/bqemu.tar.zst ]; then
-            echo "Loading cached Flip-to/bigquery-emulator image..."
-            zstd -dc /tmp/bqemu-cache/bqemu.tar.zst | docker load
-            IMAGE="bigquery-emulator:flipto"
-          else
-            # Build the resolved revision (the ghcr `flipto` tag can lag behind flipto/main).
-            echo "Building Flip-to/bigquery-emulator at ${{ steps.bqemu_rev.outputs.rev }}..."
-            docker build -t bigquery-emulator:flipto "https://github.com/Flip-to/bigquery-emulator.git#${{ steps.bqemu_rev.outputs.rev }}"
-            IMAGE="bigquery-emulator:flipto"
-            docker save bigquery-emulator:flipto | zstd -T0 -3 -o /tmp/bqemu-cache/bqemu.tar.zst
-          fi
-          docker run -d --name bqemu -p 9050:9050 -p 9060:9060 "$IMAGE" \
-            --project=test-project --host=0.0.0.0 --port=9050
-          for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9050/bigquery/v2/projects/test-project/datasets >/dev/null; then
-              echo "BigQuery emulator is ready."
-              break
-            fi
-            sleep 1
-          done
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run E2E virtual environment lifecycle test
         env:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_e2e.py
-      - name: Run concurrency and v0.1.0 upgrade checks (same emulator, fresh datasets)
+
+  emulator-concurrency-upgrade:
+    name: BigQuery Emulator concurrency and v0.1.0 upgrade checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the upgrade tests read the v0.1.0 tag
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-suffix: emulator-3.11
+          python-version: "3.11"
+      - name: Sync dependencies (with emulator client)
+        run: uv sync --extra dev --extra emulator --python 3.11
+      - uses: ./.github/actions/start-bq-emulator
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run concurrency and v0.1.0 upgrade checks
         env:
           BIGQUERY_EMULATOR_HOST: "http://127.0.0.1:9050"
           BIGQUERY_EMULATOR_PROJECT: "test-project"
         run: uv run --python 3.11 python scripts/run_emulator_concurrency_upgrade_e2e.py
+
+  emulator-real-dbt:
+    name: Real dbt-bigquery E2E on the emulator (${{ matrix.shard }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every test of the file runs in exactly one shard: `rest` is the complement of the named ones.
+        include:
+          - shard: full-lifecycle
+            select: "test_full_lifecycle_on_real_dbt_bigquery"
+          - shard: multi-dataset
+            select: "test_multi_dataset_environments_refresh_and_demotion_on_bigquery"
+          - shard: rest
+            select: "not test_full_lifecycle_on_real_dbt_bigquery and not test_multi_dataset_environments_refresh_and_demotion_on_bigquery"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the upgrade tests read the v0.1.0 tag
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-suffix: emulator-3.11
+          python-version: "3.11"
+      - name: Sync dependencies (with emulator client)
+        run: uv sync --extra dev --extra emulator --python 3.11
+      - uses: ./.github/actions/start-bq-emulator
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Real dbt-core + dbt-bigquery E2E (dbt-virtual lifecycle on the emulator)
         env:
           DBT_VIRTUAL_BQ_EMULATOR: "http://127.0.0.1:9050"
           DBT_VIRTUAL_BQ_EMULATOR_PROJECT: "test-project"
           # A missing adapter or emulator fails the job instead of skipping the tests.
           DBT_VIRTUAL_REQUIRE_BQ_EMULATOR: "1"
-        run: uv run --python 3.11 pytest -v -rs -n 4 --dist load tests/test_dbt_bigquery_emulator_e2e.py
+        run: >-
+          uv run --python 3.11 pytest -v -rs -n 4 --dist load
+          -k "${{ matrix.select }}" tests/test_dbt_bigquery_emulator_e2e.py
 
   snowflake-and-postgres-e2e:
     name: Snowflake Emulator (nnnkkk7/snowflake-emulator) & Postgres E2E
