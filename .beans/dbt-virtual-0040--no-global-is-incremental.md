@@ -1,7 +1,7 @@
 ---
 # dbt-virtual-0040
 title: 'Remove the package macro `is_incremental`, which replaced dbt''s builtin in consuming projects'
-status: in-progress
+status: completed
 type: bug
 created_at: 2026-11-11T00:00:00Z
 updated_at: 2026-11-11T00:00:00Z
@@ -24,7 +24,7 @@ Fix: drop the macro; `virtual_is_incremental()` (the documented name) returns `d
 |---|---|---|---|---|
 | Asked | Reviewer: ktillerflipto (pre-review), via Developer: Yuri Olive | Slim CI selected the whole project after the package was installed | downstream PR pre-review, 2026-11-10 | 2026-11-11 |
 | Built | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | drop `is_incremental`, keep `virtual_is_incremental` | branch claude/dbt-virtual-no-global-is-incremental | 2026-11-11 |
-| Proven | CI | L1: `test_package_defines_no_dbt_builtin_macro_names` fails on main, passes here (local 2026-11-11) | tests/test_macros_execution.py | |
-| Reviewed | pending | | pending | |
-| Shipped | pending | | pending | |
+| Proven | CI | L1: `test_package_defines_no_dbt_builtin_macro_names` fails on main, passes here | CI run 43037767959, 16 jobs green | 2026-11-11 |
+| Reviewed | Agent: Claude (session 9d590ac4-0b78-4fbf-91ee-2f18573cbc66), approved by Yuri Olive | Diff and CI read before merge; merge authorized in chat | PR #41 | 2026-11-11 |
+| Shipped | Developer: Yuri Olive | Merged with a merge commit; tag v0.2.3 | PR #41 | 2026-11-11 |
 | Verified | pending | | pending: downstream Slim CI selects only the changed nodes after repinning to v0.2.3 | |
