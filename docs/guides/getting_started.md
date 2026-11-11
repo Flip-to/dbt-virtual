@@ -131,7 +131,7 @@ With dbt's own `ref()`, a model that reads a virtual table compiles against the 
 {%- endmacro %}
 ```
 
-You do not need to override `is_incremental()`. `seed_incremental_clones()` creates the cloned table before dbt starts, so dbt's own `is_incremental()` is already true for a seeded model. `dbt_virtual.virtual_is_incremental()` (an alias of `dbt_virtual.is_incremental()`) still exists for projects that wired it in, and simply returns dbt's `is_incremental()`.
+You do not need to override `is_incremental()`. `seed_incremental_clones()` creates the cloned table before dbt starts, so dbt's own `is_incremental()` is already true for a seeded model. `dbt_virtual.virtual_is_incremental()` still exists for projects that wired it in, and simply returns dbt's `is_incremental()`.
 
 ---
 

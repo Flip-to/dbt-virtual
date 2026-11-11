@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -567,10 +568,28 @@ def test_is_incremental_does_not_claim_unseeded_table() -> None:
     harness.query_responses.append(FakeResult([("analytics_physical.orders_metrics__prodfp000000",)]))
 
     # `builtins.is_incremental()` is False in the harness: the target table does not exist yet.
-    assert harness.call_macro("is_incremental") is False
     # The name used in docs/guides/getting_started.md exists.
     assert harness.call_macro("virtual_is_incremental") is False
     assert harness.executed_queries == []
+
+
+def test_package_defines_no_dbt_builtin_macro_names() -> None:
+    """Regression: a non-root package macro named like a dbt builtin replaces it in the global
+    namespace. `is_incremental` did, so in a consuming project every incremental model depended on
+    `macro.dbt_virtual.is_incremental`, and `state:modified` against a manifest without the package
+    selected them all (flipto-dbt Slim CI, 2026-11-10: 393 nodes, Snowplow base models included)."""
+    builtins = {
+        "is_incremental", "ref", "source", "config", "run_query", "statement", "log",
+        "generate_schema_name", "generate_alias_name", "generate_database_name",
+        "should_full_refresh", "get_merge_sql", "create_table_as", "get_create_table_as_sql",
+    }
+    root = Path(__file__).parents[1] / "macros"
+    defined = {
+        m.group(1)
+        for f in root.rglob("*.sql")
+        for m in re.finditer(r"{%-?\s*macro\s+(\w+)\s*\(", f.read_text(encoding="utf-8"))
+    }
+    assert not (defined & builtins), sorted(defined & builtins)
 
 
 def test_multi_adapter_dispatch_postgres_duckdb_fallback() -> None:

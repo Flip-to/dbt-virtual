@@ -401,20 +401,13 @@
 {%- endmacro %}
 
 
-{% macro is_incremental() -%}
-  {#-
-    Kept for backward compatibility. Once `seed_incremental_clones()` has cloned the base table
-    before the run, dbt's own `is_incremental()` is already True. Returning True for a table that
-    does not exist yet made BigQuery's `create or replace table` keep only the incremental delta.
-  -#}
-  {#- `builtins` has no `is_incremental` (it raised "'dict object' has no attribute 'is_incremental'"). -#}
-  {{ return(dbt.is_incremental()) }}
-{%- endmacro %}
-
-
 {% macro virtual_is_incremental() -%}
-  {#- Name used in docs/guides/getting_started.md. -#}
-  {{ return(dbt_virtual.is_incremental()) }}
+  {#- Name used in docs/guides/getting_started.md. Once `seed_incremental_clones()` has cloned the
+      base table before the run, dbt's own `is_incremental()` is already True. This package must not
+      define a macro named `is_incremental`: a non-root package macro replaces dbt's builtin in the
+      global namespace, so every incremental model would depend on `dbt_virtual.is_incremental` and
+      count as `state:modified.macros` against a manifest without the package. -#}
+  {{ return(dbt.is_incremental()) }}
 {%- endmacro %}
 
 
